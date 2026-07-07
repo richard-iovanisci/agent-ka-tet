@@ -1,0 +1,6 @@
+node_modules/
+.bridge/
+*.sqlite
+*.sqlite-journal
+*.log
+.DS_Store

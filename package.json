@@ -1,0 +1,17 @@
+{
+  "name": "agent-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "bridge": "bin/bridge"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "typescript": "^5.9.0"
+  }
+}
