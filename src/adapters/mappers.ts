@@ -6,14 +6,19 @@ import type { AgentName, NormalizedEvent, NormalizedEventType } from "../types.t
  * and DECISIONS.md). Anything unrecognized maps to "raw" and is stored for
  * forensics — mappers never throw and never drop an event.
  */
-export function mapNativeEvent(agent: AgentName, body: unknown): NormalizedEvent {
+/**
+ * @param nativeHint optional native event name supplied out-of-band (the
+ * `?native=` query param our command shims append) — needed for agy, whose
+ * hook payloads are not verified to carry an event name field.
+ */
+export function mapNativeEvent(agent: AgentName, body: unknown, nativeHint?: string): NormalizedEvent {
   switch (agent) {
     case "claude":
       return mapClaudeEvent(body);
     case "codex":
       return mapCodexEvent(body);
     case "agy":
-      return mapAgyEvent(body);
+      return mapAgyEvent(body, nativeHint);
     case "opencode":
       return mapOpencodeEvent(body);
   }
@@ -97,23 +102,38 @@ export function mapCodexEvent(body: unknown): NormalizedEvent {
 }
 
 /* ---------------------------- Antigravity (agy) --------------------------- */
-// Weakest surface (DESIGN.md §7). Its hooks.json is Claude-shaped per available
-// docs, so we optimistically map Claude-compatible names; docs/agy-notes.md is
-// the source of truth once verified. Unknown events degrade to "raw" and agy
-// itself degrades to mux-observed if nothing arrives at all.
+// Weakest surface (DESIGN.md §7); verified findings in docs/agy-notes.md.
+// Two feeds arrive on /events/agy:
+//  1. statusline forwarder: payload carries agent_state
+//     (initializing|idle|thinking|working|tool_use) — primary state signal.
+//  2. hook command shims (PreToolUse/PostToolUse/Stop verified-ish): payload is
+//     stdin JSON with session_id; event name comes via the ?native= hint the
+//     shim appends, since agy payloads aren't verified to name their event.
+// agy has NO PermissionRequest/SessionStart equivalents — needs_you stays
+// partial for agy in Phase 0 (HANDOFF.md allows this).
 
-const AGY_HOOK_MAP: Record<string, NormalizedEventType> = {
-  SessionStart: "session.start",
-  UserPromptSubmit: "turn.start",
-  Stop: "turn.complete",
-  PermissionRequest: "permission.request",
-  PreToolUse: "raw",
-  PostToolUse: "permission.resolved",
+const AGY_STATE_MAP: Record<string, NormalizedEventType> = {
+  idle: "turn.complete",
+  thinking: "turn.start",
+  working: "turn.start",
+  tool_use: "turn.start",
+  // initializing: stays "raw" so the agent remains `launching` until real state
 };
 
-export function mapAgyEvent(body: unknown): NormalizedEvent {
+const AGY_HOOK_MAP: Record<string, NormalizedEventType> = {
+  PreToolUse: "turn.start",
+  PostToolUse: "turn.start",
+  Stop: "turn.complete",
+};
+
+export function mapAgyEvent(body: unknown, nativeHint?: string): NormalizedEvent {
   const o = asRecord(body);
-  const name = str(o.hook_event_name);
+  const agentState = str(o.agent_state);
+  if (agentState !== null) {
+    const mapped = AGY_STATE_MAP[agentState];
+    return make("agy", mapped ?? "raw", `statusline:${agentState}`, str(o.session_id), body);
+  }
+  const name = nativeHint ?? str(o.hook_event_name);
   const mapped = name ? AGY_HOOK_MAP[name] : undefined;
   return make("agy", mapped ?? "raw", name ?? "unknown", str(o.session_id), body);
 }

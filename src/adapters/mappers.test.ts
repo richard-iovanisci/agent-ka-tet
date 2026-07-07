@@ -150,9 +150,26 @@ describe("opencode mapper", () => {
   });
 });
 
-describe("agy mapper (optimistic Claude-shape until docs/agy-notes.md verifies)", () => {
-  test("claude-compatible names map, unknown degrades to raw", () => {
-    expect(mapNativeEvent("agy", { hook_event_name: "Stop", session_id: "a1" }).type).toBe("turn.complete");
+describe("agy mapper (verified surface per docs/agy-notes.md)", () => {
+  test("statusline agent_state feed is the primary signal", () => {
+    expect(mapNativeEvent("agy", { agent_state: "working" }).type).toBe("turn.start");
+    expect(mapNativeEvent("agy", { agent_state: "thinking" }).type).toBe("turn.start");
+    expect(mapNativeEvent("agy", { agent_state: "tool_use" }).type).toBe("turn.start");
+    expect(mapNativeEvent("agy", { agent_state: "idle" }).type).toBe("turn.complete");
+    // initializing stays raw so the agent remains `launching`
+    expect(mapNativeEvent("agy", { agent_state: "initializing" }).type).toBe("raw");
+  });
+
+  test("hook shims pass the event name via ?native= hint", () => {
+    expect(mapNativeEvent("agy", { session_id: "a1" }, "Stop").type).toBe("turn.complete");
+    expect(mapNativeEvent("agy", { session_id: "a1" }, "PreToolUse").type).toBe("turn.start");
+    const e = mapNativeEvent("agy", { session_id: "a1" }, "Stop");
+    expect(e.sessionId).toBe("a1");
+    expect(e.payload.nativeType).toBe("Stop");
+  });
+
+  test("unknown degrades to raw, never throws", () => {
     expect(mapNativeEvent("agy", { hook_event_name: "Mystery" }).type).toBe("raw");
+    expect(mapNativeEvent("agy", null).type).toBe("raw");
   });
 });

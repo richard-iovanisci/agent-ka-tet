@@ -27,3 +27,9 @@ Deviations from DESIGN.md are logged here **before** implementation. Format: dat
 **What:** v1.17.15 emits both `permission.asked`/`permission.replied` and `permission.v2.asked`/`permission.v2.replied` (different payload shapes). The mapper handles both; `permission.updated` (older name in some docs) does not exist and is not used.
 **Why:** missing either family drops needs-you events across OpenCode versions.
 **Impact:** duplicate events for one prompt are possible; the state machine is idempotent under them.
+
+## 2026-07-07 — agy: statusline forwarder as primary state feed; hooks at `~/.gemini/config/hooks.json`
+
+**What:** (a) agy's primary state signal is a statusline-customization forwarder (stdin JSON carries `agent_state: initializing|idle|thinking|working|tool_use`) teed to the daemon, with `PreToolUse`/`PostToolUse`/`Stop` command-shim hooks as secondary; (b) the canonical global hooks path is `~/.gemini/config/hooks.json` — DESIGN.md's `~/.gemini/antigravity-cli/hooks.json` is the legacy/buggy location (upstream issue #49), so the writer targets the canonical path (details + evidence in docs/agy-notes.md); (c) agy hook shims append `?native=<Event>` when POSTing because agy payloads are not verified to carry an event-name field.
+**Why:** agy has no PermissionRequest/SessionStart hook equivalents; the statusline feed is the only verified push-based idle/working signal. Still zero scraping.
+**Impact:** agy `needs_you` detection stays partial in Phase 0 (allowed by HANDOFF.md exit criteria); everything else is event-driven.
