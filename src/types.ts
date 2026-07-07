@@ -62,6 +62,8 @@ export interface NormalizedEvent {
 /** Per-agent view the daemon maintains and `bridge top` renders. */
 export interface AgentStatus {
   agent: AgentName;
+  /** From bridge.config — disabled agents are shown dimmed, never "stuck". */
+  enabled: boolean;
   state: AgentState;
   sessionId: string | null;
   /** Last normalized event applied, if any. */
