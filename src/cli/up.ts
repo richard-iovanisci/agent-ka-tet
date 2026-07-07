@@ -36,12 +36,14 @@ async function ensureDaemon(cfg: BridgeConfig, print: (l: string) => void, scrip
     print(`daemon: already running on 127.0.0.1:${cfg.daemonPort}`);
     return true;
   }
-  const log = daemonLogFile();
+  const log = daemonLogFile(cfg.daemonPort);
   mkdirSync(dirname(log), { recursive: true });
   const fd = openSync(log, "a");
   // The daemon is its own process: the CLI exiting (or dying) never touches
   // it, and it never touches the agents (CLAUDE.md constraint 1).
-  const child = Bun.spawn(["bun", script, "--dir", cfg.repo], {
+  // --dir is where the CONFIG lives, not cfg.repo (which may point elsewhere) —
+  // the daemon must re-load the exact config the CLI is operating with.
+  const child = Bun.spawn(["bun", script, "--dir", cfg.configDir], {
     stdin: "ignore",
     stdout: fd,
     stderr: fd,
@@ -66,8 +68,15 @@ export async function up(cfg: BridgeConfig, opts: UpOptions): Promise<number> {
   const mux = opts.mux;
 
   if (await mux.hasSession(cfg.session)) {
-    print(`session "${cfg.session}" already exists — use \`bridge attach\` (or \`bridge down\` first)`);
-    return 1;
+    // Recovery path: session alive but daemon possibly dead (crash, reboot).
+    // Re-running `bridge up` revives the daemon without touching the panes.
+    print(`session "${cfg.session}" already exists — leaving panes untouched`);
+    if (!opts.skipDaemon) {
+      const ok = await ensureDaemon(cfg, print, opts.daemonScript ?? defaultDaemonScript());
+      if (!ok) return 1;
+    }
+    print(`use \`bridge attach\` to enter it, or \`bridge down\` to tear it down`);
+    return 0;
   }
 
   if (!opts.skipDaemon) {

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { TmuxAdapter, verifyFragment } from "./tmux.ts";
+import { TmuxAdapter, countOccurrences, verifyFragment } from "./tmux.ts";
 
 /**
  * Runs against a REAL tmux server (CLAUDE.md: no mocks) on a throwaway
@@ -48,7 +48,22 @@ function waitForPrompt(paneId: string): Promise<boolean> {
   return pollFor(async () => /\S/.test(await tmux.capturePane(paneId)));
 }
 
+describe("countOccurrences", () => {
+  test("non-overlapping counting", () => {
+    expect(countOccurrences("abcabcabc", "abc")).toBe(3);
+    expect(countOccurrences("aaaa", "aa")).toBe(2);
+    expect(countOccurrences("xyz", "q")).toBe(0);
+    expect(countOccurrences("xyz", "")).toBe(0);
+  });
+});
+
 describe("TmuxAdapter", () => {
+  test("createSession rejects names tmux would silently rename", async () => {
+    for (const bad of ["a.b", "a:b", "a b", ""]) {
+      await expect(tmux.createSession(bad, { cwd: CWD })).rejects.toThrow(/must not contain|names/);
+    }
+  });
+
   test("hasSession is false before create, true after", async () => {
     expect(await tmux.hasSession(SESSION)).toBe(false);
 

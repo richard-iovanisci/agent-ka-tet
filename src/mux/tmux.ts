@@ -120,6 +120,13 @@ export class TmuxAdapter implements MuxAdapter {
     session: string,
     opts: { cwd: string; width?: number; height?: number },
   ): Promise<string> {
+    // tmux silently rewrites '.' and ':' in session names; accepting that
+    // would create a session that exact-match targets can never address.
+    if (session.length === 0 || /[.:\s]/.test(session)) {
+      throw new Error(
+        `tmux session names must not contain '.', ':' or whitespace: ${JSON.stringify(session)}`,
+      );
+    }
     // No command argument: the pane runs the user's default shell, so it
     // outlives whatever agent is later launched by typing into it.
     const args = ["new-session", "-d", "-s", session, "-c", opts.cwd];
@@ -208,13 +215,18 @@ export class TmuxAdapter implements MuxAdapter {
     let verified = false;
     let retried = false;
 
+    // Baseline BEFORE pasting: if the fragment is already on screen (same
+    // command sent earlier, prompt echo, …), a lost paste would otherwise be
+    // reported as verified. The paste must make the count go UP.
+    const baseline = verify && fragment.length > 0 ? countOccurrences(await this.captureJoined(paneId), fragment) : 0;
+
     await this.paste(paneId, text);
     if (verify) {
-      verified = await this.verifyEcho(paneId, fragment);
+      verified = await this.verifyEcho(paneId, fragment, baseline + 1);
       if (!verified) {
         retried = true;
         await this.paste(paneId, text);
-        verified = await this.verifyEcho(paneId, fragment);
+        verified = await this.verifyEcho(paneId, fragment, baseline + 1);
       }
     }
 
@@ -258,19 +270,37 @@ export class TmuxAdapter implements MuxAdapter {
     await this.exec(["paste-buffer", "-d", "-p", "-b", buf, "-t", paneId]);
   }
 
+  /** capture-pane with -J so a paste wrapped across pane-width lines rejoins. */
+  private async captureJoined(paneId: string): Promise<string> {
+    return this.exec(["capture-pane", "-p", "-J", "-t", paneId]);
+  }
+
   /**
-   * Echo verification: poll capture-pane (with -J so wrapped lines rejoin)
-   * until the fragment shows up or the timeout lapses. An empty fragment
-   * (nothing distinctive to look for) verifies trivially.
+   * Echo verification: poll capture-pane until the fragment appears at least
+   * `minCount` times (baseline occurrences + 1, so pre-existing text on
+   * screen can't vouch for a lost paste) or the timeout lapses. An empty
+   * fragment (nothing distinctive to look for) verifies trivially.
    */
-  private async verifyEcho(paneId: string, fragment: string): Promise<boolean> {
+  private async verifyEcho(paneId: string, fragment: string, minCount: number): Promise<boolean> {
     if (fragment.length === 0) return true;
     const deadline = Date.now() + VERIFY_TIMEOUT_MS;
     for (;;) {
-      const captured = await this.exec(["capture-pane", "-p", "-J", "-t", paneId]);
-      if (captured.includes(fragment)) return true;
+      if (countOccurrences(await this.captureJoined(paneId), fragment) >= minCount) return true;
       if (Date.now() >= deadline) return false;
       await Bun.sleep(VERIFY_POLL_MS);
     }
+  }
+}
+
+/** Non-overlapping occurrence count. */
+export function countOccurrences(haystack: string, needle: string): number {
+  if (needle.length === 0) return 0;
+  let count = 0;
+  let i = 0;
+  for (;;) {
+    i = haystack.indexOf(needle, i);
+    if (i === -1) return count;
+    count++;
+    i += needle.length;
   }
 }

@@ -121,8 +121,10 @@ describe("bridge up/down against real tmux + real daemon", () => {
       const status = (await (await fetch(`http://127.0.0.1:${PORT}/status`)).json()) as StatusResponse;
       expect(Object.keys(status.agents).sort()).toEqual(["agy", "claude", "codex", "opencode"]);
 
-      // re-running up refuses politely
-      expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(1);
+      // re-running up leaves the panes alone, re-ensures the daemon, exits 0
+      expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(0);
+      expect(await mux.listPanes(SESSION)).toHaveLength(4);
+      expect(await daemonHealthy(PORT)).toBe(true);
 
       const downCode = await down(cfg, { mux, print: (l) => lines.push(l) });
       expect(downCode).toBe(0);

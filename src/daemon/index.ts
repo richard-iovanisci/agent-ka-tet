@@ -39,7 +39,7 @@ export function main(): void {
     onLog: (line) => console.log(line),
   });
 
-  const pidFile = daemonPidFile();
+  const pidFile = daemonPidFile(cfg.daemonPort);
   mkdirSync(dirname(pidFile), { recursive: true });
   writeFileSync(pidFile, String(process.pid));
 

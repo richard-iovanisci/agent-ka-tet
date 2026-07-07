@@ -51,7 +51,9 @@ fi
 
 # Zero-scraping rule: capture-pane may appear only in the mux layer (previews,
 # echo-verify) — never as a state source (CLAUDE.md constraint 2).
-SCRAPES="$(grep -rln "capture-pane\|capturePane" src --include='*.ts' 2>/dev/null | grep -v '^src/mux/' || true)"
+# NOTE: -E alternation + options-before-operands, so BSD grep (macOS) behaves
+# identically to GNU grep.
+SCRAPES="$(grep -rlE --include='*.ts' 'capture-pane|capturePane' src 2>/dev/null | grep -v '^src/mux/' || true)"
 if [ -z "$SCRAPES" ]; then
   ok "no capture-pane use outside src/mux/"
 else
@@ -108,13 +110,13 @@ check_agent() { # agent, required(0/1)
   fi
   ok "$agent: events flowing ($(printf '%s\n' "$types" | sort -u | tr '\n' ' ' | sed 's/ $//'))"
 
-  if printf '%s\n' "$types" | grep -q '^turn.complete$'; then
+  if printf '%s\n' "$types" | grep -q '^turn\.complete$'; then
     ok "$agent: turn-complete observed"
   else
     if [ "$required" = "1" ]; then bad "$agent: no turn-complete event"; else warn "$agent: no turn-complete (partial coverage is allowed for agy)"; fi
   fi
 
-  if printf '%s\n' "$types" | grep -q '^session.start$\|^turn.start$'; then
+  if printf '%s\n' "$types" | grep -qE '^(session\.start|turn\.start)$'; then
     ok "$agent: session/turn start observed"
   else
     warn "$agent: no session.start/turn.start seen (was the session already running? acceptable)"
@@ -130,7 +132,7 @@ check_permission() { # agent, hint, required(0/1)
   printf '   When the approval prompt is VISIBLE (do not answer it yet), press Enter here... '
   read -r _
   types="$(events_since "$agent" "$base")"
-  if printf '%s\n' "$types" | grep -q '^permission.request$'; then
+  if printf '%s\n' "$types" | grep -q '^permission\.request$'; then
     ok "$agent: permission.request observed (needs-you badge should be showing in bridge top)"
   else
     if [ "$required" = "1" ]; then bad "$agent: no permission.request event"; else warn "$agent: no permission.request (known gap — no hook event for it)"; fi

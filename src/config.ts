@@ -23,6 +23,11 @@ export interface BridgeConfig {
   db: string;
   /** Repo/workdir agents launch in when an agent has no cwd override. */
   repo: string;
+  /**
+   * Directory the config was loaded from (where bridge.config.jsonc lives).
+   * The daemon is spawned with this — NOT cfg.repo, which may point elsewhere.
+   */
+  configDir: string;
   agents: Record<AgentName, AgentConfig>;
 }
 
@@ -37,6 +42,7 @@ export function defaultConfig(repo: string): BridgeConfig {
     opencodePort: 4096,
     db: join(stateDir(), "events.sqlite"),
     repo,
+    configDir: repo,
     agents: {
       claude: { enabled: true, command: "claude" },
       codex: { enabled: true, command: "codex" },
@@ -65,7 +71,7 @@ export function loadConfig(dir: string = process.cwd()): BridgeConfig {
   const o = raw as Record<string, unknown>;
 
   const cfg: BridgeConfig = { ...base };
-  if (o.session !== undefined) cfg.session = expectString(o.session, "session");
+  if (o.session !== undefined) cfg.session = expectSessionName(o.session);
   if (o.daemonPort !== undefined) cfg.daemonPort = expectPort(o.daemonPort, "daemonPort");
   if (o.opencodePort !== undefined) cfg.opencodePort = expectPort(o.opencodePort, "opencodePort");
   if (o.db !== undefined) cfg.db = expectString(o.db, "db");
@@ -99,6 +105,16 @@ export function loadConfig(dir: string = process.cwd()): BridgeConfig {
 function expectString(v: unknown, field: string): string {
   if (typeof v !== "string" || v.length === 0) throw new Error(`config: "${field}" must be a non-empty string`);
   return v;
+}
+
+function expectSessionName(v: unknown): string {
+  const s = expectString(v, "session");
+  // tmux silently rewrites '.' and ':' in session names, which would leave a
+  // session that down/attach can never target — reject up front instead.
+  if (/[.:\s]/.test(s)) {
+    throw new Error(`config: "session" must not contain '.', ':' or whitespace (tmux renames such sessions): ${JSON.stringify(s)}`);
+  }
+  return s;
 }
 
 function expectBoolean(v: unknown, field: string): boolean {

@@ -19,6 +19,7 @@ interface HookGroup {
 
 const HOOK_EVENTS: Array<{ event: string; matcher?: string }> = [
   { event: "SessionStart" },
+  { event: "SessionEnd" },
   { event: "UserPromptSubmit" },
   { event: "Stop" },
   { event: "StopFailure" },
@@ -36,18 +37,27 @@ function httpHandler(url: string): Record<string, unknown> {
   return { type: "http", url, timeout: 10 };
 }
 
-/** A group is ours iff every handler in it is an http handler for our URL. */
-function isOurs(group: HookGroup, url: string): boolean {
+/**
+ * A group is ours iff every handler in it is an http handler for the bridge
+ * events endpoint on ANY port — so changing daemonPort replaces the old
+ * groups instead of accumulating hooks that POST to a dead port.
+ */
+const OUR_URL_RE = /^http:\/\/127\.0\.0\.1:\d+\/events\/claude$/;
+
+function isOurs(group: HookGroup): boolean {
   return (
     Array.isArray(group.hooks) &&
     group.hooks.length > 0 &&
-    group.hooks.every((h) => h.type === "http" && h.url === url)
+    group.hooks.every((h) => h.type === "http" && typeof h.url === "string" && OUR_URL_RE.test(h.url))
   );
 }
 
 export function initClaude(cfg: BridgeConfig, opts: InitOptions = {}): WriteResult {
   const print = opts.print ?? console.log;
-  const path = join(cfg.repo, ".claude", "settings.json");
+  // Project-scope hooks only apply where the pane actually runs — which is
+  // the agent's cwd override when one is set, not necessarily cfg.repo.
+  const claudeCwd = cfg.agents.claude.cwd ?? cfg.repo;
+  const path = join(claudeCwd, ".claude", "settings.json");
   const url = claudeEventsUrl(cfg);
 
   const settings = readJsonConfig(path);
@@ -58,9 +68,9 @@ export function initClaude(cfg: BridgeConfig, opts: InitOptions = {}): WriteResu
 
   for (const { event, matcher } of HOOK_EVENTS) {
     const existing = Array.isArray(hooks[event]) ? (hooks[event] as HookGroup[]) : [];
-    // Idempotency: strip any group that is entirely ours, keep everything
-    // else untouched, then append the canonical group.
-    const foreign = existing.filter((g) => !isOurs(g, url));
+    // Idempotency: strip any group that is entirely ours (any port), keep
+    // everything else untouched, then append the canonical group.
+    const foreign = existing.filter((g) => !isOurs(g));
     const group: HookGroup = { hooks: [httpHandler(url)] };
     if (matcher !== undefined) group.matcher = matcher;
     hooks[event] = [...foreign, group];

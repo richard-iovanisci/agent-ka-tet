@@ -22,7 +22,7 @@ describe("initClaude", () => {
     const res = initClaude(cfg, { ...silent });
     expect(res.changed).toBe(true);
     const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
-    for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PostToolUse", "Notification"]) {
+    for (const event of ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PostToolUse", "Notification"]) {
       const groups = settings.hooks[event];
       expect(Array.isArray(groups)).toBe(true);
       expect(groups[0].hooks[0]).toEqual({
@@ -73,6 +73,25 @@ describe("initClaude", () => {
     initClaude(cfg, { ...silent });
     const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
     expect(settings.hooks.Stop[0].hooks[0].url).toBe("http://127.0.0.1:9999/events/claude");
+  });
+
+  test("changing daemonPort replaces old bridge groups instead of accumulating them", () => {
+    const { cfg, repo } = setup();
+    initClaude(cfg, { ...silent });
+    cfg.daemonPort = 4771;
+    initClaude(cfg, { ...silent });
+    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
+    expect(settings.hooks.Stop).toHaveLength(1);
+    expect(settings.hooks.Stop[0].hooks[0].url).toBe("http://127.0.0.1:4771/events/claude");
+  });
+
+  test("writes settings.json into the claude pane's cwd override, not cfg.repo", () => {
+    const { cfg, repo } = setup();
+    const paneCwd = mkdtempSync(join(tmpdir(), "bridge-claude-cwd-"));
+    cfg.agents.claude = { ...cfg.agents.claude, cwd: paneCwd };
+    initClaude(cfg, { ...silent });
+    expect(existsSync(join(paneCwd, ".claude", "settings.json"))).toBe(true);
+    expect(existsSync(join(repo, ".claude", "settings.json"))).toBe(false);
   });
 });
 

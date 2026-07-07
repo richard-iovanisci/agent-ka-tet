@@ -54,4 +54,18 @@ describe("loadConfig", () => {
     const cfg = defaultConfig("/x");
     expect(Object.keys(cfg.agents).sort()).toEqual(["agy", "claude", "codex", "opencode"]);
   });
+
+  test("configDir records where the config was loaded from, independent of repo", () => {
+    const dir = tempRepo('{"repo": "sub"}');
+    const cfg = loadConfig(dir);
+    expect(cfg.configDir).toBe(join(dir));
+    expect(cfg.repo).toBe(join(dir, "sub"));
+  });
+
+  test("session names tmux would rename are rejected", () => {
+    for (const bad of ["my.session", "a:b", "has space"]) {
+      const dir = tempRepo(JSON.stringify({ session: bad }));
+      expect(() => loadConfig(dir)).toThrow(/must not contain/);
+    }
+  });
 });
