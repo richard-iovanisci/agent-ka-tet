@@ -52,6 +52,13 @@ export interface MuxAdapter {
   /** Visible pane text; opts.lines reaches that far back into scrollback. */
   capturePane(paneId: string, opts?: { lines?: number }): Promise<string>;
   /**
+   * Injection etiquette, step 0: a freshly spawned pane's shell needs a beat
+   * before it can receive input — text typed earlier is echoed by the tty but
+   * never reaches a prompt line. Resolves true once the pane has drawn
+   * something (its prompt), false on timeout.
+   */
+  waitForShellReady(paneId: string, timeoutMs?: number): Promise<boolean>;
+  /**
    * Inject text as ONE paste (bracketed when the app requests it), echo-verify
    * unless opts.verify === false (retrying the paste once on failure), and —
    * only after the paste lands — send a single trailing Enter when

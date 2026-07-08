@@ -110,6 +110,12 @@ export async function up(cfg: BridgeConfig, opts: UpOptions): Promise<number> {
   for (const { agent, paneId } of panes) {
     await mux.setPaneTitle(paneId, agent);
     const cmd = launchCommand(cfg, agent);
+    // Injection etiquette step 0: text typed before the shell draws its
+    // prompt is echoed by the tty but never executes.
+    if (!(await mux.waitForShellReady(paneId))) {
+      print(`${agent}: pane ${paneId} shell never became ready — launch \`${cmd}\` in it manually`);
+      continue;
+    }
     const sent = await mux.sendText(paneId, cmd, { submit: true });
     print(`${agent}: launched \`${cmd}\` in pane ${paneId}${sent.verified ? "" : " (echo-verify failed — check the pane)"}`);
   }

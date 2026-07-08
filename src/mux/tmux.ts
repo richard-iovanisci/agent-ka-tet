@@ -205,6 +205,17 @@ export class TmuxAdapter implements MuxAdapter {
     return this.exec(args);
   }
 
+  async waitForShellReady(paneId: string, timeoutMs = 10_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      // Any drawn character means the shell got as far as its prompt. Input
+      // pasted before this point is echoed by the tty but lost to the shell.
+      if (/\S/.test(await this.capturePane(paneId))) return true;
+      if (Date.now() >= deadline) return false;
+      await Bun.sleep(VERIFY_POLL_MS);
+    }
+  }
+
   async sendText(
     paneId: string,
     text: string,

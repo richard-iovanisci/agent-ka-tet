@@ -18,6 +18,16 @@ afterAll(() => {
   Bun.spawnSync(["tmux", "-L", SOCKET, "kill-server"]);
 });
 
+/** Poll an async predicate every 50ms until true or timeout. */
+async function pollFor(predicate: () => Promise<boolean>, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await predicate()) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(50);
+  }
+}
+
 function agentStatus(partial: Partial<AgentStatus> & Pick<AgentStatus, "agent">): AgentStatus {
   return {
     enabled: true,
@@ -98,10 +108,13 @@ describe("bridge up/down against real tmux + real daemon", () => {
           daemonPort: PORT,
           db: join(repo, "events.sqlite"),
           agents: {
-            claude: { command: "cat" },
-            codex: { command: "cat" },
-            agy: { command: "cat" },
-            opencode: { command: "cat" },
+            // echo markers: lets the test assert the launch command actually
+            // EXECUTED in the pane (a paste that lands before the shell is
+            // ready echoes to the tty but never runs — a real regression).
+            claude: { command: "echo bridge-launched-claude" },
+            codex: { command: "echo bridge-launched-codex" },
+            agy: { command: "echo bridge-launched-agy" },
+            opencode: { command: "echo bridge-launched-opencode" },
           },
         }),
       );
@@ -116,6 +129,19 @@ describe("bridge up/down against real tmux + real daemon", () => {
       const panes = await mux.listPanes(SESSION);
       expect(panes).toHaveLength(4);
       expect(await daemonHealthy(PORT)).toBe(true);
+
+      // Launch commands must have EXECUTED (not just been pasted): the echo
+      // marker only appears in output when the shell ran the command. Note
+      // launchCommand appends --port/--hostname to the opencode pane's echo,
+      // so match on the marker itself.
+      for (const pane of panes) {
+        const executed = await pollFor(async () => {
+          const text = await mux.capturePane(pane.id);
+          // marker on a line of its own = command output, not the echoed paste
+          return text.split("\n").some((l) => l.trim().startsWith("bridge-launched-"));
+        });
+        expect(executed).toBe(true);
+      }
 
       // status endpoint knows all four agents
       const status = (await (await fetch(`http://127.0.0.1:${PORT}/status`)).json()) as StatusResponse;

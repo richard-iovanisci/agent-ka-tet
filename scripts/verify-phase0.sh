@@ -53,7 +53,8 @@ fi
 # echo-verify) — never as a state source (CLAUDE.md constraint 2).
 # NOTE: -E alternation + options-before-operands, so BSD grep (macOS) behaves
 # identically to GNU grep.
-SCRAPES="$(grep -rlE --include='*.ts' 'capture-pane|capturePane' src 2>/dev/null | grep -v '^src/mux/' || true)"
+# (tests may capture panes to assert injection worked; production code may not)
+SCRAPES="$(grep -rlE --include='*.ts' 'capture-pane|capturePane' src 2>/dev/null | grep -v '^src/mux/' | grep -v '\.test\.ts$' || true)"
 if [ -z "$SCRAPES" ]; then
   ok "no capture-pane use outside src/mux/"
 else
