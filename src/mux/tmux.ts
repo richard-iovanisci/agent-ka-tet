@@ -30,6 +30,7 @@ const SEP = "\x1f"; // ASCII unit separator — cannot appear in tmux format out
 const PANE_FORMAT = [
   "#{pane_id}",
   "#{pane_index}",
+  "#{@agent-bridge-agent-id}",
   "#{pane_title}",
   "#{pane_current_command}",
   "#{pane_width}",
@@ -42,6 +43,8 @@ const VERIFY_TIMEOUT_MS = 2000;
 const VERIFY_POLL_MS = 50;
 /** Distinctive-fragment length for echo verification. */
 const VERIFY_FRAGMENT_CHARS = 40;
+const SESSION_MARKER_OPTION = "@agent-bridge-owner";
+const PANE_AGENT_ID_OPTION = "@agent-bridge-agent-id";
 
 let bufferSeq = 0;
 
@@ -116,6 +119,38 @@ export class TmuxAdapter implements MuxAdapter {
     return r.exitCode === 0;
   }
 
+  async setSessionMarker(session: string, value: string): Promise<void> {
+    const target = await this.sessionId(session);
+    await this.exec(["set-option", "-t", target, SESSION_MARKER_OPTION, value]);
+  }
+
+  async getSessionMarker(session: string): Promise<string | null> {
+    const target = await this.sessionId(session);
+    const r = await this.run([
+      "show-options",
+      "-v",
+      "-t",
+      target,
+      SESSION_MARKER_OPTION,
+    ]);
+    if (r.exitCode !== 0) return null;
+    const value = r.stdout.trim();
+    return value.length > 0 ? value : null;
+  }
+
+  /** Resolve an exact session name to tmux's unambiguous `$N` id. */
+  private async sessionId(session: string): Promise<string> {
+    return (
+      await this.exec([
+        "display-message",
+        "-p",
+        "-t",
+        exactWindow(session),
+        "#{session_id}",
+      ])
+    ).trim();
+  }
+
   async createSession(
     session: string,
     opts: { cwd: string; width?: number; height?: number },
@@ -170,11 +205,12 @@ export class TmuxAdapter implements MuxAdapter {
       if (line.length === 0) continue;
       // tmux vis-encodes control characters when printing command output, so
       // the \x1f separator can come back as the literal four chars "\037".
-      const [id, index, title, command, width, height, active] =
+      const [id, index, agentId, title, command, width, height, active] =
         line.split(/\x1f|\\037/);
       if (
         id === undefined ||
         index === undefined ||
+        agentId === undefined ||
         title === undefined ||
         command === undefined ||
         width === undefined ||
@@ -186,6 +222,7 @@ export class TmuxAdapter implements MuxAdapter {
       panes.push({
         id,
         index: Number.parseInt(index, 10),
+        agentId: agentId.length > 0 ? agentId : null,
         title,
         command,
         width: Number.parseInt(width, 10),
@@ -256,6 +293,17 @@ export class TmuxAdapter implements MuxAdapter {
     // Pane ids are server-global; they resolve the window too.
     await this.exec(["select-window", "-t", paneId]);
     await this.exec(["select-pane", "-t", paneId]);
+  }
+
+  async setPaneAgentId(paneId: string, agentId: string): Promise<void> {
+    await this.exec([
+      "set-option",
+      "-p",
+      "-t",
+      paneId,
+      PANE_AGENT_ID_OPTION,
+      agentId,
+    ]);
   }
 
   async setPaneTitle(paneId: string, title: string): Promise<void> {

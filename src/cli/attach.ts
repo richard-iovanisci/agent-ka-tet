@@ -1,10 +1,17 @@
-import type { BridgeConfig } from "../config.ts";
+import { bridgeSessionMarker, type BridgeConfig } from "../config.ts";
 import type { MuxAdapter } from "../mux/adapter.ts";
 
 export async function attach(cfg: BridgeConfig, opts: { mux: MuxAdapter; print?: (l: string) => void }): Promise<number> {
   const print = opts.print ?? console.log;
   if (!(await opts.mux.hasSession(cfg.session))) {
     print(`session "${cfg.session}" is not running — \`bridge up\` first`);
+    return 1;
+  }
+  const marker = await opts.mux.getSessionMarker(cfg.session);
+  if (marker !== bridgeSessionMarker(cfg)) {
+    print(
+      `session "${cfg.session}" belongs to another or stale bridge configuration — refusing to attach`,
+    );
     return 1;
   }
   const argv = opts.mux.attachArgs(cfg.session);

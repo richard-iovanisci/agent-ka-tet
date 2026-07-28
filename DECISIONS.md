@@ -30,6 +30,86 @@ Deviations from DESIGN.md are logged here **before** implementation. Format: dat
 
 ## 2026-07-07 — agy: statusline forwarder as primary state feed; hooks at `~/.gemini/config/hooks.json`
 
-**What:** (a) agy's primary state signal is a statusline-customization forwarder (stdin JSON carries `agent_state: initializing|idle|thinking|working|tool_use`) teed to the daemon, with `PreToolUse`/`PostToolUse`/`Stop` command-shim hooks as secondary; (b) the canonical global hooks path is `~/.gemini/config/hooks.json` — DESIGN.md's `~/.gemini/antigravity-cli/hooks.json` is the legacy/buggy location (upstream issue #49), so the writer targets the canonical path (details + evidence in docs/agy-notes.md); (c) agy hook shims append `?native=<Event>` when POSTing because agy payloads are not verified to carry an event-name field.
+**What:** (a) agy's primary state signal is a statusline-customization forwarder (stdin JSON carries `agent_state: initializing|idle|thinking|working|tool_use`) teed to the daemon, with `PreToolUse`/`PostToolUse`/`Stop` command-shim hooks as secondary; (b) the canonical global hooks path is `~/.gemini/config/hooks.json` — DESIGN.md's `~/.gemini/antigravity-cli/hooks.json` is the legacy/buggy location (upstream issue #49), so the writer targets the canonical path (details + evidence remain at `origin/phase-0:docs/agy-notes.md`); (c) agy hook shims append `?native=<Event>` when POSTing because agy payloads are not verified to carry an event-name field.
 **Why:** agy has no PermissionRequest/SessionStart hook equivalents; the statusline feed is the only verified push-based idle/working signal. Still zero scraping.
 **Impact:** agy `needs_you` detection stays partial in Phase 0 (allowed by HANDOFF.md exit criteria); everything else is event-driven.
+
+## 2026-07-13 — Reset v0 around Claude Code + Codex
+
+**What:** The active product and Phase 0 acceptance target are now two native TUIs: Claude Code and Codex, side by side in tmux. OpenCode and Antigravity (`agy`) are parked, and Grok was never implemented. The active model separates a configured agent's `id` from its adapter `kind`; v0 supports the `claude` and `codex` kinds and defaults to one instance of each. The existing OpenCode- and agy-specific decisions above remain as implementation history but are superseded for active v0 scope.
+
+**Why:** The project's durable value is coordinating Claude Code and Codex without replacing either native TUI. The four-provider breadth delayed the first useful workflow, made Phase 0 live verification depend on tools outside the primary use case, and coupled common types to provider names. Separating identity from adapter kind preserves a clean path to configurable N instances without keeping speculative providers active.
+
+**Impact:** Phase 0 is reopened as the two-agent foundation: deterministic horizontal panes, two-agent event/status wiring, daemon independence, and live verification on macOS then WSL2. OpenCode SSE, agy fallback logic, their config writers, and their acceptance checks leave the active build. Later phases prioritize bidirectional handoffs and pair workflow before rate-aware routing or additional providers.
+
+## 2026-07-13 — Codex lifecycle hooks are the sole Phase 0 event path
+
+**What:** `bridge init` uses Codex `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, and `Stop` command hooks. It no longer edits the global `notify` setting.
+
+**Why:** Current Codex documentation exposes these lifecycle events directly through `hooks.json`; `Stop` includes the last assistant message. The separate `notify` command is redundant for turn completion and is a single global user setting that may already belong to another tool.
+
+**Impact:** Codex observation stays event-driven while `bridge init` becomes less invasive and avoids notification-config conflicts. Existing hook trust review through `/hooks` remains required.
+
+## 2026-07-13 — Retire only integrations provably owned by the old bridge
+
+**What:** During the two-agent migration, `bridge init` removes the exact legacy Codex `notify` value that points at Agent Bridge's own notify shim and the exact `agent-bridge` agy hook blocks written by the previous Phase 0 initializer. It also removes owned Claude/Codex lifecycle handlers when that configured instance is disabled. Mixed hook groups are pruned handler-by-handler so foreign handlers and group metadata survive.
+
+**Why:** Parking a provider in common types is insufficient if callbacks installed by an earlier checkout keep posting to the new daemon. Conversely, broad cleanup would violate config ownership. Exact path/schema checks give the reset a bounded uninstall path without claiming user-managed settings.
+
+**Impact:** A first post-reframe `bridge init` may print and apply diff-backed, backup-protected removals in `~/.codex/config.toml` and the two legacy agy hook files. Foreign `notify` values, modified agy blocks, foreign handlers, and unrelated settings remain byte-for-byte or structurally preserved. After this one migration, active init manages only Claude Code and Codex lifecycle hooks and does not install or replace `notify`.
+
+## 2026-07-13 — Scope active Codex hooks to the target repo
+
+**What:** New Codex lifecycle handlers are written to the configured Codex instance's `<cwd>/.codex/hooks.json`, not the user-global `~/.codex/hooks.json`. The migration removes only handlers pointing at Agent Bridge's exact legacy global shim paths, including handlers inside mixed groups.
+
+**Why:** Current Codex supports project-local hook layers. A user-global forwarder observes every Codex TUI on the machine and cannot intrinsically identify the one pane managed by this bridge. Project scope plus daemon-side `cwd` validation narrows events to the selected target while preserving the native TUI.
+
+**Impact:** The target project must be trusted by Codex and the project hook definition approved once through `/hooks`. Initial migration may back up and edit the old global hooks file solely to remove Agent Bridge-owned commands; all foreign global hooks remain. Concurrent sessions in another repo no longer call this bridge. Phase 0 still assumes one live session per adapter kind within the same target cwd; binding a pane to a native session id is deferred.
+
+## 2026-07-27 — Keep pane identity outside TUI-owned display titles
+
+**What:** Each managed pane carries its configured `AgentId` in the pane-scoped tmux user option `@agent-bridge-agent-id`. The mux adapter and live verifier use this marker as durable pane identity. `select-pane -T <agent-id>` remains a best-effort initial display label only.
+
+**Why:** The first authenticated macOS run proved that both native TUIs legitimately overwrite `pane_title` through terminal title escape sequences: Claude Code changed it to `✳ Claude Code`, and Codex changed it to the repository name. tmux's `allow-rename` option governs window names, not pane titles, so the verifier's title equality check could never be stable once real TUIs launched.
+
+**Impact:** Native titles remain visible and TUI-controlled, while ownership/layout checks use metadata the child process cannot rewrite accidentally. The destructive daemon-independence test revalidates pane IDs and pane-agent markers before signalling or recovering. Real-tmux coverage now overwrites a visible title and proves the pane marker survives.
+
+## 2026-07-27 — Claude idle reminders do not mean needs-you
+
+**What:** Claude Code's `Notification:idle_prompt` is observational only. New Agent Bridge hook configuration no longer subscribes to that subtype, and the compatibility mapper classifies any `idle_prompt` delivered by already-loaded configuration as `raw`. `permission_prompt` remains a permission request, and `agent_needs_input` remains an explicit needs-input transition.
+
+**Why:** The authenticated macOS run showed Claude emitting `idle_prompt` about sixty seconds after an ordinary completed turn while its TUI remained at the normal input prompt. Treating that reminder as `needs.input` incorrectly changed an already-idle agent to `needs_you`.
+
+**Impact:** Claude remains `idle` after the passive reminder, while real permission and explicit input requests still show `NEEDS YOU`. Re-running `bridge init` updates the matcher; the mapper fallback makes the behavior safe even before a restarted Claude process loads that update.
+
+## 2026-07-27 — Codex with no observed turn remains launching
+
+**What:** Agent Bridge does not synthesize an idle event for a newly opened Codex TUI or after a daemon-only restart. While the current daemon has observed no semantic event, `bridge top` keeps the normalized state `launching` and explains it as `awaiting first observed turn`.
+
+**Why:** Codex 0.145.0 queues `SessionStart` at session construction but executes it inside the first `run_turn`, immediately before `UserPromptSubmit`. The hook therefore marks first-turn startup, not an untouched TUI becoming ready. Inferring idle from pane text or injecting a hidden warm-up prompt would violate the event-only and native-TUI constraints.
+
+**Impact:** A Codex pane with no events in the current daemon visibly reads `launching  awaiting first observed turn`; after the operator submits a prompt, normal `working → idle` hook transitions apply. The wording also remains true when an in-memory registry starts again behind an existing TUI. A future coordinator-owned process/readiness dimension or persisted-state replay may describe availability without falsifying semantic agent state.
+
+## 2026-07-28 — Canonical Claude permission detail outranks its delayed notification
+
+**What:** Claude Code's `PermissionRequest` hook is the authoritative detail source for a tool approval, while `Notification:permission_prompt` remains subscribed as a fallback human-attention signal. A native `PermissionRequest` always sets or upgrades the pending detail; a notification sets it only when no permission detail is already active.
+
+**Why:** The authenticated macOS event history showed four tool approvals where `PermissionRequest` arrived with a specific `tool_name`, followed 6.000–6.021 seconds later by `Notification:permission_prompt` carrying only `Claude needs your permission`. Unconditional replacement downgraded the useful badge. The same history also contains a notification-only `Session paused` model-consent fallback, so removing the notification would miss a real human decision. Claude's hook reference likewise distinguishes the controllable, tool-specific request from the asynchronous alert surface.
+
+**Impact:** A Claude tool approval keeps `⚠ Bash` (or the originating tool name) when the delayed generic notification arrives, while a notification-only consent/input prompt still produces `NEEDS YOU` with its own message. The event remains stored and may appear as the latest native event; only the active human-attention detail has source precedence. Hook configuration does not change.
+
+## 2026-07-28 — Render unresolved attention separately from event recency
+
+**What:** Daemon status keeps `lastEvent` as the literal latest normalized event and adds `activeAttention` as the provenance of the unresolved human-attention state. While an agent is `needs_you`, `bridge top` renders `activeAttention`; otherwise it renders `lastEvent`. A canonical `PermissionRequest` establishes or upgrades both the active detail and its provenance, while Claude's later generic `Notification:permission_prompt` remains recorded as `lastEvent` without replacing either. Notification-only consent and explicit needs-input events still establish their own attention provenance.
+
+**Why:** Preserving only the `⚠ Bash` detail was insufficient: the delayed notification still changed the middle column from `PermissionRequest` to `Notification:permission_prompt`. Rewriting or suppressing `lastEvent` would make daemon status and event history misleading. A separate unresolved-attention projection makes both views truthful and stable.
+
+**Impact:** A pending Claude tool approval remains visually `PermissionRequest … ⚠ Bash` even after its advisory notification arrives. `/status.lastEvent` and SQLite still expose that notification as the most recent observed event. Resolution, progress, completion, and exit events clear both the pending detail and its provenance.
+
+## 2026-07-28 — Do not infer Claude manual permission dismissal
+
+**What:** Agent Bridge does not synthesize `idle` when the user presses Escape or manually declines a Claude permission dialog. It continues to clear attention on the next trusted lifecycle hook. It does not use a timeout, transcript polling, pane scraping, focus changes, or tmux key interception as a substitute for the missing hook.
+
+**Why:** Authenticated session evidence records `toolDenialKind: "user-rejected"` in Claude's transcript for each Escape but shows no corresponding hook event. Claude's current hook reference explicitly says `PermissionDenied` does not run for manual denial, while tool-result hooks cannot run for a tool that never executed. Declaring idle without an observable resolution could violate the idle-only injection safety invariant.
+
+**Impact:** After Escape, `needs_you` may remain visible until the next `UserPromptSubmit`, `Stop`, tool-result, failure, session-end, or other clearing event. Re-subscribing to `Notification:idle_prompt` as a delayed idle observation remains a possible hook-only improvement, but it requires an authenticated proof that the notification fires after dismissal and never while an approval dialog remains open before it can become trusted lifecycle state.

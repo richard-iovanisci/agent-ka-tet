@@ -1,19 +1,21 @@
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { BridgeConfig } from "../../config.ts";
+import { agentForKind, type BridgeConfig } from "../../config.ts";
 import { writeConfigFile, type WriteResult } from "../../util/configFile.ts";
 import {
   readJsonConfig,
-  resolveHome,
+  quoteShellArg,
+  scopedShimsDir,
   serializeJson,
   shimsDir,
+  unquoteGeneratedShellArg,
   writeShim,
   type InitOptions,
 } from "../initCommon.ts";
 
 /**
- * Wire Codex CLI to the daemon: ~/.codex/hooks.json command shims (stdin JSON
- * → curl) plus `notify` in ~/.codex/config.toml for agent-turn-complete.
+ * Wire Codex CLI to the daemon through project-local .codex/hooks.json
+ * command shims (stdin JSON → curl). We deliberately do not claim `notify`
+ * setting; the Stop lifecycle hook is the canonical completion signal.
  * Schema verified against developers.openai.com/codex/hooks July 2026.
  *
  * Trust model: Codex records approval per hook-definition hash, so the writer
@@ -23,21 +25,14 @@ import {
 
 const HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse"] as const;
 
-interface HookGroup {
-  matcher?: string;
-  hooks: Array<Record<string, unknown>>;
-}
-
 export function codexEventsUrl(cfg: BridgeConfig): string {
-  return `http://127.0.0.1:${cfg.daemonPort}/events/codex`;
+  const codex = agentForKind(cfg, "codex");
+  if (codex === undefined) throw new Error("no Codex instance is configured");
+  return `http://127.0.0.1:${cfg.daemonPort}/events/${codex.id}`;
 }
 
-export function codexHookShimPath(opts: InitOptions): string {
-  return join(shimsDir(opts), "bridge-codex-hook.sh");
-}
-
-export function codexNotifyShimPath(opts: InitOptions): string {
-  return join(shimsDir(opts), "bridge-codex-notify.sh");
+export function codexHookShimPath(cfg: BridgeConfig, opts: InitOptions): string {
+  return join(scopedShimsDir(cfg, opts), "bridge-codex-hook.sh");
 }
 
 function hookShimScript(url: string): string {
@@ -49,53 +44,66 @@ exit 0
 `;
 }
 
-function notifyShimScript(url: string): string {
-  return `#!/usr/bin/env bash
-# agent-bridge: forward a Codex notify payload (JSON in argv[1]) to the daemon.
-# Must NEVER fail or block the agent: short timeout, always exit 0.
-if [ -n "\${1:-}" ]; then
-  curl -fsS -m 2 -X POST -H 'content-type: application/json' --data-binary "\$1" "${url}" >/dev/null 2>&1 || true
-fi
-exit 0
-`;
+function isOwnedHandler(handler: unknown, opts: InitOptions): boolean {
+  if (typeof handler !== "object" || handler === null || Array.isArray(handler)) {
+    return false;
+  }
+  const record = handler as Record<string, unknown>;
+  if (record.type !== "command" || typeof record.command !== "string") return false;
+  const commandPath = unquoteGeneratedShellArg(record.command);
+  return (
+    commandPath === join(shimsDir(opts), "bridge-codex-hook.sh") ||
+    (commandPath.startsWith(`${shimsDir(opts)}/`) &&
+      commandPath.endsWith("/bridge-codex-hook.sh"))
+  );
 }
 
-function isOurs(group: HookGroup, shimPath: string): boolean {
-  return (
-    Array.isArray(group.hooks) &&
-    group.hooks.length > 0 &&
-    group.hooks.every((h) => h.type === "command" && h.command === shimPath)
-  );
+/** Remove only our handlers, retaining mixed-group metadata and foreign handlers. */
+function pruneOwnedHandlers(group: unknown, opts: InitOptions): unknown | null {
+  if (typeof group !== "object" || group === null || Array.isArray(group)) return group;
+  const record = group as Record<string, unknown>;
+  if (!Array.isArray(record.hooks)) return group;
+  const hooks = record.hooks.filter((handler) => !isOwnedHandler(handler, opts));
+  if (hooks.length === record.hooks.length) return group;
+  return hooks.length === 0 ? null : { ...record, hooks };
 }
 
 export interface CodexInitResult {
   hooksJson: WriteResult;
-  configTomlChanged: boolean;
-  notifyConflict: string | null;
 }
 
 export function initCodex(cfg: BridgeConfig, opts: InitOptions = {}): CodexInitResult {
   const print = opts.print ?? console.log;
-  const home = resolveHome(opts);
   const url = codexEventsUrl(cfg);
+  const codex = agentForKind(cfg, "codex");
+  if (codex === undefined) throw new Error("no Codex instance is configured");
 
   // 1. Shims (through the diff+backup engine like everything else).
-  const hookShim = codexHookShimPath(opts);
-  const notifyShim = codexNotifyShimPath(opts);
+  const hookShim = codexHookShimPath(cfg, opts);
   writeShim(hookShim, hookShimScript(url), opts);
-  writeShim(notifyShim, notifyShimScript(url), opts);
 
-  // 2. ~/.codex/hooks.json — merge our command groups, preserve foreign ones.
-  const hooksPath = join(home, ".codex", "hooks.json");
+  // 2. Project-local hooks: avoid observing unrelated Codex sessions.
+  const hooksPath = join(codex.cwd ?? cfg.repo, ".codex", "hooks.json");
   const root = readJsonConfig(hooksPath);
   const hooks =
     typeof root.hooks === "object" && root.hooks !== null && !Array.isArray(root.hooks)
       ? (root.hooks as Record<string, unknown>)
       : {};
   for (const event of HOOK_EVENTS) {
-    const existing = Array.isArray(hooks[event]) ? (hooks[event] as HookGroup[]) : [];
-    const foreign = existing.filter((g) => !isOurs(g, hookShim));
-    hooks[event] = [...foreign, { hooks: [{ type: "command", command: hookShim, timeout: 10 }] }];
+    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+    const foreign = existing
+      .map((group) => pruneOwnedHandlers(group, opts))
+      .filter((group) => group !== null);
+    hooks[event] = [
+      ...foreign,
+      {
+        hooks: [{
+          type: "command",
+          command: quoteShellArg(hookShim),
+          timeout: 10,
+        }],
+      },
+    ];
   }
   root.hooks = hooks;
   print(`codex: hooks (command shim → ${url}) in ${hooksPath}`);
@@ -105,28 +113,44 @@ export function initCodex(cfg: BridgeConfig, opts: InitOptions = {}): CodexInitR
     print("codex:        (trust is per definition hash; identical re-runs stay approved)");
   }
 
-  // 3. notify = [...] in ~/.codex/config.toml. TOML top-level keys must appear
-  //    before the first [section]; we only ever insert at the top, and we never
-  //    overwrite a foreign notify setting.
-  const tomlPath = join(home, ".codex", "config.toml");
-  const desired = `notify = ["${notifyShim}"]`;
-  const current = existsSync(tomlPath) ? readFileSync(tomlPath, "utf8") : "";
-  const notifyLine = current.split("\n").find((l) => /^\s*notify\s*=/.test(l));
+  return { hooksJson };
+}
 
-  let configTomlChanged = false;
-  let notifyConflict: string | null = null;
-  if (notifyLine === undefined) {
-    const next = `# agent-bridge: forward turn-complete notifications to the daemon\n${desired}\n${current}`;
-    print(`codex: notify → ${tomlPath}`);
-    configTomlChanged = writeConfigFile(tomlPath, next, { print, dryRun: opts.dryRun }).changed;
-  } else if (notifyLine.trim() === desired) {
-    print(`codex: notify already wired in ${tomlPath}`);
-  } else {
-    notifyConflict = notifyLine.trim();
-    print(`codex: WARNING — ${tomlPath} already sets: ${notifyConflict}`);
-    print(`codex:            leaving it untouched (turn-complete still arrives via the Stop hook).`);
-    print(`codex:            to also use notify, set it yourself to: ${desired}`);
+/** Remove only Agent Bridge handlers when the configured Codex instance is disabled. */
+export function removeCodexHooks(
+  cfg: BridgeConfig,
+  opts: InitOptions = {},
+): WriteResult {
+  const print = opts.print ?? console.log;
+  const codex = agentForKind(cfg, "codex");
+  if (codex === undefined) throw new Error("no Codex instance is configured");
+  const hooksPath = join(codex.cwd ?? cfg.repo, ".codex", "hooks.json");
+  const root = readJsonConfig(hooksPath);
+  const hooks =
+    typeof root.hooks === "object" && root.hooks !== null && !Array.isArray(root.hooks)
+      ? (root.hooks as Record<string, unknown>)
+      : {};
+  let removed = false;
+  for (const event of HOOK_EVENTS) {
+    if (!Array.isArray(hooks[event])) continue;
+    const existing = hooks[event];
+    const pruned = existing
+      .map((group) => pruneOwnedHandlers(group, opts))
+      .filter((group) => group !== null);
+    if (pruned.length !== existing.length || pruned.some((group, i) => group !== existing[i])) {
+      removed = true;
+      if (pruned.length === 0) delete hooks[event];
+      else hooks[event] = pruned;
+    }
   }
-
-  return { hooksJson, configTomlChanged, notifyConflict };
+  if (!removed) {
+    print(`codex: disabled; no Agent Bridge hooks found in ${hooksPath}`);
+    return { path: hooksPath, changed: false, backupPath: null };
+  }
+  root.hooks = hooks;
+  print(`codex: disabled; removing Agent Bridge hooks from ${hooksPath}`);
+  return writeConfigFile(hooksPath, serializeJson(root), {
+    print,
+    dryRun: opts.dryRun,
+  });
 }

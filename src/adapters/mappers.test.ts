@@ -1,175 +1,122 @@
 import { describe, expect, test } from "bun:test";
+import type { AgentIdentity } from "../types.ts";
 import { mapNativeEvent, permissionDigest } from "./mappers.ts";
 
-describe("claude mapper", () => {
-  test("hook events map to canonical types", () => {
+const CLAUDE: AgentIdentity = { id: "primary-claude", kind: "claude" };
+const CODEX: AgentIdentity = { id: "review_codex", kind: "codex" };
+
+describe("Claude mapper", () => {
+  test("hook events map to canonical types and preserve instance identity", () => {
     const cases: Array<[string, string]> = [
       ["SessionStart", "session.start"],
       ["UserPromptSubmit", "turn.start"],
       ["Stop", "turn.complete"],
       ["StopFailure", "turn.error"],
       ["PermissionRequest", "permission.request"],
+      ["PermissionDenied", "permission.resolved"],
       ["PostToolUse", "permission.resolved"],
+      ["SessionEnd", "agent.exit"],
     ];
+
     for (const [native, normalized] of cases) {
-      const e = mapNativeEvent("claude", { hook_event_name: native, session_id: "s1" });
-      expect(e.type).toBe(normalized as never);
-      expect(e.sessionId).toBe("s1");
-      expect(e.payload.nativeType).toBe(native);
+      const event = mapNativeEvent(CLAUDE, {
+        hook_event_name: native,
+        session_id: "s1",
+      });
+      expect(event.agent).toBe("primary-claude");
+      expect(event.kind).toBe("claude");
+      expect(event.type).toBe(normalized as never);
+      expect(event.sessionId).toBe("s1");
+      expect(event.payload.nativeType).toBe(native);
     }
   });
 
   test("notification subtypes", () => {
-    const permission = mapNativeEvent("claude", {
+    const permission = mapNativeEvent(CLAUDE, {
       hook_event_name: "Notification",
       notification_type: "permission_prompt",
       session_id: "s1",
     });
     expect(permission.type).toBe("permission.request");
-    expect(permission.payload.nativeType).toBe("Notification:permission_prompt");
+    expect(permission.payload.nativeType).toBe(
+      "Notification:permission_prompt",
+    );
 
-    const idle = mapNativeEvent("claude", {
+    const idle = mapNativeEvent(CLAUDE, {
       hook_event_name: "Notification",
       notification_type: "idle_prompt",
       session_id: "s1",
     });
-    expect(idle.type).toBe("needs.input");
+    expect(idle.type).toBe("raw");
+    expect(idle.payload.nativeType).toBe("Notification:idle_prompt");
 
-    // subagent completion is not "this agent is done"
-    const sub = mapNativeEvent("claude", {
+    const needsInput = mapNativeEvent(CLAUDE, {
+      hook_event_name: "Notification",
+      notification_type: "agent_needs_input",
+      session_id: "s1",
+    });
+    expect(needsInput.type).toBe("needs.input");
+
+    // A background subagent completing does not complete the main session.
+    const subagent = mapNativeEvent(CLAUDE, {
       hook_event_name: "Notification",
       notification_type: "agent_completed",
       session_id: "s1",
     });
-    expect(sub.type).toBe("raw");
+    expect(subagent.type).toBe("raw");
   });
 
-  test("unknown/garbage payloads degrade to raw, never throw", () => {
-    expect(mapNativeEvent("claude", null).type).toBe("raw");
-    expect(mapNativeEvent("claude", "junk").type).toBe("raw");
-    expect(mapNativeEvent("claude", { hook_event_name: "SomethingNew" }).type).toBe("raw");
+  test("unknown and malformed payloads degrade to raw without losing identity", () => {
+    for (const body of [null, "junk", { hook_event_name: "SomethingNew" }]) {
+      const event = mapNativeEvent(CLAUDE, body);
+      expect(event.agent).toBe("primary-claude");
+      expect(event.kind).toBe("claude");
+      expect(event.type).toBe("raw");
+    }
   });
 });
 
-describe("codex mapper", () => {
-  test("hook payloads (snake_case)", () => {
-    const e = mapNativeEvent("codex", {
-      hook_event_name: "Stop",
-      session_id: "c1",
-      last_assistant_message: "done",
-    });
-    expect(e.type).toBe("turn.complete");
-    expect(e.sessionId).toBe("c1");
+describe("Codex mapper", () => {
+  test("hook events map to canonical types and preserve instance identity", () => {
+    const cases: Array<[string, string]> = [
+      ["SessionStart", "session.start"],
+      ["UserPromptSubmit", "turn.start"],
+      ["Stop", "turn.complete"],
+      ["PermissionRequest", "permission.request"],
+      ["PostToolUse", "permission.resolved"],
+    ];
+
+    for (const [native, normalized] of cases) {
+      const event = mapNativeEvent(CODEX, {
+        hook_event_name: native,
+        session_id: "c1",
+      });
+      expect(event.agent).toBe("review_codex");
+      expect(event.kind).toBe("codex");
+      expect(event.type).toBe(normalized as never);
+      expect(event.sessionId).toBe("c1");
+      expect(event.payload.nativeType).toBe(native);
+    }
   });
 
-  test("notify payload (hyphenated agent-turn-complete)", () => {
-    const e = mapNativeEvent("codex", {
-      type: "agent-turn-complete",
-      "thread-id": "t9",
-      "last-assistant-message": "done",
-    });
-    expect(e.type).toBe("turn.complete");
-    expect(e.sessionId).toBe("t9");
-    expect(e.payload.nativeType).toBe("agent-turn-complete");
-  });
-
-  test("permission request", () => {
-    const e = mapNativeEvent("codex", {
+  test("permission request exposes a human-readable digest", () => {
+    const event = mapNativeEvent(CODEX, {
       hook_event_name: "PermissionRequest",
       session_id: "c1",
       tool_name: "shell",
     });
-    expect(e.type).toBe("permission.request");
-    expect(permissionDigest(e)).toBe("shell");
-  });
-});
-
-describe("opencode mapper", () => {
-  test("session.status busy/idle/retry", () => {
-    const busy = mapNativeEvent("opencode", {
-      id: "evt_1",
-      type: "session.status",
-      properties: { sessionID: "ses1", status: { type: "busy" } },
-    });
-    expect(busy.type).toBe("turn.start");
-
-    const idle = mapNativeEvent("opencode", {
-      id: "evt_2",
-      type: "session.status",
-      properties: { sessionID: "ses1", status: { type: "idle" } },
-    });
-    expect(idle.type).toBe("turn.complete");
-
-    const retry = mapNativeEvent("opencode", {
-      id: "evt_3",
-      type: "session.status",
-      properties: { sessionID: "ses1", status: { type: "retry", attempt: 2 } },
-    });
-    expect(retry.type).toBe("turn.start");
+    expect(event.agent).toBe("review_codex");
+    expect(event.kind).toBe("codex");
+    expect(event.type).toBe("permission.request");
+    expect(permissionDigest(event)).toBe("shell");
   });
 
-  test("v1 and v2 permission events both map", () => {
-    const v1 = mapNativeEvent("opencode", {
-      id: "evt_4",
-      type: "permission.asked",
-      properties: { id: "per1", sessionID: "ses1", permission: "bash", patterns: ["*"] },
-    });
-    expect(v1.type).toBe("permission.request");
-    expect(permissionDigest(v1)).toBe("bash");
-
-    const v2 = mapNativeEvent("opencode", {
-      id: "evt_5",
-      type: "permission.v2.asked",
-      properties: { id: "per2", sessionID: "ses1", action: "fs.write", resources: [] },
-    });
-    expect(v2.type).toBe("permission.request");
-    expect(permissionDigest(v2)).toBe("fs.write");
-
-    const replied = mapNativeEvent("opencode", {
-      id: "evt_6",
-      type: "permission.replied",
-      properties: { sessionID: "ses1", requestID: "per1", reply: "once" },
-    });
-    expect(replied.type).toBe("permission.resolved");
-  });
-
-  test("session.error with optional fields", () => {
-    const e = mapNativeEvent("opencode", { id: "evt_7", type: "session.error", properties: {} });
-    expect(e.type).toBe("turn.error");
-    expect(e.sessionId).toBeNull();
-  });
-
-  test("session.created starts a session; unknown types are raw", () => {
-    const created = mapNativeEvent("opencode", {
-      id: "evt_8",
-      type: "session.created",
-      properties: { sessionID: "ses1", info: {} },
-    });
-    expect(created.type).toBe("session.start");
-    expect(mapNativeEvent("opencode", { id: "evt_9", type: "message.part.updated", properties: {} }).type).toBe("raw");
-  });
-});
-
-describe("agy mapper (verified surface per docs/agy-notes.md)", () => {
-  test("statusline agent_state feed is the primary signal", () => {
-    expect(mapNativeEvent("agy", { agent_state: "working" }).type).toBe("turn.start");
-    expect(mapNativeEvent("agy", { agent_state: "thinking" }).type).toBe("turn.start");
-    expect(mapNativeEvent("agy", { agent_state: "tool_use" }).type).toBe("turn.start");
-    expect(mapNativeEvent("agy", { agent_state: "idle" }).type).toBe("turn.complete");
-    // initializing stays raw so the agent remains `launching`
-    expect(mapNativeEvent("agy", { agent_state: "initializing" }).type).toBe("raw");
-  });
-
-  test("hook shims pass the event name via ?native= hint", () => {
-    expect(mapNativeEvent("agy", { session_id: "a1" }, "Stop").type).toBe("turn.complete");
-    expect(mapNativeEvent("agy", { session_id: "a1" }, "PreToolUse").type).toBe("turn.start");
-    const e = mapNativeEvent("agy", { session_id: "a1" }, "Stop");
-    expect(e.sessionId).toBe("a1");
-    expect(e.payload.nativeType).toBe("Stop");
-  });
-
-  test("unknown degrades to raw, never throws", () => {
-    expect(mapNativeEvent("agy", { hook_event_name: "Mystery" }).type).toBe("raw");
-    expect(mapNativeEvent("agy", null).type).toBe("raw");
+  test("unknown and malformed payloads degrade to raw without losing identity", () => {
+    for (const body of [null, "junk", { hook_event_name: "SomethingNew" }]) {
+      const event = mapNativeEvent(CODEX, body);
+      expect(event.agent).toBe("review_codex");
+      expect(event.kind).toBe("codex");
+      expect(event.type).toBe("raw");
+    }
   });
 });

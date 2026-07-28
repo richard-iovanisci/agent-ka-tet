@@ -3,14 +3,11 @@ import { dirname, join, resolve } from "node:path";
 import { CONFIG_FILENAME, loadConfig } from "../config.ts";
 import { daemonPidFile } from "../paths.ts";
 import { startDaemon } from "./server.ts";
-import { subscribeOpencode } from "./opencodeSse.ts";
 
 /**
  * Daemon entrypoint: `bun src/daemon/index.ts [--dir <repoDir>]`.
- * Boots the HTTP ingest/status server, the OpenCode SSE subscriber (wired
- * into the same append/apply path), and a pidfile; tears all of it down
- * cleanly on SIGINT/SIGTERM. The agents never notice either way
- * (CLAUDE.md constraint 1).
+ * Boots the HTTP ingest/status server and pidfile; tears both down cleanly
+ * on SIGINT/SIGTERM. The agents never notice either way.
  */
 
 function parseDirArg(argv: string[]): string | undefined {
@@ -33,11 +30,6 @@ export function main(): void {
 
   // Opens the store at cfg.db and binds 127.0.0.1:cfg.daemonPort.
   const daemon = startDaemon(cfg);
-  const subscription = subscribeOpencode({
-    port: cfg.opencodePort,
-    onEvent: daemon.ingest,
-    onLog: (line) => console.log(line),
-  });
 
   const pidFile = daemonPidFile(cfg.daemonPort);
   mkdirSync(dirname(pidFile), { recursive: true });
@@ -46,14 +38,12 @@ export function main(): void {
   console.log(`[daemon] config: ${configSource}`);
   console.log(`[daemon] listening on 127.0.0.1:${daemon.port}`);
   console.log(`[daemon] event store: ${cfg.db}`);
-  console.log(`[daemon] opencode SSE source: 127.0.0.1:${cfg.opencodePort}/event`);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[daemon] ${signal}: shutting down`);
-    subscription.stop();
     await daemon.stop(); // stops the HTTP server and closes the store
     try {
       unlinkSync(pidFile);

@@ -76,6 +76,14 @@ describe("TmuxAdapter", () => {
     expect(await tmux.hasSession(SESSION)).toBe(true);
   });
 
+  test("session ownership marker roundtrips", async () => {
+    expect(await tmux.getSessionMarker(SESSION)).toBeNull();
+    await tmux.setSessionMarker(SESSION, '{"configDir":"/repo","fingerprint":"abc"}');
+    expect(await tmux.getSessionMarker(SESSION)).toBe(
+      '{"configDir":"/repo","fingerprint":"abc"}',
+    );
+  });
+
   test("three splits + tiled layout => four sane panes", async () => {
     for (let i = 0; i < 3; i++) {
       splitPanes.push(await tmux.splitPane(SESSION, { cwd: CWD }));
@@ -95,6 +103,7 @@ describe("TmuxAdapter", () => {
       expect(Number.isInteger(p.index)).toBe(true);
       expect(p.width).toBeGreaterThan(0);
       expect(p.height).toBeGreaterThan(0);
+      expect(p.agentId).toBeNull();
       expect(typeof p.title).toBe("string");
       expect(p.command.length).toBeGreaterThan(0); // the user's shell
     }
@@ -148,10 +157,13 @@ describe("TmuxAdapter", () => {
     expect(verifyFragment("\n \n")).toBe("");
   });
 
-  test("setPaneTitle shows up in listPanes", async () => {
+  test("pane identity survives a native-TUI-style display title replacement", async () => {
+    await tmux.setPaneAgentId(firstPane, "claude");
     await tmux.setPaneTitle(firstPane, "claude");
-    const panes = await tmux.listPanes(SESSION);
-    expect(panes.find((p) => p.id === firstPane)?.title).toBe("claude");
+    await tmux.setPaneTitle(firstPane, "✳ Claude Code");
+    const pane = (await tmux.listPanes(SESSION)).find((p) => p.id === firstPane);
+    expect(pane?.title).toBe("✳ Claude Code");
+    expect(pane?.agentId).toBe("claude");
   });
 
   test("focusPane moves the active flag", async () => {

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { AgentName, NormalizedEvent } from "../types.ts";
+import type { AgentId, AgentKind, NormalizedEvent } from "../types.ts";
 
 /**
  * bun:sqlite event store. Append-only log of normalized events; the registry
@@ -13,6 +13,8 @@ import type { AgentName, NormalizedEvent } from "../types.ts";
 export interface StoredEvent {
   id: number;
   agent: string;
+  /** Adapter kind; historical pre-reframe rows migrate as "unknown". */
+  kind: AgentKind | "unknown";
   type: string;
   native_type: string;
   session_id: string | null;
@@ -25,11 +27,11 @@ export interface EventStore {
   /** Insert one event; returns the assigned row id. */
   append(e: NormalizedEvent): number;
   /** Newest-first rows, optionally filtered by agent. Default limit 50. */
-  recent(opts?: { agent?: AgentName; limit?: number }): StoredEvent[];
+  recent(opts?: { agent?: AgentId; limit?: number }): StoredEvent[];
   close(): void;
 }
 
-const SELECT_COLUMNS = "id, agent, type, native_type, session_id, ts, payload";
+const SELECT_COLUMNS = "id, agent, kind, type, native_type, session_id, ts, payload";
 
 /**
  * Open (creating if needed) the event store at `dbPath`. The parent directory
@@ -46,6 +48,7 @@ export function openStore(dbPath: string): EventStore {
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       agent TEXT NOT NULL,
+      kind TEXT NOT NULL,
       type TEXT NOT NULL,
       native_type TEXT NOT NULL,
       session_id TEXT,
@@ -54,9 +57,16 @@ export function openStore(dbPath: string): EventStore {
     );
   `);
 
-  const insert = db.prepare<StoredEvent, [string, string, string, string | null, number, string]>(
-    `INSERT INTO events (agent, type, native_type, session_id, ts, payload)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+  // Phase-0 reframe migration: old databases keyed events only by provider
+  // name. Preserve those rows and make the new identity boundary explicit.
+  const columns = db.query<{ name: string }, []>("PRAGMA table_info(events)").all();
+  if (!columns.some((column) => column.name === "kind")) {
+    db.exec("ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown';");
+  }
+
+  const insert = db.prepare<StoredEvent, [string, string, string, string, string | null, number, string]>(
+    `INSERT INTO events (agent, kind, type, native_type, session_id, ts, payload)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   const selectAll = db.prepare<StoredEvent, [number]>(
     `SELECT ${SELECT_COLUMNS} FROM events ORDER BY id DESC LIMIT ?`,
@@ -69,6 +79,7 @@ export function openStore(dbPath: string): EventStore {
     append(e: NormalizedEvent): number {
       const result = insert.run(
         e.agent,
+        e.kind,
         e.type,
         e.payload.nativeType,
         e.sessionId,
@@ -78,7 +89,7 @@ export function openStore(dbPath: string): EventStore {
       return Number(result.lastInsertRowid);
     },
 
-    recent(opts?: { agent?: AgentName; limit?: number }): StoredEvent[] {
+    recent(opts?: { agent?: AgentId; limit?: number }): StoredEvent[] {
       const limit = opts?.limit ?? 50;
       return opts?.agent !== undefined
         ? selectByAgent.all(opts.agent, limit)

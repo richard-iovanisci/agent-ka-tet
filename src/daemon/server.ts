@@ -1,6 +1,6 @@
-import type { BridgeConfig } from "../config.ts";
-import type { AgentName, NormalizedEvent, StatusResponse } from "../types.ts";
-import { isAgentName } from "../types.ts";
+import { realpathSync } from "node:fs";
+import { configFingerprint, type BridgeConfig } from "../config.ts";
+import type { AgentId, NormalizedEvent, StatusResponse } from "../types.ts";
 import { mapNativeEvent } from "../adapters/mappers.ts";
 import { openStore } from "./store.ts";
 import { createRegistry } from "./registry.ts";
@@ -19,8 +19,8 @@ export interface DaemonHandle {
   port: number;
   stop(): Promise<void>;
   /**
-   * Shared append/apply path for non-HTTP sources (the OpenCode SSE
-   * subscriber): store the event, fold it into the registry, log it.
+   * Shared append/apply path: store the event, fold it into the registry,
+   * and log it. Exposed for focused integration tests and future adapters.
    * Never throws.
    */
   ingest(event: NormalizedEvent): void;
@@ -36,6 +36,15 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+function canonicalCwd(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    return realpathSync(value);
+  } catch {
+    return null;
+  }
+}
+
 export function startDaemon(
   cfg: BridgeConfig,
   opts?: { port?: number; dbPath?: string },
@@ -46,6 +55,10 @@ export function startDaemon(
 
   function ingest(event: NormalizedEvent): void {
     try {
+      // Reject invalid instance/kind pairs before the append-only store is
+      // touched. HTTP ingress normally derives identity from config, but the
+      // public handle is also used by future in-process adapter feeds.
+      registry.validate(event);
       store.append(event);
       const status = registry.apply(event);
       console.log(
@@ -68,42 +81,73 @@ export function startDaemon(
       const url = new URL(req.url);
       const path = url.pathname;
 
-      // POST /events/:agent — hook/shim ingest.
+      // POST /events/:agentId — native hook ingest. The configured instance
+      // supplies the adapter kind used for normalization.
       if (req.method === "POST" && path.startsWith("/events/")) {
-        const agent = path.slice("/events/".length);
-        if (!isAgentName(agent)) {
-          return json({ ok: false, error: `unknown agent "${agent}"` }, 400);
+        const agentId = path.slice("/events/".length);
+        const agent = cfg.agents.find(
+          (configured) => configured.id === agentId && configured.enabled,
+        );
+        if (agent === undefined) {
+          return json({ ok: false, error: `unknown or disabled agent "${agentId}"` }, 400);
         }
         let body: unknown = {};
         try {
           body = await req.json();
         } catch {
-          // Invalid/absent JSON: record anyway; the mapper degrades to "raw".
+          // The hook still receives an empty 2xx below, but untrusted payloads
+          // without a verifiable cwd never reach the store/state machine.
           body = {};
         }
-        const nativeHint = url.searchParams.get("native") ?? undefined;
+        const nativeCwdValue =
+          typeof body === "object" && body !== null && !Array.isArray(body) &&
+          "cwd" in body
+            ? (body as Record<string, unknown>).cwd
+            : null;
+        const nativeCwd = canonicalCwd(nativeCwdValue);
+        const expectedCwdValue = agent.cwd ?? cfg.repo;
+        const expectedCwd = canonicalCwd(expectedCwdValue);
+        // Both native hook contracts include cwd. Fail closed if it is absent,
+        // malformed, missing on disk, or from another repo. realpath handles a
+        // pane entered through a symlink without weakening target isolation.
+        if (nativeCwd === null || expectedCwd === null || nativeCwd !== expectedCwd) {
+          console.warn(
+            `[event] ignored agent=${agent.id} from cwd=${typeof nativeCwdValue === "string" ? nativeCwdValue : "<missing-or-invalid>"}; expected ${expectedCwdValue}`,
+          );
+          return new Response(null, { status: 204 });
+        }
         try {
-          ingest(mapNativeEvent(agent, body, nativeHint));
+          ingest(mapNativeEvent({ id: agent.id, kind: agent.kind }, body));
         } catch (err) {
           // Belt and braces: nothing past the agent-name check may 4xx/5xx.
-          console.error(`[event] handler error for ${agent}: ${String(err)}`);
+          console.error(`[event] handler error for ${agent.id}: ${String(err)}`);
         }
-        return json({ ok: true });
+        // Claude HTTP hooks define an empty 2xx as the no-op success. An
+        // arbitrary JSON body is parsed as hook output and may be rejected.
+        return new Response(null, { status: 204 });
       }
 
       if (req.method === "GET" && path === "/status") {
         const response: StatusResponse = {
-          daemon: { startedAt, port: boundPort, pid: process.pid },
+          daemon: {
+            startedAt,
+            port: boundPort,
+            pid: process.pid,
+            configDir: cfg.configDir,
+            sourceRoot: cfg.sourceRoot,
+            sourceFingerprint: cfg.sourceFingerprint,
+            configFingerprint: configFingerprint(cfg),
+          },
           agents: registry.snapshot(),
         };
         return json(response);
       }
 
       if (req.method === "GET" && path === "/events") {
-        let agent: AgentName | undefined;
+        let agent: AgentId | undefined;
         const agentParam = url.searchParams.get("agent");
         if (agentParam !== null && agentParam !== "") {
-          if (!isAgentName(agentParam)) {
+          if (!cfg.agents.some((configured) => configured.id === agentParam)) {
             return json({ ok: false, error: `unknown agent "${agentParam}"` }, 400);
           }
           agent = agentParam;

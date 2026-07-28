@@ -7,17 +7,12 @@
   // daemon HTTP port (binds 127.0.0.1 only)
   "daemonPort": 4770,
 
-  // OpenCode's server port — pinned so the daemon can subscribe to /event
-  "opencodePort": 4096,
-
   // Working directory agents launch in (default: the dir `bridge up` runs in)
   // "repo": ".",
 
-  "agents": {
-    "claude": { "enabled": true, "command": "claude" },
-    "codex": { "enabled": true, "command": "codex" },
-    "agy": { "enabled": true, "command": "agy" },
-    // --port is appended automatically from opencodePort if not present
-    "opencode": { "enabled": true, "command": "opencode" }
-  }
+  // Ordered roster: Phase 0 supports one Claude Code and one Codex instance.
+  "agents": [
+    { "id": "claude", "kind": "claude", "enabled": true, "command": "claude" },
+    { "id": "codex", "kind": "codex", "enabled": true, "command": "codex" }
+  ]
 }

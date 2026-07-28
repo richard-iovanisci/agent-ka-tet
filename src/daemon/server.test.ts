@@ -1,6 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { defaultConfig } from "../config.ts";
-import type { StatusResponse } from "../types.ts";
+import { mkdtempSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { configFingerprint, defaultConfig } from "../config.ts";
+import type { AgentStatus, StatusResponse } from "../types.ts";
 import type { StoredEvent } from "./store.ts";
 import { startDaemon } from "./server.ts";
 
@@ -26,10 +29,20 @@ async function post(path: string, body: string): Promise<Response> {
   });
 }
 
+function hookBody(body: Record<string, unknown>, cwd = cfg.repo): string {
+  return JSON.stringify({ cwd, ...body });
+}
+
 async function getStatus(): Promise<StatusResponse> {
   const res = await fetch(`${base}/status`);
   expect(res.status).toBe(200);
   return (await res.json()) as StatusResponse;
+}
+
+function agent(status: StatusResponse, id: string): AgentStatus {
+  const found = status.agents.find((candidate) => candidate.agent === id);
+  if (found === undefined) throw new Error(`missing agent status for ${id}`);
+  return found;
 }
 
 describe("daemon HTTP API", () => {
@@ -39,92 +52,214 @@ describe("daemon HTTP API", () => {
     expect(await res.json()).toEqual({ ok: true });
   });
 
-  test("status starts with all agents launching; daemon block is populated", async () => {
+  test("status starts with the configured two-agent roster launching", async () => {
     const status = await getStatus();
     expect(status.daemon.port).toBe(daemon.port);
     expect(status.daemon.pid).toBe(process.pid);
     expect(status.daemon.startedAt).toBeGreaterThan(0);
-    for (const agent of ["claude", "codex", "agy", "opencode"] as const) {
-      expect(status.agents[agent].state).toBe("launching");
-      expect(status.agents[agent].lastEvent).toBeNull();
+    expect(status.daemon.configDir).toBe(cfg.configDir);
+    expect(status.daemon.sourceRoot).toBe(cfg.sourceRoot);
+    expect(status.daemon.sourceFingerprint).toBe(cfg.sourceFingerprint);
+    expect(status.daemon.configFingerprint).toBe(configFingerprint(cfg));
+    expect(status.agents.map((entry) => [entry.agent, entry.kind])).toEqual([
+      ["claude", "claude"],
+      ["codex", "codex"],
+    ]);
+    for (const entry of status.agents) {
+      expect(entry.state).toBe("launching");
+      expect(entry.lastEvent).toBeNull();
+      expect(entry.activeAttention).toBeNull();
     }
-    expect(status.agents.agy.observedVia).toBe("mux");
-    expect(status.agents.claude.observedVia).toBe("events");
   });
 
   test("claude lifecycle: SessionStart -> idle, UserPromptSubmit -> working, Stop -> idle", async () => {
-    let res = await post("/events/claude", JSON.stringify({ hook_event_name: "SessionStart", session_id: "s1" }));
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    let res = await post("/events/claude", hookBody({ hook_event_name: "SessionStart", session_id: "s1" }));
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
     let status = await getStatus();
-    expect(status.agents.claude.state).toBe("idle");
-    expect(status.agents.claude.sessionId).toBe("s1");
+    expect(agent(status, "claude").state).toBe("idle");
+    expect(agent(status, "claude").sessionId).toBe("s1");
 
-    res = await post("/events/claude", JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1" }));
-    expect(res.status).toBe(200);
+    res = await post("/events/claude", hookBody({ hook_event_name: "UserPromptSubmit", session_id: "s1" }));
+    expect(res.status).toBe(204);
     status = await getStatus();
-    expect(status.agents.claude.state).toBe("working");
+    expect(agent(status, "claude").state).toBe("working");
 
-    res = await post("/events/claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s1" }));
-    expect(res.status).toBe(200);
+    res = await post("/events/claude", hookBody({ hook_event_name: "Stop", session_id: "s1" }));
+    expect(res.status).toBe(204);
     status = await getStatus();
-    expect(status.agents.claude.state).toBe("idle");
-    expect(status.agents.claude.lastEvent?.type).toBe("turn.complete");
-    expect(status.agents.claude.lastEvent?.nativeType).toBe("Stop");
+    expect(agent(status, "claude").state).toBe("idle");
+    expect(agent(status, "claude").lastEvent?.type).toBe("turn.complete");
+    expect(agent(status, "claude").lastEvent?.nativeType).toBe("Stop");
+
+    // Claude emits this passive reminder after an ordinary idle interval. It
+    // must not turn a completed, ready session into an actionable needs-you.
+    res = await post("/events/claude", hookBody({
+      hook_event_name: "Notification",
+      notification_type: "idle_prompt",
+      session_id: "s1",
+    }));
+    expect(res.status).toBe(204);
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("idle");
+    expect(agent(status, "claude").lastEvent?.type).toBe("raw");
+    expect(agent(status, "claude").lastEvent?.nativeType).toBe(
+      "Notification:idle_prompt",
+    );
   });
 
   test("permission flow: PermissionRequest -> needs_you with digest, PostToolUse clears -> working", async () => {
-    await post("/events/claude", JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "s1", tool_name: "Bash" }));
+    await post("/events/claude", hookBody({ hook_event_name: "PermissionRequest", session_id: "s1", tool_name: "Bash" }));
     let status = await getStatus();
-    expect(status.agents.claude.state).toBe("needs_you");
-    expect(status.agents.claude.pendingPermission).toBe("Bash");
+    expect(agent(status, "claude").state).toBe("needs_you");
+    expect(agent(status, "claude").pendingPermission).toBe("Bash");
+    expect(agent(status, "claude").activeAttention?.nativeType).toBe(
+      "PermissionRequest",
+    );
 
-    await post("/events/claude", JSON.stringify({ hook_event_name: "PostToolUse", session_id: "s1", tool_name: "Bash" }));
+    // Claude sends this generic alert after the detailed PermissionRequest.
+    // Older already-loaded hook config may still forward it, but it must not
+    // replace the stable tool-name badge or alter the actionable state.
+    await post("/events/claude", hookBody({
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      session_id: "s1",
+      message: "Claude needs your permission",
+    }));
     status = await getStatus();
-    expect(status.agents.claude.state).toBe("working");
-    expect(status.agents.claude.pendingPermission).toBeNull();
+    expect(agent(status, "claude").state).toBe("needs_you");
+    expect(agent(status, "claude").pendingPermission).toBe("Bash");
+    expect(agent(status, "claude").lastEvent?.type).toBe(
+      "permission.request",
+    );
+    expect(agent(status, "claude").lastEvent?.nativeType).toBe(
+      "Notification:permission_prompt",
+    );
+    expect(agent(status, "claude").activeAttention?.nativeType).toBe(
+      "PermissionRequest",
+    );
+
+    await post("/events/claude", hookBody({ hook_event_name: "PostToolUse", session_id: "s1", tool_name: "Bash" }));
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("working");
+    expect(agent(status, "claude").pendingPermission).toBeNull();
+    expect(agent(status, "claude").activeAttention).toBeNull();
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      session_id: "s1",
+      message: "Session paused",
+    }));
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("needs_you");
+    expect(agent(status, "claude").pendingPermission).toBe("Session paused");
+    expect(agent(status, "claude").activeAttention?.nativeType).toBe(
+      "Notification:permission_prompt",
+    );
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "SessionEnd",
+      session_id: "s1",
+    }));
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("done");
+    expect(agent(status, "claude").pendingPermission).toBeNull();
+    expect(agent(status, "claude").activeAttention).toBeNull();
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s1",
+    }));
+    expect(agent(await getStatus(), "claude").state).toBe("working");
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      session_id: "s1",
+      message: "Claude needs your permission",
+    }));
+    expect(agent(await getStatus(), "claude").pendingPermission).toBe(
+      "Claude needs your permission",
+    );
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "PermissionRequest",
+      session_id: "s1",
+      tool_name: "Bash",
+    }));
+    status = await getStatus();
+    expect(agent(status, "claude").pendingPermission).toBe("Bash");
+    expect(agent(status, "claude").activeAttention?.nativeType).toBe(
+      "PermissionRequest",
+    );
+
+    // Manual permission dismissal has no Claude hook. The next submitted
+    // prompt is the first trusted lifecycle event and must clear stale
+    // attention before the new turn proceeds.
+    await post("/events/claude", hookBody({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s1",
+    }));
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("working");
+    expect(agent(status, "claude").pendingPermission).toBeNull();
+    expect(agent(status, "claude").activeAttention).toBeNull();
+
+    await post("/events/claude", hookBody({
+      hook_event_name: "PermissionRequest",
+      session_id: "s1",
+      tool_name: "Bash",
+    }));
+    await post("/events/claude", hookBody({ hook_event_name: "PermissionDenied", session_id: "s1", tool_name: "Bash" }));
+    status = await getStatus();
+    expect(agent(status, "claude").state).toBe("working");
+    expect(agent(status, "claude").pendingPermission).toBeNull();
+    expect(agent(status, "claude").activeAttention).toBeNull();
   });
 
-  test("agy ?native= hint records turn.complete and flips observedVia to events", async () => {
-    const res = await post("/events/agy?native=Stop", JSON.stringify({ session_id: "a1" }));
-    expect(res.status).toBe(200);
+  test("codex lifecycle is normalized through its own adapter kind", async () => {
+    await post("/events/codex", hookBody({ hook_event_name: "SessionStart", session_id: "c1" }));
+    await post("/events/codex", hookBody({ hook_event_name: "UserPromptSubmit", session_id: "c1" }));
+    const res = await post("/events/codex", hookBody({ hook_event_name: "Stop", session_id: "c1" }));
+    expect(res.status).toBe(204);
 
     const status = await getStatus();
-    expect(status.agents.agy.state).toBe("idle");
-    expect(status.agents.agy.sessionId).toBe("a1");
-    expect(status.agents.agy.observedVia).toBe("events");
+    expect(agent(status, "codex").state).toBe("idle");
+    expect(agent(status, "codex").sessionId).toBe("c1");
 
-    const rows = (await (await fetch(`${base}/events?agent=agy`)).json()) as StoredEvent[];
-    expect(rows.length).toBe(1);
+    const rows = (await (await fetch(`${base}/events?agent=codex`)).json()) as StoredEvent[];
+    expect(rows.length).toBe(3);
     expect(rows[0]?.type).toBe("turn.complete");
     expect(rows[0]?.native_type).toBe("Stop");
-    expect(rows[0]?.session_id).toBe("a1");
+    expect(rows[0]?.session_id).toBe("c1");
   });
 
   test("unknown agent is rejected", async () => {
-    const res = await post("/events/gemini", JSON.stringify({ hook_event_name: "Stop" }));
+    const res = await post("/events/gemini", hookBody({ hook_event_name: "Stop" }));
     expect(res.status).toBe(400);
   });
 
-  test("invalid JSON body still gets 200 and is stored as raw", async () => {
-    const res = await post("/events/claude", "{{{ not json");
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-
-    const rows = (await (await fetch(`${base}/events?agent=claude&limit=1`)).json()) as StoredEvent[];
-    expect(rows.length).toBe(1);
-    expect(rows[0]?.type).toBe("raw");
-    expect(rows[0]?.native_type).toBe("unknown");
-
-    // raw causes no state transition — claude stays working from the previous test.
-    const status = await getStatus();
-    expect(status.agents.claude.state).toBe("working");
+  test("missing, malformed, or invalid-JSON cwd fails closed with empty success", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    for (const body of [
+      JSON.stringify({ hook_event_name: "Stop" }),
+      JSON.stringify({ hook_event_name: "Stop", cwd: 42 }),
+      "{{{ not json",
+    ]) {
+      const res = await post("/events/claude", body);
+      expect(res.status).toBe(204);
+      expect(await res.text()).toBe("");
+    }
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
+    expect(agent(await getStatus(), "claude").state).toBe("working");
   });
 
   test("GET /events returns rows newest-first and respects filters", async () => {
     const all = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
-    // 5 claude lifecycle + 1 raw claude + 1 agy events so far.
-    expect(all.length).toBe(7);
+    // 15 Claude lifecycle + 3 Codex lifecycle events so far.
+    expect(all.length).toBe(18);
     const ids = all.map((r) => r.id);
     expect(ids).toEqual([...ids].sort((a, b) => b - a));
 
@@ -139,5 +274,66 @@ describe("daemon HTTP API", () => {
     expect((await fetch(`${base}/nope`)).status).toBe(404);
     expect((await fetch(`${base}/events/claude`)).status).toBe(404); // GET on ingest route
     expect((await fetch(`${base}/status`, { method: "POST" })).status).toBe(404);
+  });
+
+  test("valid hook payloads from another cwd cannot mutate this target", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    const response = await post(
+      "/events/codex",
+      JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "unmanaged-session",
+        cwd: "/definitely/another/repo",
+      }),
+    );
+    expect(response.status).toBe(204);
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
+    expect(agent(await getStatus(), "codex").sessionId).toBe("c1");
+  });
+
+  test("direct ingest rejects an invalid id/kind pair before persistence", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    daemon.ingest({
+      agent: "claude",
+      kind: "codex",
+      type: "raw",
+      sessionId: null,
+      ts: Date.now(),
+      payload: { nativeType: "mismatch", body: {} },
+    });
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
+    expect(after.some((row) => row.native_type === "mismatch")).toBe(false);
+  });
+
+  test("custom id works and realpath accepts an equivalent symlinked cwd", async () => {
+    const realRepo = mkdtempSync(join(tmpdir(), "bridge-real-cwd-"));
+    const linkedRepo = `${realRepo}-link`;
+    symlinkSync(realRepo, linkedRepo, "dir");
+    const customCfg = defaultConfig(linkedRepo);
+    customCfg.agents[0] = { ...customCfg.agents[0]!, id: "claude-primary" };
+    const custom = startDaemon(customCfg, { port: 0, dbPath: ":memory:" });
+    try {
+      const customBase = `http://127.0.0.1:${custom.port}`;
+      const response = await fetch(`${customBase}/events/claude-primary`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          hook_event_name: "SessionStart",
+          session_id: "custom-session",
+          cwd: realRepo,
+        }),
+      });
+      expect(response.status).toBe(204);
+      const status = (await (await fetch(`${customBase}/status`)).json()) as StatusResponse;
+      expect(agent(status, "claude-primary").kind).toBe("claude");
+      expect(agent(status, "claude-primary").sessionId).toBe("custom-session");
+      const rows = (await (await fetch(`${customBase}/events?agent=claude-primary`)).json()) as StoredEvent[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.agent).toBe("claude-primary");
+    } finally {
+      await custom.stop();
+    }
   });
 });

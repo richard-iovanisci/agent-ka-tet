@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { stateDir } from "../config.ts";
+import { stateDir, type BridgeConfig } from "../config.ts";
 import { writeConfigFile, type WriteResult } from "../util/configFile.ts";
 
 /** Options every `bridge init` writer accepts (home/repo injectable for tests). */
@@ -17,10 +18,20 @@ export function resolveHome(opts: InitOptions): string {
 
 export function shimsDir(opts: InitOptions): string {
   // Shims live under the bridge state dir, referenced by absolute path from
-  // agent configs. Keep them out of ~/.codex / ~/.gemini so those stay auditable.
+  // agent configs. Keep generated scripts out of agent config directories so
+  // those files stay small and auditable.
   return opts.home !== undefined
     ? join(opts.home, ".local", "state", "agent-bridge", "shims")
     : join(stateDir(), "shims");
+}
+
+/** Target-repo namespace so initializing one repo cannot rewrite another's shim. */
+export function scopedShimsDir(cfg: BridgeConfig, opts: InitOptions): string {
+  const scope = createHash("sha256")
+    .update(cfg.configDir)
+    .digest("hex")
+    .slice(0, 16);
+  return join(shimsDir(opts), scope);
 }
 
 /** Write an executable shim script through the diff+backup engine. */
@@ -52,4 +63,15 @@ export function readJsonConfig(path: string): Record<string, unknown> {
 
 export function serializeJson(obj: unknown): string {
   return `${JSON.stringify(obj, null, 2)}\n`;
+}
+
+/** Quote one path as a POSIX-shell word for native command-hook schemas. */
+export function quoteShellArg(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+/** Decode only the single-word quoting form produced by quoteShellArg. */
+export function unquoteGeneratedShellArg(command: string): string {
+  if (!command.startsWith("'") || !command.endsWith("'")) return command;
+  return command.slice(1, -1).replaceAll(`'"'"'`, "'");
 }

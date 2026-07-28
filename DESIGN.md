@@ -1,189 +1,296 @@
-# Agent Bridge — Design Doc & v0 Plan
+# Agent Bridge — Claude Code + Codex v0 Design
 
-**Date:** July 7, 2026 · **Status:** proposal for review
-**Inputs:** the two attached deep-research reports (ChatGPT's "Native Multi-Agent Terminal Control Room", Gemini's "Puppeteer & Blackboard"), plus independent research across ~45 primary sources, with load-bearing claims re-verified against official docs this session.
+**Updated:** July 13, 2026 · **Status:** active design
 
----
-
-## 1. Goal and constraints
-
-A local supervisor for four coding agents running in their **native TUIs** — Claude Code, Codex CLI, Antigravity CLI (`agy`), and OpenCode (Copilot-backed models) — that lets you observe all of them at once, step into any session with your keyboard, hand context between them, let two of them pair on a task, and lean on whichever tool has rate-limit headroom.
-
-Hard constraints, from your prompt and answers:
-
-- The agent TUIs stay alive and unmodified. No re-hosting them behind an API the way gsd-review, LangChain-style wrappers, or ACP clients do. Stepping in means literally focusing the pane and typing.
-- Autonomy is a **per-task dial**: some tasks you approve every handoff, some tasks two agents coordinate on their own (worktrees, locks, coordinated merge — your instinct, and it holds up).
-- Local-only is fine. Personal tool. macOS (iTerm2) is primary; Windows (Windows Terminal) should have a path. You're open to adopting a multiplexer.
-- Rate-limit-aware routing across the four subscriptions.
-- graphify considered as shared-context glue; Obsidian considered for the human-consumption side.
-
-Non-goal: another unified chat UI over agent event streams. That product exists several times over (Conduit, Crystal/Nimbalyst, vibe-kanban, Conductor, every ACP client) and every one of them kills the native TUI.
+Phase 0 has been reopened on `codex/phase-0-two-agent`. This document replaces the original four-provider v0 scope while preserving its native-TUI architecture.
 
 ---
 
-## 2. The finding that changes the design
+## 1. Goal
 
-Both prior reports assume the supervisor learns agent state by watching the terminal — Gemini's report by scraping the screen buffer for idle prompts (`">" in bottom_text`), ChatGPT's via multiplexer streams. That was true in 2025. It isn't anymore, and it's the single most consequential thing my research turned up:
+Agent Bridge coordinates **Claude Code and Codex in their native TUIs**, side by side in tmux. The human can focus either pane and type normally. A local daemon observes both agents through their semantic hook events, shows their current state, and later delivers inspectable handoffs and pair-workflow coordination without re-hosting either agent.
 
-**Every tool except `agy` now emits real, documented, semantic events a local daemon can consume directly.**
+The first useful workflow is deliberately narrow:
 
-| Tool | Turn finished | Needs approval / input | Push mechanism | Transcript on disk | Local input into the live TUI |
+1. launch Claude Code and Codex in two real panes;
+2. know when each is working, idle, blocked, done, or errored;
+3. hand work in either direction at the visible terminal boundary;
+4. let them cooperate in isolated worktrees with a human-reviewable integration branch.
+
+The core should leave room for configurable agent instances later, but v0 supports exactly two adapter kinds and defaults to one instance of each.
+
+### Non-goals for active v0
+
+- A unified chat UI that replaces either native TUI.
+- OpenCode, Antigravity (`agy`), Grok, or another provider matrix.
+- Headless/API/ACP operation as a substitute for an interactive agent pane.
+- A general N-agent scheduler before the two-agent workflow is proven.
+- Graphify, Obsidian, a web dashboard, or a second multiplexer backend.
+
+---
+
+## 2. Non-negotiable constraints
+
+1. **Native TUIs stay alive and unmodified in real tmux panes.** The daemon dying must not terminate, pause, or corrupt either agent.
+2. **Events over scraping.** Agent state comes from Claude Code and Codex hooks. `capture-pane` is reserved for previews, shell readiness, and injection echo-verification, never lifecycle inference.
+3. **Injection happens at the terminal boundary.** Both agents receive text through tmux bracketed paste plus a single Enter. A handoff is never injected unless the target is idle.
+4. **Local-only control plane.** The daemon and any future bridge-bus bind `127.0.0.1` only.
+5. **Safe configuration writes.** Every writer prints a diff first, backs up an existing file, preserves unrelated settings, and is idempotent.
+6. **Same behavior on macOS and WSL2 Ubuntu.** There is no native-Windows path and no `/mnt/c` assumption.
+7. **Integration fidelity over mocks.** Mux tests use a real throwaway tmux server. Authenticated live-agent checks stay behind `BRIDGE_LIVE_TESTS=1` or an interactive verification script.
+
+---
+
+## 3. The architectural finding
+
+The multiplexer is the body; hooks are the nervous system.
+
+tmux provides real PTYs, native step-in, durable panes, previews, focus, and terminal injection. It does not decide whether an agent is working or waiting. Claude Code and Codex already emit semantic lifecycle events, so the daemon can observe them without guessing from prompt characters.
+
+| Tool | Working / turn complete | Needs approval or input | Push path | Transcript | Input to live TUI |
 |---|---|---|---|---|---|
-| **Claude Code** | `Stop`, `StopFailure` hooks | `PermissionRequest`, `Notification` (matchers: `permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`) | 30 hook events; handler types include **`http`** — hooks can POST JSON straight to a local daemon | `~/.claude/projects/<proj>/<session>.jsonl` (path handed to every hook) | None official → tmux `send-keys` |
-| **Codex CLI** | `Stop` hook (includes `last_assistant_message`), `notify` = `agent-turn-complete` | `PermissionRequest` hook — can even auto-allow/deny | 10 Claude-compatible hook events (`command` handlers; shim posts to daemon) + `codex app-server` JSON-RPC | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | None official → `send-keys` |
-| **OpenCode** | `session.idle` event | `permission.asked` / `permission.replied`; answerable via `POST /session/:id/permissions/:permissionID` | TUI always runs on a local HTTP server; **SSE `/event` bus** (~80 event types); plugins; OpenAPI 3.1 + TS SDK | `~/.local/share/opencode/storage/` | **First-class:** `POST /tui/append-prompt` + `/tui/submit-prompt` — the visible TUI types and submits |
-| **Antigravity `agy`** | `Stop`-class hook (names unverified) | hook on pre-tool-use (`allow_tool: false` blocks) | hooks.json at `~/.gemini/antigravity-cli/` and `<repo>/.agents/hooks.json` | Undocumented/opaque | None → `send-keys` |
+| **Claude Code** | `UserPromptSubmit`, `Stop`, `StopFailure` | `PermissionRequest`; `Notification:permission_prompt`; `Notification:agent_needs_input` | Repo-local HTTP hooks; command shim for command-only `SessionStart` | `~/.claude/projects/<proj>/<session>.jsonl` | tmux terminal injection |
+| **Codex** | `UserPromptSubmit`, `Stop` | `PermissionRequest`; `PostToolUse` clears a pending approval | Project-local `hooks.json` command shims POST to the daemon | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | tmux terminal injection |
 
-(Copilot CLI, if you ever add it as a fifth: 6 hooks but notably **no Stop/turn-complete event**, plus a tailable `~/.copilot/session-state/<id>/events.jsonl`. OpenCode-via-Copilot already covers that quota anyway.)
+Claude's passive `Notification:idle_prompt` reminder is stored as `raw` if an
+already-loaded hook delivers it and never changes lifecycle state. It is not a
+request for action: only permission prompts and explicit
+`agent_needs_input` notifications move Claude to `needs_you`.
 
-So the architecture inverts: **the multiplexer is the body, hooks are the nervous system.** The mux hosts real PTYs, gives you step-in, previews, and keystroke injection. Agent *state* — working / idle / waiting-on-you / done / erroring — comes from the tools' own hooks and servers, with screen-scraping demoted to a fallback for `agy` and a sanity-check elsewhere. This is exactly the gap in prior art: claude-squad and agent-of-empires have PTY fidelity but dumb (scrape-based) supervision; Conduit/ACP/vibe-kanban have semantic supervision but destroy the TUI. Nothing ships both. That's Agent Bridge's actual contribution.
+For a Claude tool approval, `PermissionRequest` supplies the authoritative
+detail such as `Bash`. Claude may emit a generic
+`Notification:permission_prompt` several seconds later; that notification
+remains a fallback for notification-only consent prompts, but it cannot replace
+an already-active, more specific pending detail or its displayed event source.
+Daemon status retains the notification as the literal `lastEvent` while
+`activeAttention` identifies the unresolved event that `bridge top` should
+render. This keeps the pending row stable as `PermissionRequest … ⚠ Bash`
+without hiding event recency from status consumers or SQLite history.
+
+Claude Code currently emits no lifecycle hook when the operator presses Escape
+or manually declines a permission dialog. `PermissionDenied` covers automatic
+permission-mode denial, not a manual dialog decision. Agent Bridge therefore
+does not guess that Claude is idle from elapsed time, pane contents, focus, or
+an intercepted key: attention clears on the next trusted lifecycle event.
+This may leave a stale `needs_you` row after Escape, but it preserves the
+idle-only injection invariant. A future hook-only delayed recovery using
+`Notification:idle_prompt` requires live proof that the notification cannot
+arrive while a permission dialog remains open.
+
+Codex lifecycle hooks are the sole active event path. Agent Bridge does **not** take over the user's global Codex `notify` setting. Active hooks live in the target project and still require one-time trust review through `/hooks`.
+
+A fresh Codex TUI remains `launching` until its first submitted prompt. Current
+Codex runs `SessionStart` inside that first turn immediately before
+`UserPromptSubmit`, so there is no hook-only event for “the untouched input box
+is drawn.” `bridge top` describes this honest pre-event state as `awaiting first
+observed turn`; the same wording remains accurate when a restarted in-memory
+daemon has not yet re-observed an existing TUI. Agent Bridge does not scrape
+the pane or inject a warm-up turn to manufacture `idle`.
 
 ---
 
-## 3. Scorecard on the two prior reports
+## 4. Identity model: instance versus adapter
 
-**ChatGPT report.** Its architecture (terminal control plane + MCP context plane, worktree isolation, human-directed handoffs by default, graphify as memory-not-orchestrator) survives verification and I adopt most of it. Specific checks: `zellij subscribe` is real — I verified the docs page; it landed in Zellij 0.44.0 (March 2026) and streams rendered pane output as NDJSON, cross-session. Zellij's case is *stronger* than the report knew: 0.44.0 also brought native Windows support. Two corrections: it treats terminal-layer observation as the only observability channel, underusing the hooks story above; and it presents Conduit as the direct precedent, but Conduit does **not** host native TUIs — it renders its own chat UI over the agents' stream-JSON interfaces. The closest real precedents are claude-squad (tmux + worktrees, attach-to-real-session, active, AGPL) and agent-of-empires (tmux-hosted native TUIs + status detection + web view, MIT, supports all four of your tools including `agy`).
+The original code used one closed provider-name union for configuration, panes, adapters, events, and display. That makes “another pane” indistinguishable from “another provider.”
 
-**Gemini report.** The tmux + send-keys "puppeteer" skeleton is sound and its step-in story ("the orchestrator doesn't care; it's just waiting") is the right mental model. Three corrections: `wait_for_idle` by scraping for prompt characters is fragile and now unnecessary (hooks); rebuilding graphify from scratch each handoff is outdated (graphify has `--update` incremental re-extraction, `graphify watch`, and git hooks that rebuild AST-only with no API cost); and always-auto-relay conflicts with your per-task dial — injection without an idle-gate will also race against a TUI mid-render.
+The active design separates two concepts:
+
+- **`AgentId`** — the configured instance identity used by panes, status, tasks, handoffs, and history. It is a string unique within one bridge session.
+- **`AgentKind`** — the adapter implementation that knows how to launch, initialize, and map native events. Active v0 kinds are `claude` and `codex`.
+
+The default instances are:
+
+| AgentId | AgentKind | Command |
+|---|---|---|
+| `claude` | `claude` | `claude` |
+| `codex` | `codex` | `codex` |
+
+Status and coordination are keyed by `AgentId`; adapter dispatch is keyed by `AgentKind`. A normalized event conceptually carries:
+
+```ts
+{
+  agent: AgentId;
+  kind: "claude" | "codex";
+  type: NormalizedEventType;
+  sessionId: string | null;
+  ts: number;
+  payload: { nativeType: string; body: unknown };
+}
+```
+
+The lifecycle states remain:
+
+```
+launching | working | idle | needs_you | done | error
+```
+
+This boundary permits multiple configured instances later without pretending that unimplemented providers already exist. Supporting a new `AgentKind` remains a separate adapter decision.
 
 ---
 
-## 4. Architecture
+## 5. Architecture
 
 ```
-┌─────────────────────────── tmux session: bridge ────────────────────────────┐
-│ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐    │
-│ │ claude (TUI)  │ │ codex (TUI)   │ │ agy (TUI)     │ │ opencode (TUI)│    │
-│ │ worktree A    │ │ worktree B    │ │ worktree C    │ │ worktree D    │    │
-│ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘    │
-│         │ hooks(http)     │ hooks(shim)     │ hooks(shim)     │ SSE /event │
-│ ┌───────▼─────────────────▼─────────────────▼─────────────────▼──────────┐ │
-│ │                        bridged  (local daemon)                         │ │
-│ │  event ingest · state store (SQLite) · transcript tailers              │ │
-│ │  rate-limit pollers · router · handoff engine · pair-mode coordinator  │ │
-│ │  mux adapter (tmux now, zellij later): spawn/capture/send-keys/focus   │ │
-│ └───────┬─────────────────────────────┬──────────────────────────────────┘ │
-│ ┌───────▼───────┐             ┌───────▼──────────────────────────────────┐ │
-│ │ bridge top    │             │ shared context plane                     │ │
-│ │ (control pane)│             │  bridge-bus MCP  ·  graphify MCP (http)  │ │
-│ └───────────────┘             │  .bridge/ handoff files → Obsidian vault │ │
-└───────────────────────────────┴──────────────────────────────────────────┴─┘
-        you: step into any pane natively (Ctrl-b arrows / iTerm2 -CC)
+┌──────────────────────── tmux session: bridge ────────────────────────┐
+│ ┌──────────────────────────┐  ┌──────────────────────────┐           │
+│ │ claude (native TUI)      │  │ codex (native TUI)       │           │
+│ │ AgentId: claude          │  │ AgentId: codex           │           │
+│ └────────────┬─────────────┘  └────────────┬─────────────┘           │
+│              │ hooks (HTTP + command)      │ project command shims    │
+│ ┌────────────▼──────────────────────────────▼───────────────────────┐ │
+│ │ bridged — loopback-only local daemon                             │ │
+│ │ ingest · normalize · state registry · SQLite event history       │ │
+│ └────────────┬──────────────────────────────┬───────────────────────┘ │
+│ ┌────────────▼─────────────┐  ┌─────────────▼─────────────────────┐ │
+│ │ bridge top              │  │ .bridge/ task and handoff files   │ │
+│ │ two live status cards   │  │ later: bridge-bus coordination    │ │
+│ └─────────────────────────┘  └────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+        human: focus either pane and type using ordinary tmux
 ```
 
-**`bridged`** is one local daemon. It ingests events four ways: Claude Code hooks configured with the native `http` handler type (zero shell shims); Codex and `agy` hooks as tiny `command` shims that `curl` the daemon; OpenCode via an SSE client on its `/event` bus (the TUI always runs a server — pin it with `--port`); transcript JSONL tailers as backfill/detail. State lands in SQLite: per-agent status, current task, last message digest, pending permissions, rate-limit snapshots.
+### `bridged`
 
-**The mux adapter** does only four jobs: spawn panes (one per agent, each in its own worktree), capture previews (`capture-pane`), inject input (`send-keys` — except OpenCode, where injection goes through `/tui/append-prompt` + `/tui/submit-prompt` so the visible TUI does the typing), and focus panes for step-in. It's an interface (`spawn/capture/stream/send/focus/list`) with a tmux backend first and a Zellij backend later — Zellij 0.44's `subscribe`, `send-keys`, `dump-screen`, and `list-panes --json` map one-to-one, which is what makes the Windows story cheap.
+One Bun process binds the daemon HTTP API to `127.0.0.1`. It accepts Claude Code and Codex hook payloads, maps them into the shared event vocabulary, appends them to SQLite, and folds them into an in-memory status registry. Default event databases are namespaced by target-repo path so session-local `AgentId` values cannot mix history across projects. Hook requests must return quickly and must not make an agent depend on daemon health.
 
-**`bridge top`** is the control pane — a small TUI the daemon serves inside the same tmux session. Per-agent cards: state (from events, not scraping), task, last output line, pending approval badges, rate-limit bars. One keystroke: focus an agent's pane, approve a queued handoff, watch a diff. Stepping in remains plain tmux navigation; on macOS you can run the whole session under iTerm2's `tmux -CC` integration so every agent is a native iTerm pane and your muscle memory doesn't change.
+The daemon exposes its config directory, source checkout, load-time source-content fingerprint, and composite config fingerprint in `/status`; the tmux session carries the same composite identity in a user option. Reuse, attach, display, and live verification require the exact loaded fingerprint, so a daemon started before an in-place source edit is stale even when its path is unchanged. Teardown is the deliberate exception: `bridge down` may retire a stale fingerprint only when the config directory still proves the same target, so a config edit cannot strand its old runtime; another target is always refused. Hook payloads without the configured working directory are acknowledged but ignored; real paths are compared so equivalent symlinked paths remain valid.
+
+Transcript tailing can enrich later handoffs, but it is not required for Phase 0 state detection.
+
+### Mux adapter
+
+The mux layer creates a detached tmux session, launches one login shell per configured instance, waits for the shell prompt to exist, and types the user's normal TUI launch command into it. With the two defaults, `bridge up` selects a deterministic `even-horizontal` layout. Each pane stores its `AgentId` in durable backend metadata (`@agent-bridge-agent-id` in tmux); the visible pane title is only a best-effort initial label because native TUIs legitimately replace it.
+
+Its responsibilities are intentionally small: create, split, list, capture, send, focus, identify, title, and tear down panes. The existing interface stays count-agnostic even though active v0 launches two panes.
+
+### `bridge top`
+
+The control board shows configured active-kind instances, their normalized state, last event and age, session prefix, and pending approval. A configured-but-disabled instance is shown dimmed; parked provider kinds do not appear.
+
+---
+
+## 6. Handoffs and pair coordination
 
 ### Handoffs
 
-A handoff is a **file, then an injection**. The engine builds a handoff packet — markdown with frontmatter (`from`, `to`, `task`, `worktree`, `branch`) containing a transcript-derived summary of what the source agent just did (from its JSONL, not from asking it), the relevant `git diff --stat`, and optionally a `graphify query` result for the touched area. Packets live in `.bridge/handoffs/` — inspectable, diffable, and exactly what gets injected.
+A handoff is a **file, then an injection**.
 
-The autonomy dial, per task:
+The engine writes a Markdown packet under `.bridge/handoffs/` with frontmatter such as `from`, `to`, `task`, `worktree`, and `branch`. The body contains a transcript-derived source summary, relevant diff statistics, and explicit instructions for the target. The packet is human-readable and is exactly what gets injected.
 
-- **observe** — packet is prepared and parked; you do whatever you want with it.
-- **approve** (default) — `bridge top` shows the packet; one keystroke sends it into the target pane.
-- **auto** — the daemon waits for the target's *idle event* (never a scrape heuristic), then injects, visibly. You watch the prompt get typed and can Ctrl-C it like anything else.
+Per-task autonomy:
 
-Injection etiquette matters more than it sounds: bracketed paste, single trailing Enter, then verify the echo via `capture-pane` and retry once — the verify-and-retry trick is cribbed from `tmux-cli` in pchalasani/claude-code-tools, which exists because naive `send-keys` intermittently loses the Enter.
+- **observe** — prepare the packet and stop;
+- **approve** — prepare it and wait for a human confirmation; this is the default;
+- **auto** — wait for the target's semantic idle event, then inject visibly.
 
-### Pair mode
+Terminal delivery uses one bracketed paste, echo-verification, one retry if needed, then exactly one Enter. The human can always focus the pane or interrupt the agent normally.
 
-Your sketch — worktrees plus coordinated merge with locks — is the right protocol, and it decomposes into things that already exist:
+### Shared task plane
 
-1. `bridge pair <task> claude codex` creates two worktrees off an integration branch (`task/x/claude`, `task/x/codex`) and injects the same brief with role framing (e.g., implementer / test-writer, or two competing implementations).
-2. Coordination runs through the **bridge-bus MCP server** (below): `post_update` for progress notes the other agent can read, `lock_paths` for advisory path leases when both must touch shared files, `read_peer` to pull the other's latest update. Because it's MCP, both agents use it natively from inside their own TUIs — no chat-relaying between their contexts.
-3. Merge choreography: when both post `done`, the daemon merges the first branch into the integration branch, then hands agent two a merge task with the conflict list. You review the integration branch before it touches your real branch. Locks make conflicts rare; the merge step makes the remaining ones an agent's problem instead of yours.
+After bidirectional handoffs work, a small loopback-only bridge-bus lets both TUIs use the same task records without relaying chat. Its tools cover task creation/claiming, progress updates, handoff reads, peer reads, and advisory path locks. Storage remains Markdown/JSON under `.bridge/`.
 
-### bridge-bus (the tiny MCP server you do build)
+Graphify is not required for this shared plane.
 
-Six tools, localhost only: `create_task`, `claim_task`, `post_update`, `read_handoff`, `lock_paths` / `release_paths`, `read_peer`. All four TUIs speak MCP as clients, so this is the one standards-aligned channel where "the agents interact with each other" without anyone leaving their native tooling. Everything it stores is markdown/JSON in `.bridge/` — same files the human-facing layer reads.
+### Pair workflow
 
-### Rate-limit router
+`bridge pair <task> claude codex` creates two worktrees from an integration branch and sends role-framed versions of one brief. Typical roles are implementer/reviewer, implementation/test, or two competing approaches.
 
-Feasible today for all four tools; monitors like CodexBar and ClaudeBar already ship the read paths in production. Normalize everything to `{tool, window, used_pct, resets_at}`:
-
-| Tool | Read path | Fidelity |
-|---|---|---|
-| Claude Code | statusline stdin JSON carries `rate_limits.five_hour/.seven_day` (official — a statusline script that tees to the daemon gets it for free); `GET api.anthropic.com/api/oauth/usage` (unofficial, needs `claude-code/<ver>` User-Agent, poll ≥180s) for on-demand cross-device truth | High |
-| Codex | `token_count.rate_limits` in every session JSONL (server-sent `used_percent` + resets); `codex app-server` → `account/rateLimits/read` for on-demand | High (documented surface) |
-| Copilot (via OpenCode) | `GET api.github.com/copilot_internal/user` → `quota_snapshots.premium_interactions.percent_remaining` (unofficial); caveat: GitHub moved to **AI Credits** June 2026, schema in flux | Medium |
-| Antigravity | localhost probe of the Antigravity language server (`GetUserStatus` — what the IDE itself displays) or the `antigravity-usage` npm CLI (`--json`, multi-account) | Medium (internal protocol) |
-
-Routing policy: rank agents by weekly-window headroom, treat the 5-hour window as a soft gate (defer, don't exclude), let you pin a task to a tool, and paint the bars in `bridge top`. `bridge assign "<task>"` places a task on the best-headroom agent. Pollers are plugins with graceful degradation (fall back to ccusage-style local estimation when an endpoint breaks) because half of these paths are unofficial and will churn.
-
-### graphify (shared memory, not orchestrator)
-
-Verified against the README this session: run **one** server — `python -m graphify.serve graphify-out/graph.json --transport http --port 8080` — and point all four TUIs' MCP configs at `http://localhost:8080/mcp`. Tools exposed: `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, plus PR-oriented `list_prs`/`get_pr_impact`/`triage_prs`. Keep it fresh with `graphify watch` or its git hooks (post-commit AST-only rebuild, no API cost) rather than full rebuilds. Handoff packets embed a targeted `graphify query` result instead of dumping `GRAPH_REPORT.md`. Two caveats: code parsing is local (tree-sitter, offline), but docs/PDFs/images go to a model API unless you use the Ollama backend (local PDF parsing is an open feature request, #259); and every query is logged to `~/.cache/graphify-queries.log` unless you set `GRAPHIFY_QUERY_LOG_DISABLE=1`. The project is healthy — MIT, very active, now YC-backed — but 0.x, so pin versions. Note the PyPI name is `graphifyy` (double y).
-
-### Obsidian (park the plugin, ship the conventions)
-
-A vault is markdown on disk and Obsidian live-reindexes external writes, so agents don't need a plugin to populate it — and a plugin would add an "Obsidian must be running" dependency that's wrong for headless writers. `.bridge/` mirrors into a vault folder: append-only session logs, handoff packets as notes with frontmatter (`agent`, `task`, `status`, `cost`, timestamps), which makes **Bases** (core plugin) a zero-code dashboard over agent activity; `.canvas` files (open JSON spec) can render pipeline boards; `obsidian://open` deep links go in `bridge top`. graphify even ships `--obsidian --obsidian-dir ~/vault` export. If app-context features ever matter (patching a note a human has open, semantic search), adopt the Local REST API community plugin — it now bundles its own MCP server with 15 vault tools — rather than writing plugin code. Revisit a custom plugin only if these conventions demonstrably fall short.
+Agents post progress through the shared task plane and use advisory path leases when overlap is unavoidable. When both finish, the daemon merges the first branch into the integration branch and hands the second agent any conflict-resolution work. The human reviews the integration branch before it touches the real branch.
 
 ---
 
-## 5. Substrate decision
+## 7. Substrate and stack
 
-**macOS (primary): tmux.** Maturity, `send-keys`/`capture-pane`/`pipe-pane`, control-mode `%output` events if raw streams are ever needed, and the pattern is proven by claude-squad and agent-of-empires. Run it under iTerm2's `tmux -CC` so agent panes are native iTerm panes — you keep your terminal, and detach/reattach survives iTerm restarts.
+- **Mux:** tmux on both macOS and WSL2. Zellij remains parked unless native Windows becomes a real requirement.
+- **Runtime:** TypeScript on Bun, including `bun:sqlite`. No framework or ORM.
+- **CLI layout:** `src/cli`, `src/daemon`, `src/mux`, `src/adapters`, `scripts/`, and `docs/`.
+- **Daemon port:** `4770` by default, bound to `127.0.0.1`.
+- **Tests:** `bun test`, real tmux on a throwaway socket, authenticated live tests opt-in.
 
-> **Decision update (Jul 7):** Rich confirmed Windows will run via **WSL2**, so tmux is the sole v0 substrate on both platforms and the Zellij backend is parked (revisit only if native Windows becomes a requirement). The paragraph below is kept for the record.
-
-**Windows: Zellij 0.44+ native, or WSL2 tmux.** tmux still doesn't run natively on Windows (the PR for it is open, unmerged). Zellij 0.44.0 (March 2026) runs natively on Windows and its CLI now mirrors everything the daemon needs (`subscribe` — rendered-output NDJSON streaming, arguably a *better* observation primitive than tmux's raw bytes — plus `send-keys`, `dump-screen`, `list-panes --json`, `watch` read-only attach, browser-based session sharing). It's three months old on Windows, hence backend #2 rather than the foundation. If your Windows work already lives in WSL2, identical tmux stack, zero new code. One check needed: OpenCode's docs still carry a "Windows (WSL)" page — verify current native-Windows status for each agent CLI before committing (agy ships native Windows installers; Claude Code and Codex run on Windows).
-
-**Stack for the daemon: TypeScript on Bun.** Single process, cross-platform, SSE/JSON native, and OpenCode's official SDK (`@opencode-ai/sdk`) plus its generated OpenAPI types are TS. Hook shims are three-line shell/PowerShell scripts. (Go is the alternative if you later want a single static binary; nothing in the design precludes porting.)
-
----
-
-## 6. v0 plan
-
-Each phase is independently useful; stop anywhere and you still have a tool.
-
-**Phase 0 — See everything (a weekend).** Repo + daemon skeleton. `bridge up`: tmux session, four panes, one agent each (optionally each in a worktree). `bridge init`: writes Claude hooks (http handlers) into `.claude/settings.json`, Codex `hooks.json` + `notify`, agy `hooks.json` (best-effort), discovers/pins OpenCode's server port and subscribes to `/event`. `bridge top` v0: four cards with live state — working / idle / **needs you** / done — driven entirely by events. *Exit test: all four agents' turn-completions and permission prompts appear in one pane with zero scraping.*
-
-**Phase 1 — Handoffs (week 2).** Packet builder (JSONL summary + diffstat), `.bridge/handoffs/`, approve-mode injection (send-keys with verify-retry; OpenCode via `/tui/*`), `bridge handoff <from> <to>`, auto mode gated on target-idle events. *Exit test: Claude finishes a refactor; you press one key; Codex's TUI visibly receives a briefing and starts writing tests.*
-
-**Phase 2 — Shared plane.** bridge-bus MCP server (six tools) registered in all four TUIs; graphify HTTP server + `watch`; `bridge init` appends a short "how to use the bus" section to `CLAUDE.md`/`AGENTS.md`. *Exit test: two agents in separate TUIs read/write the same task thread without you relaying anything.*
-
-**Phase 3 — Router.** Rate-limit pollers (Claude statusline tee + OAuth endpoint; Codex JSONL tail + app-server RPC; Copilot internal endpoint; `antigravity-usage`), bars in `bridge top`, `bridge assign` placement by weekly headroom. *Exit test: with Claude at 85% weekly, `bridge assign` routes to Codex and says why.*
-
-**Phase 4 — Pair mode.** Worktree spawner + integration branch, `lock_paths` leases, merge choreography, per-task autonomy config (frontmatter in the task file). *Exit test: two agents build one feature in parallel worktrees and the integration branch merges with agent-resolved conflicts.*
-
-**Phase 5 — Human layer (+ parked portability).** Obsidian vault mirroring + a Bases dashboard. The Zellij mux backend is parked per the WSL2 decision above; the `MuxAdapter` interface keeps the door open.
+OpenCode's SDK and server were part of the original stack rationale but are no longer active v0 dependencies.
 
 ---
 
-## 7. Risks and open questions
+## 8. Reframed phase plan
 
-**agy is the weak link.** Its hook event names and transcript location are the two things I could not pin to primary docs (antigravity.google is a JS-rendered SPA that resists fetching; the GitHub repo is a docs-mirror). Worst case, agy runs in observe-via-mux mode in Phase 0 while the others are event-driven — the design degrades gracefully. Worth five minutes in a browser on `antigravity.google/docs/hooks` before building its adapter.
+Each phase is independently useful and gets its own branch.
 
-**Unofficial endpoints churn.** Claude's OAuth usage endpoint, `copilot_internal/user`, and the Antigravity LSP probe are all undocumented; Copilot's AI-Credits migration (June 2026) is actively reshaping its schema. Hence: pollers as plugins, estimation fallback, and never letting the router hard-fail on a dead poller.
+### Phase 0 — Dual-TUI foundation (reopened; current)
 
-**Injection races.** Typing into a TUI that's mid-render loses keystrokes. Mitigations are in the design (idle-event gating, bracketed paste, echo-verify + retry) but this will still be the fiddliest code in the repo. Claude Code has no local input API at all — send-keys *is* the mechanism — and that's an accepted limitation, not a blocker.
+`bridge up` launches Claude Code and Codex side by side. `bridge init` safely configures only their hook surfaces. `bridge top` displays two event-driven cards.
 
-**Two sessions ≠ one session.** OpenCode aside, you can't attach a second programmatic client to a *running* TUI session (Codex app-server threads are separate; Claude's Remote Control rail is vendor-only). The design never needs to — it observes via hooks and injects via the terminal — but don't drift into expecting API-grade control of live TUI sessions.
+**Exit test:** both native TUIs are interactive; both transition working → idle; both surface permission prompts as `needs_you`; killing the daemon leaves both TUIs untouched; no lifecycle state comes from screen scraping. Verify on macOS, then WSL2.
 
-**Security.** Hooks execute arbitrary local commands; keep `bridge init`'s written configs auditable and the daemon/bus loopback-only. graphify sends non-code assets to model APIs unless configured for Ollama. Auto-mode handoffs inject text into agents that can run tools — keep auto off for tasks touching anything sensitive, which the per-task dial already expresses.
+### Phase 1 — Bidirectional handoffs
 
-**Scope creep is the real risk.** The landscape table from research is a graveyard of over-built agent managers (omnara archived, Crystal deprecated, Pheromind stale). Phase 0+1 alone — live status board + one-keystroke handoffs between native TUIs — already beats everything that exists.
+Build packets from transcript context plus diff statistics. Support Claude → Codex and Codex → Claude in approve mode, then idle-gated auto mode.
+
+**Exit test:** either agent can finish a turn and visibly hand the next bounded task to the other without losing or racing terminal input.
+
+### Phase 2 — Shared task plane
+
+Add the minimal bridge-bus, file-backed task/update records, peer reads, and advisory path locks. Register it in both TUIs.
+
+**Exit test:** both agents read and update one task thread without the human relaying messages.
+
+### Phase 3 — Pair workflow
+
+Add worktree creation, role-framed briefs, an integration branch, lock leases, and merge/conflict choreography.
+
+**Exit test:** Claude Code and Codex build one feature in parallel worktrees and produce a human-reviewable integration branch.
+
+### Phase 4 — Rate-aware routing
+
+Use Claude and Codex's high-fidelity usage surfaces, show headroom in `bridge top`, and explain automatic placement. Poller failure must degrade gracefully and never block manual assignment.
+
+**Exit test:** a new task routes to the healthier of the two subscriptions and reports why.
+
+### Phase 5 — Extensibility and optional human layer
+
+Generalize configured instance count where the proven workflow requires it. Evaluate additional adapter kinds, Graphify, Obsidian, or another presentation layer only against demonstrated needs.
 
 ---
 
-## 8. Explicitly parked
+## 9. Risks
 
-The Obsidian **plugin** (conventions + existing Local REST API plugin cover it); a web dashboard (tmux + `bridge top` suffice; Zellij's web client arrives free in Phase 5); Copilot CLI as a fifth agent (OpenCode already spends that quota; add later via the same adapter pattern — noting its missing Stop hook); ACP integration (re-hosts agents — violates the prime constraint); building any bespoke knowledge graph (graphify).
+**Injection races.** Terminal input can be lost while a TUI redraws. Semantic idle gating, bracketed paste, echo-verification, and one retry are load-bearing.
+
+**Configuration ownership.** Hooks live in user or repo configuration. Writers must preserve unrelated settings and must not seize global Codex `notify`.
+
+**Session attribution.** Project scope and `cwd` checks exclude other repos, but two simultaneous native sessions of the same kind in one target cwd are not distinguishable yet. Phase 0 assumes one live Claude session and one live Codex session in the managed cwd; native-session binding belongs in the handoff foundation.
+
+**Two sessions are not one model context.** The agents coordinate through explicit packets, files, and later the bridge-bus. The design does not pretend to merge their internal conversations.
+
+**Premature generalization.** `AgentId` versus `AgentKind` is the required seam; a dynamic plugin framework is not. The two-agent workflow must pass before N-agent breadth.
+
+**Scope creep.** The project wins when Claude Code and Codex cooperate reliably in the TUIs the human already uses. Additional providers and dashboards are distractions until that loop works.
+
+---
+
+## 10. Explicitly parked
+
+- OpenCode and its SSE/TUI HTTP special cases.
+- Antigravity (`agy`) and its statusline/hook fallback research.
+- Grok, which was never implemented.
+- Graphify and Obsidian integration.
+- Additional `AgentKind` adapters and generalized N-agent scheduling.
+- Zellij, native-Windows support, web dashboards, and custom chat UIs.
+- ACP or any other approach that replaces the native TUI.
+
+The Git history and decision log retain the original research; parked scope is not active product behavior.
+
+---
+
+## 11. Reset and migration boundary
+
+The origin/phase-0 object-shaped roster remains readable long enough to run `bridge down --legacy`, which retires a running four-agent session only after its old status shape, pidfile, process command, config directory, and pane titles agree. The next `bridge init` removes exact Agent-Bridge-owned global Codex notify/hook callbacks and exact agy blocks with the normal diff-and-backup writer. Foreign or modified entries are preserved. New runtime sessions, hook shims, and event databases are target-scoped.
 
 ---
 
 ## Sources
 
-**Substrate:** [zellij subscribe](https://zellij.dev/documentation/zellij-subscribe.html) · [Zellij CLI actions](https://zellij.dev/documentation/cli-actions) · [Zellij web client](https://zellij.dev/documentation/web-client.html) · [tmux control mode](https://github.com/tmux/tmux/wiki/Control-Mode) · [tmux man page](https://man7.org/linux/man-pages/man1/tmux.1.html) · [tmux native-Windows PR (open)](https://github.com/tmux/tmux/pull/4086) · [iTerm2 tmux integration](https://iterm2.com/documentation-tmux-integration.html) · [WezTerm CLI](https://wezterm.org/cli/cli/index.html)
+**Agent surfaces:** [Claude Code hooks](https://code.claude.com/docs/en/hooks) · [Claude Code statusline](https://code.claude.com/docs/en/statusline) · [Codex hooks](https://developers.openai.com/codex/hooks) · [Codex app-server](https://developers.openai.com/codex/app-server) · [Codex advanced configuration](https://developers.openai.com/codex/config-advanced)
 
-**Agent surfaces:** [Claude Code hooks](https://code.claude.com/docs/en/hooks) · [statusline (incl. rate_limits)](https://code.claude.com/docs/en/statusline) · [remote control](https://code.claude.com/docs/en/remote-control) · [Codex hooks](https://developers.openai.com/codex/hooks) · [Codex app-server](https://developers.openai.com/codex/app-server) · [Codex config](https://developers.openai.com/codex/config-advanced) · [OpenCode server API (verified: /tui/*, /event SSE, permissions)](https://opencode.ai/docs/server/) · [OpenCode plugins](https://opencode.ai/docs/plugins/) · [OpenCode SDK](https://opencode.ai/docs/sdk/) · [Copilot via OpenCode (GitHub changelog)](https://github.blog/changelog/) · [antigravity-cli repo](https://github.com/google-antigravity/antigravity-cli) · [agy docs (SPA — check in browser)](https://antigravity.google/docs/cli-overview) · [Copilot CLI hooks](https://docs.github.com/en/copilot/reference/hooks-configuration)
+**Terminal substrate:** [tmux control mode](https://github.com/tmux/tmux/wiki/Control-Mode) · [tmux man page](https://man7.org/linux/man-pages/man1/tmux.1.html) · [iTerm2 tmux integration](https://iterm2.com/documentation-tmux-integration.html)
 
-**Rate limits:** [Claude OAuth usage endpoint write-up](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor/issues/202) · [ccusage](https://ccusage.com/guide/) · [codex-ratelimit (JSONL format)](https://github.com/xiangz19/codex-ratelimit) · [CodexBar providers.md (read-path catalog for ~48 providers)](https://github.com/steipete/CodexBar/blob/main/docs/providers.md) · [GitHub AI Credits announcement](https://github.blog/news-insights/company-news/github-copilot-is-moving-to-usage-based-billing/) · [antigravity-usage](https://github.com/skainguyen1412/antigravity-usage)
-
-**Prior art:** [claude-squad](https://github.com/smtg-ai/claude-squad) · [agent-of-empires](https://github.com/njbrake/agent-of-empires) · [Conduit](https://getconduit.sh/) · [Tmux-Orchestrator](https://github.com/Jedward23/Tmux-Orchestrator) · [tmux-mcp](https://github.com/nickgnd/tmux-mcp) · [tmux-cli (verify-retry injection)](https://github.com/pchalasani/claude-code-tools) · [vibe-kanban](https://github.com/BloopAI/vibe-kanban) · [ACP](https://agentclientprotocol.com/) · [omnara (archived)](https://github.com/omnara-ai/omnara) · [happy](https://github.com/slopus/happy)
-
-**Context & human layer:** [graphify (README verified: MCP tools, HTTP mode, --update/watch, --obsidian)](https://github.com/safishamsi/graphify) · [local-PDF feature request #259](https://github.com/safishamsi/graphify/issues/259) · [Obsidian Local REST API (built-in MCP)](https://github.com/coddingtonbear/obsidian-local-rest-api) · [JSON Canvas spec](https://jsoncanvas.org/) · [Obsidian Bases](https://obsidian.md/help/bases) · [git worktree](https://git-scm.com/docs/git-worktree)
+**Prior art and coordination:** [claude-squad](https://github.com/smtg-ai/claude-squad) · [agent-of-empires](https://github.com/njbrake/agent-of-empires) · [tmux-cli](https://github.com/pchalasani/claude-code-tools) · [git worktree](https://git-scm.com/docs/git-worktree)

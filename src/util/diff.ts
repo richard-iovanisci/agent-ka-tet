@@ -1,6 +1,6 @@
 /**
  * Dependency-free unified-style line diff, for showing config changes
- * before they are written (CLAUDE.md constraint #4). Config files are
+ * before they are written (CLAUDE.md constraint #5). Config files are
  * small, so the O(n*m) LCS is fine.
  */
 export function unifiedDiff(before: string, after: string, label: string): string {

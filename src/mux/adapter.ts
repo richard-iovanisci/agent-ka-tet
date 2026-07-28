@@ -12,7 +12,9 @@ export interface PaneInfo {
   id: string;
   /** Position within the window. */
   index: number;
-  /** Pane title (settable via setPaneTitle). */
+  /** Durable bridge identity stored outside TUI-controlled display state. */
+  agentId: string | null;
+  /** Best-effort display title; native TUIs may overwrite it. */
   title: string;
   /** Command currently running in the pane (e.g. the user's shell). */
   command: string;
@@ -33,6 +35,9 @@ export interface SendResult {
 
 export interface MuxAdapter {
   hasSession(session: string): Promise<boolean>;
+  /** Store/read a backend-native session marker used to prevent cross-repo reuse. */
+  setSessionMarker(session: string, value: string): Promise<void>;
+  getSessionMarker(session: string): Promise<string | null>;
   /**
    * Create a detached session whose first pane runs the user's default shell
    * (agents are launched later by typing into that shell — the pane must
@@ -70,6 +75,9 @@ export interface MuxAdapter {
     opts?: { submit?: boolean; verify?: boolean },
   ): Promise<SendResult>;
   focusPane(session: string, paneId: string): Promise<void>;
+  /** Persist the configured AgentId in backend-native pane metadata. */
+  setPaneAgentId(paneId: string, agentId: string): Promise<void>;
+  /** Set the initial display title; native TUIs remain free to replace it. */
   setPaneTitle(paneId: string, title: string): Promise<void>;
   killSession(session: string): Promise<void>;
   /** argv for an interactive attach, e.g. ["tmux", "-L", sock, "attach", "-t", session]. */

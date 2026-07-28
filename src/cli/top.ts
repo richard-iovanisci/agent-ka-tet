@@ -1,5 +1,6 @@
 import type { BridgeConfig } from "../config.ts";
-import { AGENT_NAMES, type AgentState, type StatusResponse } from "../types.ts";
+import type { AgentState, StatusResponse } from "../types.ts";
+import { daemonMatchesConfig, fetchDaemonStatus } from "./daemonClient.ts";
 
 /**
  * `bridge top` — single-pane ANSI board. State comes from daemon events,
@@ -36,21 +37,28 @@ export function renderBoard(status: StatusResponse, now: number): string {
   );
   lines.push("");
 
-  for (const name of AGENT_NAMES) {
-    const a = status.agents[name];
+  const nameWidth = Math.max(8, ...status.agents.map((agent) => agent.agent.length));
+  for (const a of status.agents) {
+    const name = a.agent;
+    const kind = a.agent === a.kind ? "" : ` ${DIM}(${a.kind})${RESET}`;
     if (!a.enabled) {
-      lines.push(`  ${DIM}○ ${name.padEnd(8)} disabled${RESET}`);
+      lines.push(`  ${DIM}○ ${name.padEnd(nameWidth)} disabled${RESET}${kind}`);
       continue;
     }
     const style = STATE_STYLE[a.state];
     const badge = a.pendingPermission !== null ? `  ${BOLD}\x1b[31m⚠ ${a.pendingPermission}${RESET}` : "";
+    const displayedEvent =
+      a.state === "needs_you"
+        ? (a.activeAttention ?? a.lastEvent)
+        : a.lastEvent;
     const last =
-      a.lastEvent === null
-        ? `${DIM}no events yet${RESET}`
-        : `${a.lastEvent.nativeType} ${DIM}${formatAge(now - a.lastEvent.ts)} ago${RESET}`;
-    const via = a.observedVia === "mux" ? ` ${DIM}(mux-observed)${RESET}` : "";
+      displayedEvent === null
+        ? a.kind === "codex" && a.state === "launching"
+          ? `${DIM}awaiting first observed turn${RESET}`
+          : `${DIM}no events yet${RESET}`
+        : `${displayedEvent.nativeType} ${DIM}${formatAge(now - displayedEvent.ts)} ago${RESET}`;
     const sess = a.sessionId !== null ? ` ${DIM}sess ${a.sessionId.slice(0, 8)}${RESET}` : "";
-    lines.push(`  ● ${BOLD}${name.padEnd(8)}${RESET} ${style.color}${style.label}${RESET}  ${last}${sess}${via}${badge}`);
+    lines.push(`  ● ${BOLD}${name.padEnd(nameWidth)}${RESET}${kind} ${style.color}${style.label}${RESET}  ${last}${sess}${badge}`);
   }
   lines.push("");
   return lines.join("\n");
@@ -66,14 +74,18 @@ export function renderUnreachable(cfg: BridgeConfig): string {
   ].join("\n");
 }
 
+export function renderMismatch(cfg: BridgeConfig): string {
+  return [
+    `${BOLD}agent-bridge${RESET} ${DIM}· q quits${RESET}`,
+    "",
+    `  \x1b[31mport ${cfg.daemonPort} belongs to another or stale bridge configuration${RESET}`,
+    `  ${DIM}refusing to display another target repo's state${RESET}`,
+    "",
+  ].join("\n");
+}
+
 export async function fetchStatus(port: number): Promise<StatusResponse | null> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(900) });
-    if (!res.ok) return null;
-    return (await res.json()) as StatusResponse;
-  } catch {
-    return null;
-  }
+  return fetchDaemonStatus(port);
 }
 
 export interface TopOptions {
@@ -88,8 +100,13 @@ export async function top(cfg: BridgeConfig, opts: TopOptions = {}): Promise<num
 
   if (opts.once) {
     const status = await fetchStatus(cfg.daemonPort);
-    write((status === null ? renderUnreachable(cfg) : renderBoard(status, Date.now())) + "\n");
-    return status === null ? 1 : 0;
+    const frame = status === null
+      ? renderUnreachable(cfg)
+      : daemonMatchesConfig(status, cfg)
+        ? renderBoard(status, Date.now())
+        : renderMismatch(cfg);
+    write(frame + "\n");
+    return status !== null && daemonMatchesConfig(status, cfg) ? 0 : 1;
   }
 
   const interval = opts.intervalMs ?? 1000;
@@ -118,7 +135,11 @@ export async function top(cfg: BridgeConfig, opts: TopOptions = {}): Promise<num
   try {
     while (running) {
       const status = await fetchStatus(cfg.daemonPort);
-      const frame = status === null ? renderUnreachable(cfg) : renderBoard(status, Date.now());
+      const frame = status === null
+        ? renderUnreachable(cfg)
+        : daemonMatchesConfig(status, cfg)
+          ? renderBoard(status, Date.now())
+          : renderMismatch(cfg);
       write(`\x1b[H\x1b[2J${frame}`);
       const deadline = Date.now() + interval;
       while (running && Date.now() < deadline) await Bun.sleep(50);

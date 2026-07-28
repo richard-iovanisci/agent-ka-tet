@@ -1,12 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type BridgeConfig } from "../config.ts";
-import { initClaude } from "./claude/init.ts";
-import { initCodex, codexHookShimPath, codexNotifyShimPath } from "./codex/init.ts";
-import { initAgy, agyHookShimPath, agyStatuslineShimPath } from "./agy/init.ts";
-import { composeOpencodeCommand } from "./opencode/init.ts";
+import {
+  claudeSessionStartShimPath,
+  initClaude,
+  removeClaudeHooks,
+} from "./claude/init.ts";
+import {
+  initCodex,
+  codexHookShimPath,
+  removeCodexHooks,
+} from "./codex/init.ts";
+import { retireLegacyIntegrations } from "./retireLegacy.ts";
+import { quoteShellArg } from "./initCommon.ts";
 
 const silent = { print: () => {} };
 
@@ -18,222 +33,482 @@ function setup(): { cfg: BridgeConfig; home: string; repo: string } {
 
 describe("initClaude", () => {
   test("writes http hooks for all bridged events", () => {
-    const { cfg, repo } = setup();
-    const res = initClaude(cfg, { ...silent });
+    const { cfg, home, repo } = setup();
+    const opts = { ...silent, home };
+    const res = initClaude(cfg, opts);
     expect(res.changed).toBe(true);
-    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
-    for (const event of ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "PostToolUse", "Notification"]) {
+    const settings = JSON.parse(
+      readFileSync(join(repo, ".claude", "settings.json"), "utf8"),
+    );
+    for (const event of [
+      "SessionEnd",
+      "UserPromptSubmit",
+      "Stop",
+      "StopFailure",
+      "PermissionRequest",
+      "PermissionDenied",
+      "PostToolUse",
+      "Notification",
+    ]) {
       const groups = settings.hooks[event];
       expect(Array.isArray(groups)).toBe(true);
       expect(groups[0].hooks[0]).toEqual({
         type: "http",
         url: "http://127.0.0.1:4770/events/claude",
         timeout: 10,
+        headers: { "X-Agent-Bridge": "1" },
       });
     }
-    expect(settings.hooks.Notification[0].matcher).toBe("permission_prompt|idle_prompt|agent_needs_input");
+    expect(settings.hooks.Notification[0].matcher).toBe(
+      "permission_prompt|agent_needs_input",
+    );
+    const sessionStart = settings.hooks.SessionStart[0].hooks[0];
+    expect(sessionStart).toEqual({
+      type: "command",
+      command: quoteShellArg(claudeSessionStartShimPath(cfg, opts)),
+      timeout: 10,
+    });
+    const sessionStartShim = claudeSessionStartShimPath(cfg, opts);
+    expect(statSync(sessionStartShim).mode & 0o111).toBeGreaterThan(0);
+    expect(readFileSync(sessionStartShim, "utf8")).toContain(
+      "http://127.0.0.1:4770/events/claude",
+    );
   });
 
   test("is idempotent", () => {
-    const { cfg } = setup();
-    initClaude(cfg, { ...silent });
-    const res = initClaude(cfg, { ...silent });
+    const { cfg, home } = setup();
+    initClaude(cfg, { ...silent, home });
+    const res = initClaude(cfg, { ...silent, home });
     expect(res.changed).toBe(false);
   });
 
+  test("replaces the previous idle-prompt matcher without accumulating groups", () => {
+    const { cfg, home, repo } = setup();
+    const opts = { ...silent, home };
+    initClaude(cfg, opts);
+    const path = join(repo, ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(path, "utf8"));
+    settings.hooks.Notification[0].matcher =
+      "permission_prompt|idle_prompt|agent_needs_input";
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+
+    expect(initClaude(cfg, opts).changed).toBe(true);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.hooks.Notification).toHaveLength(1);
+    expect(after.hooks.Notification[0].matcher).toBe(
+      "permission_prompt|agent_needs_input",
+    );
+  });
+
   test("preserves foreign settings and foreign hooks", () => {
-    const { cfg, repo } = setup();
+    const { cfg, home, repo } = setup();
     const path = join(repo, ".claude", "settings.json");
     mkdirSync(join(repo, ".claude"), { recursive: true });
     writeFileSync(
       path,
       JSON.stringify({
         model: "opus",
-        hooks: { Stop: [{ hooks: [{ type: "command", command: "/my/thing.sh" }] }] },
+        hooks: {
+          Stop: [
+            { hooks: [{ type: "command", command: "/my/thing.sh" }] },
+            {
+              hooks: [
+                { type: "http", url: "http://127.0.0.1:9999/events/foreign" },
+              ],
+            },
+          ],
+        },
       }),
     );
-    initClaude(cfg, { ...silent });
+    initClaude(cfg, { ...silent, home });
     const settings = JSON.parse(readFileSync(path, "utf8"));
     expect(settings.model).toBe("opus");
-    expect(settings.hooks.Stop).toHaveLength(2);
+    expect(settings.hooks.Stop).toHaveLength(3);
     expect(settings.hooks.Stop[0].hooks[0].command).toBe("/my/thing.sh");
-    expect(settings.hooks.Stop[1].hooks[0].type).toBe("http");
+    expect(settings.hooks.Stop[1].hooks[0].url).toContain("/events/foreign");
+    expect(settings.hooks.Stop[2].hooks[0].headers["X-Agent-Bridge"]).toBe("1");
+  });
+
+  test("prunes owned handlers inside a mixed group without losing foreign metadata", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".claude", "settings.json");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: "keep-me",
+            hooks: [
+              {
+                type: "http",
+                url: "http://127.0.0.1:4770/events/old-id",
+                headers: { "X-Agent-Bridge": "1" },
+              },
+              { type: "command", command: "/foreign.sh" },
+            ],
+          }],
+        },
+      }),
+    );
+    initClaude(cfg, { ...silent, home });
+    const settings = JSON.parse(readFileSync(path, "utf8"));
+    expect(settings.hooks.Stop).toHaveLength(2);
+    expect(settings.hooks.Stop[0]).toEqual({
+      matcher: "keep-me",
+      hooks: [{ type: "command", command: "/foreign.sh" }],
+    });
+  });
+
+  test("disabled cleanup removes only bridge-owned Claude handlers", () => {
+    const { cfg, home, repo } = setup();
+    initClaude(cfg, { ...silent, home });
+    const path = join(repo, ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(path, "utf8"));
+    settings.hooks.Stop.unshift({ hooks: [{ type: "command", command: "/foreign.sh" }] });
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+    expect(removeClaudeHooks(cfg, { ...silent, home }).changed).toBe(true);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.hooks.Stop).toEqual([
+      { hooks: [{ type: "command", command: "/foreign.sh" }] },
+    ]);
+    expect(after.hooks.SessionStart).toBeUndefined();
   });
 
   test("refuses to clobber unparseable settings", () => {
-    const { cfg, repo } = setup();
+    const { cfg, home, repo } = setup();
     mkdirSync(join(repo, ".claude"), { recursive: true });
     writeFileSync(join(repo, ".claude", "settings.json"), "{not json");
-    expect(() => initClaude(cfg, { ...silent })).toThrow(/refusing to touch/);
+    expect(() => initClaude(cfg, { ...silent, home })).toThrow(/refusing to touch/);
   });
 
   test("daemon port is respected in the url", () => {
-    const { cfg, repo } = setup();
+    const { cfg, home, repo } = setup();
     cfg.daemonPort = 9999;
-    initClaude(cfg, { ...silent });
-    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
-    expect(settings.hooks.Stop[0].hooks[0].url).toBe("http://127.0.0.1:9999/events/claude");
+    initClaude(cfg, { ...silent, home });
+    const settings = JSON.parse(
+      readFileSync(join(repo, ".claude", "settings.json"), "utf8"),
+    );
+    expect(settings.hooks.Stop[0].hooks[0].url).toBe(
+      "http://127.0.0.1:9999/events/claude",
+    );
   });
 
   test("changing daemonPort replaces old bridge groups instead of accumulating them", () => {
-    const { cfg, repo } = setup();
-    initClaude(cfg, { ...silent });
+    const { cfg, home, repo } = setup();
+    initClaude(cfg, { ...silent, home });
     cfg.daemonPort = 4771;
-    initClaude(cfg, { ...silent });
-    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
+    initClaude(cfg, { ...silent, home });
+    const settings = JSON.parse(
+      readFileSync(join(repo, ".claude", "settings.json"), "utf8"),
+    );
     expect(settings.hooks.Stop).toHaveLength(1);
-    expect(settings.hooks.Stop[0].hooks[0].url).toBe("http://127.0.0.1:4771/events/claude");
+    expect(settings.hooks.Stop[0].hooks[0].url).toBe(
+      "http://127.0.0.1:4771/events/claude",
+    );
   });
 
-  test("writes settings.json into the claude pane's cwd override, not cfg.repo", () => {
-    const { cfg, repo } = setup();
+  test("changing AgentId migrates the old bridge groups", () => {
+    const { cfg, home, repo } = setup();
+    initClaude(cfg, { ...silent, home });
+    const claude = cfg.agents.find((agent) => agent.kind === "claude");
+    if (claude === undefined) throw new Error("default Claude instance missing");
+    claude.id = "primary-claude";
+    initClaude(cfg, { ...silent, home });
+    const settings = JSON.parse(
+      readFileSync(join(repo, ".claude", "settings.json"), "utf8"),
+    );
+    expect(settings.hooks.Stop).toHaveLength(1);
+    expect(settings.hooks.Stop[0].hooks[0].url).toBe(
+      "http://127.0.0.1:4770/events/primary-claude",
+    );
+  });
+
+  test("writes settings.json into the configured Claude instance cwd", () => {
+    const { cfg, home, repo } = setup();
     const paneCwd = mkdtempSync(join(tmpdir(), "bridge-claude-cwd-"));
-    cfg.agents.claude = { ...cfg.agents.claude, cwd: paneCwd };
-    initClaude(cfg, { ...silent });
+    const claude = cfg.agents.find((agent) => agent.kind === "claude");
+    if (claude === undefined) throw new Error("default Claude instance missing");
+    claude.id = "primary-claude";
+    claude.cwd = paneCwd;
+
+    initClaude(cfg, { ...silent, home });
+
     expect(existsSync(join(paneCwd, ".claude", "settings.json"))).toBe(true);
     expect(existsSync(join(repo, ".claude", "settings.json"))).toBe(false);
+    const settings = JSON.parse(
+      readFileSync(join(paneCwd, ".claude", "settings.json"), "utf8"),
+    );
+    expect(settings.hooks.Stop[0].hooks[0].url).toBe(
+      "http://127.0.0.1:4770/events/primary-claude",
+    );
   });
 });
 
 describe("initCodex", () => {
-  test("writes executable shims, hooks.json and notify", () => {
-    const { cfg, home } = setup();
+  test("writes an executable hook shim and hooks.json without claiming notify", () => {
+    const { cfg, home, repo } = setup();
     const opts = { ...silent, home };
     const res = initCodex(cfg, opts);
     expect(res.hooksJson.changed).toBe(true);
-    expect(res.configTomlChanged).toBe(true);
-    expect(res.notifyConflict).toBeNull();
 
-    for (const shim of [codexHookShimPath(opts), codexNotifyShimPath(opts)]) {
-      expect(existsSync(shim)).toBe(true);
-      expect(statSync(shim).mode & 0o111).toBeGreaterThan(0);
-      expect(readFileSync(shim, "utf8")).toContain("#!/usr/bin/env bash");
-      expect(readFileSync(shim, "utf8")).toContain("http://127.0.0.1:4770/events/codex");
-    }
+    const shim = codexHookShimPath(cfg, opts);
+    expect(existsSync(shim)).toBe(true);
+    expect(statSync(shim).mode & 0o111).toBeGreaterThan(0);
+    expect(readFileSync(shim, "utf8")).toContain("#!/usr/bin/env bash");
+    expect(readFileSync(shim, "utf8")).toContain(
+      "http://127.0.0.1:4770/events/codex",
+    );
 
-    const hooks = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8"));
-    for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse"]) {
+    const hooks = JSON.parse(
+      readFileSync(join(repo, ".codex", "hooks.json"), "utf8"),
+    );
+    for (const event of [
+      "SessionStart",
+      "UserPromptSubmit",
+      "Stop",
+      "PermissionRequest",
+      "PostToolUse",
+    ]) {
       expect(hooks.hooks[event][0].hooks[0]).toEqual({
         type: "command",
-        command: codexHookShimPath(opts),
+        command: quoteShellArg(shim),
         timeout: 10,
       });
     }
 
-    const toml = readFileSync(join(home, ".codex", "config.toml"), "utf8");
-    expect(toml).toContain(`notify = ["${codexNotifyShimPath(opts)}"]`);
+    expect(existsSync(join(home, ".codex", "config.toml"))).toBe(false);
+    expect(existsSync(join(home, ".codex", "hooks.json"))).toBe(false);
   });
 
-  test("is idempotent (trust-hash safe: byte-identical re-runs)", () => {
-    const { cfg, home } = setup();
+  test("is idempotent and trust-hash safe", () => {
+    const { cfg, home, repo } = setup();
     initCodex(cfg, { ...silent, home });
-    const before = readFileSync(join(home, ".codex", "hooks.json"), "utf8");
+    const before = readFileSync(join(repo, ".codex", "hooks.json"), "utf8");
     const res = initCodex(cfg, { ...silent, home });
     expect(res.hooksJson.changed).toBe(false);
-    expect(res.configTomlChanged).toBe(false);
-    expect(readFileSync(join(home, ".codex", "hooks.json"), "utf8")).toBe(before);
+    expect(readFileSync(join(repo, ".codex", "hooks.json"), "utf8")).toBe(
+      before,
+    );
   });
 
-  test("notify conflict: foreign value left untouched, reported", () => {
+  test("leaves an existing config.toml byte-identical", () => {
     const { cfg, home } = setup();
-    mkdirSync(join(home, ".codex"), { recursive: true });
-    writeFileSync(join(home, ".codex", "config.toml"), 'notify = ["my-notifier"]\n[section]\nx = 1\n');
-    const res = initCodex(cfg, { ...silent, home });
-    expect(res.notifyConflict).toBe('notify = ["my-notifier"]');
-    const toml = readFileSync(join(home, ".codex", "config.toml"), "utf8");
-    expect(toml).toContain('notify = ["my-notifier"]');
-    expect(toml).not.toContain("bridge-codex-notify");
-  });
+    const codexDir = join(home, ".codex");
+    const tomlPath = join(codexDir, "config.toml");
+    mkdirSync(codexDir, { recursive: true });
+    const before = 'notify = ["my-notifier"]\n[profiles.default]\nmodel = "o4"\n';
+    writeFileSync(tomlPath, before);
 
-  test("notify inserted at top, before any [section]", () => {
-    const { cfg, home } = setup();
-    mkdirSync(join(home, ".codex"), { recursive: true });
-    writeFileSync(join(home, ".codex", "config.toml"), "[profiles.default]\nmodel = \"o4\"\n");
     initCodex(cfg, { ...silent, home });
-    const toml = readFileSync(join(home, ".codex", "config.toml"), "utf8");
-    const notifyIdx = toml.indexOf("notify = ");
-    const sectionIdx = toml.indexOf("[profiles.default]");
-    expect(notifyIdx).toBeGreaterThanOrEqual(0);
-    expect(notifyIdx).toBeLessThan(sectionIdx);
-    expect(toml).toContain("model = \"o4\"");
+
+    expect(readFileSync(tomlPath, "utf8")).toBe(before);
   });
 
-  test("preserves foreign codex hooks", () => {
+  test("targets the configured Codex instance id", () => {
     const { cfg, home } = setup();
-    mkdirSync(join(home, ".codex"), { recursive: true });
+    const codex = cfg.agents.find((agent) => agent.kind === "codex");
+    if (codex === undefined) throw new Error("default Codex instance missing");
+    codex.id = "review_codex";
+    const opts = { ...silent, home };
+    initCodex(cfg, opts);
+    expect(readFileSync(codexHookShimPath(cfg, opts), "utf8")).toContain(
+      "http://127.0.0.1:4770/events/review_codex",
+    );
+  });
+
+  test("writes project hooks into the configured Codex instance cwd", () => {
+    const { cfg, home, repo } = setup();
+    const paneCwd = mkdtempSync(join(tmpdir(), "bridge-codex-cwd-"));
+    const codex = cfg.agents.find((agent) => agent.kind === "codex");
+    if (codex === undefined) throw new Error("default Codex instance missing");
+    codex.cwd = paneCwd;
+    initCodex(cfg, { ...silent, home });
+    expect(existsSync(join(paneCwd, ".codex", "hooks.json"))).toBe(true);
+    expect(existsSync(join(repo, ".codex", "hooks.json"))).toBe(false);
+    expect(existsSync(join(home, ".codex", "hooks.json"))).toBe(false);
+  });
+
+  test("preserves foreign Codex hooks", () => {
+    const { cfg, home, repo } = setup();
+    mkdirSync(join(repo, ".codex"), { recursive: true });
     writeFileSync(
-      join(home, ".codex", "hooks.json"),
-      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "/mine.sh" }] }] } }),
+      join(repo, ".codex", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command: "/mine.sh" }] }],
+        },
+      }),
     );
     initCodex(cfg, { ...silent, home });
-    const hooks = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8"));
+    const hooks = JSON.parse(
+      readFileSync(join(repo, ".codex", "hooks.json"), "utf8"),
+    );
     expect(hooks.hooks.Stop).toHaveLength(2);
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe("/mine.sh");
   });
-});
 
-describe("initAgy", () => {
-  test("writes per-event shims with ?native= and both hooks.json locations", () => {
-    const { cfg, home } = setup();
+  test("prunes owned Codex handlers inside mixed groups", () => {
+    const { cfg, home, repo } = setup();
     const opts = { ...silent, home };
-    const res = initAgy(cfg, opts);
-    expect(res.hooksFiles).toHaveLength(2);
-
-    for (const event of ["PreToolUse", "PostToolUse", "Stop"]) {
-      const shim = agyHookShimPath(event, opts);
-      expect(existsSync(shim)).toBe(true);
-      expect(statSync(shim).mode & 0o111).toBeGreaterThan(0);
-      expect(readFileSync(shim, "utf8")).toContain(`/events/agy?native=${event}`);
-    }
-    expect(existsSync(agyStatuslineShimPath(opts))).toBe(true);
-
-    for (const path of [
-      join(home, ".gemini", "config", "hooks.json"),
-      join(home, ".gemini", "antigravity-cli", "hooks.json"),
-    ]) {
-      const root = JSON.parse(readFileSync(path, "utf8"));
-      const block = root["agent-bridge"];
-      expect(Object.keys(block).sort()).toEqual(["PostToolUse", "PreToolUse", "Stop"]);
-      expect(block.Stop[0].matcher).toBe("*");
-      expect(block.Stop[0].hooks[0].type).toBe("command");
-    }
+    const shim = codexHookShimPath(cfg, opts);
+    mkdirSync(join(repo, ".codex"), { recursive: true });
+    writeFileSync(
+      join(repo, ".codex", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: "keep-me",
+            hooks: [
+              { type: "command", command: shim },
+              { type: "command", command: "/foreign.sh" },
+            ],
+          }],
+        },
+      }),
+    );
+    initCodex(cfg, opts);
+    const root = JSON.parse(readFileSync(join(repo, ".codex", "hooks.json"), "utf8"));
+    expect(root.hooks.Stop).toHaveLength(2);
+    expect(root.hooks.Stop[0]).toEqual({
+      matcher: "keep-me",
+      hooks: [{ type: "command", command: "/foreign.sh" }],
+    });
   });
 
-  test("is idempotent and preserves foreign named hooks", () => {
-    const { cfg, home } = setup();
+  test("disabled cleanup removes only bridge-owned Codex handlers", () => {
+    const { cfg, home, repo } = setup();
+    const opts = { ...silent, home };
+    initCodex(cfg, opts);
+    const path = join(repo, ".codex", "hooks.json");
+    const root = JSON.parse(readFileSync(path, "utf8"));
+    root.hooks.Stop.unshift({ hooks: [{ type: "command", command: "/foreign.sh" }] });
+    writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`);
+    expect(removeCodexHooks(cfg, opts).changed).toBe(true);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.hooks.Stop).toEqual([
+      { hooks: [{ type: "command", command: "/foreign.sh" }] },
+    ]);
+  });
+
+  test("quotes generated hook paths for shell-special home directories", () => {
+    const home = mkdtempSync(join(tmpdir(), "bridge init home with space '"));
+    const repo = mkdtempSync(join(tmpdir(), "bridge-init-repo-"));
+    const cfg = defaultConfig(repo);
+    const opts = { ...silent, home };
+    initClaude(cfg, opts);
+    initCodex(cfg, opts);
+
+    const claude = JSON.parse(
+      readFileSync(join(repo, ".claude", "settings.json"), "utf8"),
+    );
+    const codex = JSON.parse(
+      readFileSync(join(repo, ".codex", "hooks.json"), "utf8"),
+    );
+    const commands = [
+      claude.hooks.SessionStart[0].hooks[0].command,
+      codex.hooks.SessionStart[0].hooks[0].command,
+    ];
+    expect(commands).toEqual([
+      quoteShellArg(claudeSessionStartShimPath(cfg, opts)),
+      quoteShellArg(codexHookShimPath(cfg, opts)),
+    ]);
+    for (const command of commands) {
+      expect(Bun.spawnSync(["bash", "-c", `${command} </dev/null`]).exitCode).toBe(0);
+    }
+  });
+});
+
+describe("legacy integration retirement", () => {
+  test("removes exact old notify and agy blocks but preserves unrelated config", () => {
+    const { home } = setup();
+    const opts = { ...silent, home };
+    const codexDir = join(home, ".codex");
+    mkdirSync(codexDir, { recursive: true });
+    const notifyShim = join(
+      home,
+      ".local",
+      "state",
+      "agent-bridge",
+      "shims",
+      "bridge-codex-notify.sh",
+    );
+    writeFileSync(
+      join(codexDir, "config.toml"),
+      `# agent-bridge: forward turn-complete notifications to the daemon\nnotify = ["${notifyShim}"]\nmodel = "keep"\n`,
+    );
+    const oldHookShim = join(
+      home,
+      ".local",
+      "state",
+      "agent-bridge",
+      "shims",
+      "bridge-codex-hook.sh",
+    );
+    writeFileSync(
+      join(codexDir, "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          SessionStart: [{ hooks: [{ type: "command", command: oldHookShim }] }],
+          Stop: [{
+            matcher: "keep-metadata",
+            hooks: [
+              { type: "command", command: oldHookShim },
+              { type: "command", command: "/foreign.sh" },
+            ],
+          }],
+        },
+      }),
+    );
+
+    const agyDir = join(home, ".gemini", "config");
+    mkdirSync(agyDir, { recursive: true });
+    const block: Record<string, unknown> = {};
+    for (const event of ["PreToolUse", "PostToolUse", "Stop"]) {
+      block[event] = [{
+        matcher: "*",
+        hooks: [{
+          type: "command",
+          command: join(
+            home,
+            ".local",
+            "state",
+            "agent-bridge",
+            "shims",
+            `bridge-agy-hook-${event}.sh`,
+          ),
+          timeout: 10,
+        }],
+      }];
+    }
+    writeFileSync(
+      join(agyDir, "hooks.json"),
+      JSON.stringify({ "agent-bridge": block, foreign: { keep: true } }),
+    );
+
+    expect(retireLegacyIntegrations(opts)).toBe(0);
+    expect(readFileSync(join(codexDir, "config.toml"), "utf8")).toBe(
+      'model = "keep"\n',
+    );
+    const codexHooks = JSON.parse(readFileSync(join(codexDir, "hooks.json"), "utf8"));
+    expect(codexHooks.hooks.SessionStart).toBeUndefined();
+    expect(codexHooks.hooks.Stop).toEqual([{
+      matcher: "keep-metadata",
+      hooks: [{ type: "command", command: "/foreign.sh" }],
+    }]);
+    const after = JSON.parse(readFileSync(join(agyDir, "hooks.json"), "utf8"));
+    expect(after["agent-bridge"]).toBeUndefined();
+    expect(after.foreign).toEqual({ keep: true });
+  });
+
+  test("leaves a modified legacy agy block untouched", () => {
+    const { home } = setup();
+    const opts = { ...silent, home };
     const path = join(home, ".gemini", "config", "hooks.json");
     mkdirSync(join(home, ".gemini", "config"), { recursive: true });
-    writeFileSync(path, JSON.stringify({ "my-hook": { PreToolUse: [] } }));
-    initAgy(cfg, { ...silent, home });
-    const second = initAgy(cfg, { ...silent, home });
-    expect(second.hooksFiles.every((r) => !r.changed)).toBe(true);
-    const root = JSON.parse(readFileSync(path, "utf8"));
-    expect(root["my-hook"]).toEqual({ PreToolUse: [] });
-    expect(root["agent-bridge"]).toBeDefined();
-  });
-});
-
-describe("composeOpencodeCommand", () => {
-  test("appends --port and --hostname when missing", () => {
-    const { cfg } = setup();
-    expect(composeOpencodeCommand(cfg)).toBe("opencode --port 4096 --hostname 127.0.0.1");
-  });
-
-  test("respects an existing --port", () => {
-    const { cfg } = setup();
-    cfg.agents.opencode.command = "opencode --port 5000";
-    expect(composeOpencodeCommand(cfg)).toBe("opencode --port 5000 --hostname 127.0.0.1");
-  });
-
-  test("respects a fully specified command", () => {
-    const { cfg } = setup();
-    cfg.agents.opencode.command = "opencode --port=5000 --hostname=0.0.0.0";
-    expect(composeOpencodeCommand(cfg)).toBe("opencode --port=5000 --hostname=0.0.0.0");
-  });
-
-  test("uses the configured opencodePort", () => {
-    const { cfg } = setup();
-    cfg.opencodePort = 7777;
-    expect(composeOpencodeCommand(cfg)).toContain("--port 7777");
+    const before = '{"agent-bridge":{"Stop":[]},"foreign":true}';
+    writeFileSync(path, before);
+    expect(retireLegacyIntegrations(opts)).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(before);
   });
 });

@@ -10,7 +10,7 @@ export interface WriteResult {
 
 /**
  * The single engine every `bridge init` writer goes through. Enforces
- * CLAUDE.md constraint #4: print a diff before writing, back up the
+ * CLAUDE.md constraint #5: print a diff before writing, back up the
  * original, and stay idempotent (identical content -> no write, no backup).
  */
 export function writeConfigFile(
