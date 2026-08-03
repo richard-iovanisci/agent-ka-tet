@@ -38,7 +38,7 @@ safety checks. The shared task plane, pair/worktree launcher, model/effort and
 usage telemetry, native resume actions, and global multi-project operator
 console are not part of this first slice.
 
-Current automated gate: **187 Bun tests / 0 failures / 1,194 assertions** in
+Current automated gate: **187 Bun tests / 0 failures / 1,195 assertions** in
 both the normal UTF-8 environment and plain `LC_ALL=C`; strict TypeScript is
 green, and Phase 0 static compatibility reports **8 pass / 0 fail / 0 warn**
 in both locales on macOS. The independent review and consensus hardening are

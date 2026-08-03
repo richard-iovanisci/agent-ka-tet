@@ -392,21 +392,40 @@ describe("approve-mode native-TUI handoffs", () => {
     expect(existsSync(f.targetOutput)).toBe(false);
   }, 15_000);
 
-  test("a target exiting after the final gate receives no Enter in its fallback shell", async () => {
+  test("a target exiting after paste verification receives no Enter in its fallback shell", async () => {
     const f = await fixture("claude");
     const lines: string[] = [];
     let interrupted = false;
     const racingMux = proxyMux(f.mux, {
       sendText: async (paneId, text, options) => {
-        if (!interrupted && paneId === f.targetPane && options?.verification?.mode === "native-tui") {
-          interrupted = true;
-          Bun.spawnSync(["tmux", "-L", SOCKET, "send-keys", "-t", f.targetPane, "C-c"]);
-          expect(await pollFor(async () =>
-            (await f.mux.listPanes(f.cfg.session))
-              .find((pane) => pane.id === f.targetPane)?.managedProcess === null
-          )).toBe(true);
+        if (
+          interrupted || paneId !== f.targetPane ||
+          options?.verification?.mode !== "native-tui"
+        ) {
+          return f.mux.sendText(paneId, text, options);
         }
-        return f.mux.sendText(paneId, text, options);
+        const beforeSubmit = options.beforeSubmit;
+        expect(beforeSubmit).toBeDefined();
+        return f.mux.sendText(paneId, text, {
+          ...options,
+          beforeSubmit: async () => {
+            interrupted = true;
+            Bun.spawnSync([
+              "tmux",
+              "-L",
+              SOCKET,
+              "send-keys",
+              "-t",
+              f.targetPane,
+              "C-c",
+            ]);
+            expect(await pollFor(async () =>
+              (await f.mux.listPanes(f.cfg.session))
+                .find((pane) => pane.id === f.targetPane)?.managedProcess === null
+            )).toBe(true);
+            await beforeSubmit?.();
+          },
+        });
       },
     });
 
