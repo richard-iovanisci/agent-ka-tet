@@ -48,7 +48,6 @@ function make(
 /* ------------------------------ Claude Code ------------------------------ */
 
 const CLAUDE_HOOK_MAP: Record<string, NormalizedEventType> = {
-  SessionStart: "session.start",
   UserPromptSubmit: "turn.start",
   Stop: "turn.complete",
   StopFailure: "turn.error",
@@ -57,6 +56,13 @@ const CLAUDE_HOOK_MAP: Record<string, NormalizedEventType> = {
   PostToolUse: "permission.resolved",
   SessionEnd: "agent.exit",
 };
+
+const CLAUDE_SESSION_START_SOURCES: ReadonlySet<string> = new Set([
+  "startup",
+  "resume",
+  "clear",
+  "fork",
+]);
 
 const CLAUDE_NOTIFICATION_MAP: Record<string, NormalizedEventType> = {
   permission_prompt: "permission.request",
@@ -79,6 +85,18 @@ export function mapClaudeEvent(body: unknown, agentId: AgentId = "claude"): Norm
       body,
     );
   }
+  if (name === "SessionStart") {
+    const source = str(o.source);
+    return make(
+      identity,
+      source !== null && CLAUDE_SESSION_START_SOURCES.has(source)
+        ? "session.start"
+        : "raw",
+      name,
+      sessionId,
+      body,
+    );
+  }
   const mapped = name ? CLAUDE_HOOK_MAP[name] : undefined;
   return make(identity, mapped ?? "raw", name ?? "unknown", sessionId, body);
 }
@@ -86,19 +104,37 @@ export function mapClaudeEvent(body: unknown, agentId: AgentId = "claude"): Norm
 /* -------------------------------- Codex CLI ------------------------------ */
 
 const CODEX_HOOK_MAP: Record<string, NormalizedEventType> = {
-  SessionStart: "session.start",
   UserPromptSubmit: "turn.start",
   Stop: "turn.complete",
   PermissionRequest: "permission.request",
   PostToolUse: "permission.resolved",
 };
 
+const CODEX_SESSION_START_SOURCES: ReadonlySet<string> = new Set([
+  "startup",
+  "resume",
+  "clear",
+]);
+
 export function mapCodexEvent(body: unknown, agentId: AgentId = "codex"): NormalizedEvent {
   const identity: AgentIdentity = { id: agentId, kind: "codex" };
   const o = asRecord(body);
   const name = str(o.hook_event_name);
+  const sessionId = str(o.session_id);
+  if (name === "SessionStart") {
+    const source = str(o.source);
+    return make(
+      identity,
+      source !== null && CODEX_SESSION_START_SOURCES.has(source)
+        ? "session.start"
+        : "raw",
+      name,
+      sessionId,
+      body,
+    );
+  }
   const mapped = name ? CODEX_HOOK_MAP[name] : undefined;
-  return make(identity, mapped ?? "raw", name ?? "unknown", str(o.session_id), body);
+  return make(identity, mapped ?? "raw", name ?? "unknown", sessionId, body);
 }
 
 /** Short human-readable digest of a permission request for `bridge top`. */

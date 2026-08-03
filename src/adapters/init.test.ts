@@ -4,11 +4,18 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  BRIDGE_AGENT_ID_ENV,
+  BRIDGE_AGENT_ID_HEADER,
+  BRIDGE_CONFIG_FINGERPRINT_ENV,
+  BRIDGE_CONFIG_FINGERPRINT_HEADER,
+} from "../attribution.ts";
 import { defaultConfig, type BridgeConfig } from "../config.ts";
 import {
   claudeSessionStartShimPath,
@@ -56,7 +63,16 @@ describe("initClaude", () => {
         type: "http",
         url: "http://127.0.0.1:4770/events/claude",
         timeout: 10,
-        headers: { "X-Agent-Bridge": "1" },
+        headers: {
+          "X-Agent-Bridge": "1",
+          [BRIDGE_AGENT_ID_HEADER]: `$${BRIDGE_AGENT_ID_ENV}`,
+          [BRIDGE_CONFIG_FINGERPRINT_HEADER]:
+            `$${BRIDGE_CONFIG_FINGERPRINT_ENV}`,
+        },
+        allowedEnvVars: [
+          BRIDGE_AGENT_ID_ENV,
+          BRIDGE_CONFIG_FINGERPRINT_ENV,
+        ],
       });
     }
     expect(settings.hooks.Notification[0].matcher).toBe(
@@ -70,8 +86,15 @@ describe("initClaude", () => {
     });
     const sessionStartShim = claudeSessionStartShimPath(cfg, opts);
     expect(statSync(sessionStartShim).mode & 0o111).toBeGreaterThan(0);
-    expect(readFileSync(sessionStartShim, "utf8")).toContain(
+    const shim = readFileSync(sessionStartShim, "utf8");
+    expect(shim).toContain(
       "http://127.0.0.1:4770/events/claude",
+    );
+    expect(shim).toContain(
+      `-H "${BRIDGE_AGENT_ID_HEADER}: \${${BRIDGE_AGENT_ID_ENV}:-}"`,
+    );
+    expect(shim).toContain(
+      `-H "${BRIDGE_CONFIG_FINGERPRINT_HEADER}: \${${BRIDGE_CONFIG_FINGERPRINT_ENV}:-}"`,
     );
   });
 
@@ -129,6 +152,31 @@ describe("initClaude", () => {
     expect(settings.hooks.Stop[2].hooks[0].headers["X-Agent-Bridge"]).toBe("1");
   });
 
+  test("keeps foreign settings byte-stable on the second run without another backup", () => {
+    const { cfg, home, repo } = setup();
+    const directory = join(repo, ".claude");
+    const path = join(directory, "settings.json");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      model: "opus",
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: "/foreign.sh" }] }],
+      },
+    }));
+    const opts = { ...silent, home };
+
+    expect(initClaude(cfg, opts).changed).toBe(true);
+    const afterFirst = readFileSync(path, "utf8");
+    const backupsAfterFirst = readdirSync(directory)
+      .filter((name) => name.startsWith("settings.json.bak."));
+    expect(backupsAfterFirst).toHaveLength(1);
+
+    expect(initClaude(cfg, opts).changed).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(afterFirst);
+    expect(readdirSync(directory).filter((name) => name.startsWith("settings.json.bak.")))
+      .toEqual(backupsAfterFirst);
+  });
+
   test("prunes owned handlers inside a mixed group without losing foreign metadata", () => {
     const { cfg, home, repo } = setup();
     const path = join(repo, ".claude", "settings.json");
@@ -180,6 +228,46 @@ describe("initClaude", () => {
     mkdirSync(join(repo, ".claude"), { recursive: true });
     writeFileSync(join(repo, ".claude", "settings.json"), "{not json");
     expect(() => initClaude(cfg, { ...silent, home })).toThrow(/refusing to touch/);
+  });
+
+  test("refuses to replace a present non-object hooks section", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".claude", "settings.json");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    const before = `${JSON.stringify({ model: "opus", hooks: [] }, null, 2)}\n`;
+    writeFileSync(path, before);
+
+    expect(() => initClaude(cfg, { ...silent, home })).toThrow(/refusing to touch/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  test("refuses to replace a present non-array Claude event entry", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".claude", "settings.json");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    const before = `${JSON.stringify({ hooks: { Stop: { foreign: true } } }, null, 2)}\n`;
+    writeFileSync(path, before);
+    const opts = { ...silent, home };
+
+    expect(() => initClaude(cfg, opts)).toThrow(/hook event "Stop".*refusing to touch/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(existsSync(claudeSessionStartShimPath(cfg, opts))).toBe(false);
+  });
+
+  test("validates Claude SessionStart before writing its shim", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".claude", "settings.json");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    const before = `${JSON.stringify({
+      hooks: { SessionStart: { foreign: true } },
+    }, null, 2)}\n`;
+    writeFileSync(path, before);
+    const opts = { ...silent, home };
+
+    expect(() => initClaude(cfg, opts))
+      .toThrow(/hook event "SessionStart".*refusing to touch/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(existsSync(claudeSessionStartShimPath(cfg, opts))).toBe(false);
   });
 
   test("daemon port is respected in the url", () => {
@@ -255,9 +343,16 @@ describe("initCodex", () => {
     const shim = codexHookShimPath(cfg, opts);
     expect(existsSync(shim)).toBe(true);
     expect(statSync(shim).mode & 0o111).toBeGreaterThan(0);
-    expect(readFileSync(shim, "utf8")).toContain("#!/usr/bin/env bash");
-    expect(readFileSync(shim, "utf8")).toContain(
+    const shimSource = readFileSync(shim, "utf8");
+    expect(shimSource).toContain("#!/usr/bin/env bash");
+    expect(shimSource).toContain(
       "http://127.0.0.1:4770/events/codex",
+    );
+    expect(shimSource).toContain(
+      `-H "${BRIDGE_AGENT_ID_HEADER}: \${${BRIDGE_AGENT_ID_ENV}:-}"`,
+    );
+    expect(shimSource).toContain(
+      `-H "${BRIDGE_CONFIG_FINGERPRINT_HEADER}: \${${BRIDGE_CONFIG_FINGERPRINT_ENV}:-}"`,
     );
 
     const hooks = JSON.parse(
@@ -346,6 +441,55 @@ describe("initCodex", () => {
     );
     expect(hooks.hooks.Stop).toHaveLength(2);
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe("/mine.sh");
+  });
+
+  test("keeps foreign Codex hooks byte-stable on the second run without another backup", () => {
+    const { cfg, home, repo } = setup();
+    const directory = join(repo, ".codex");
+    const path = join(directory, "hooks.json");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      foreign: { keep: true },
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: "/foreign.sh" }] }],
+      },
+    }));
+    const opts = { ...silent, home };
+
+    expect(initCodex(cfg, opts).hooksJson.changed).toBe(true);
+    const afterFirst = readFileSync(path, "utf8");
+    const backupsAfterFirst = readdirSync(directory)
+      .filter((name) => name.startsWith("hooks.json.bak."));
+    expect(backupsAfterFirst).toHaveLength(1);
+
+    expect(initCodex(cfg, opts).hooksJson.changed).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(afterFirst);
+    expect(readdirSync(directory).filter((name) => name.startsWith("hooks.json.bak.")))
+      .toEqual(backupsAfterFirst);
+  });
+
+  test("refuses to replace a present non-object Codex hooks section", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".codex", "hooks.json");
+    mkdirSync(join(repo, ".codex"), { recursive: true });
+    const before = `${JSON.stringify({ foreign: true, hooks: [] }, null, 2)}\n`;
+    writeFileSync(path, before);
+
+    expect(() => initCodex(cfg, { ...silent, home })).toThrow(/refusing to touch/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  test("refuses to replace a present non-array Codex event entry", () => {
+    const { cfg, home, repo } = setup();
+    const path = join(repo, ".codex", "hooks.json");
+    mkdirSync(join(repo, ".codex"), { recursive: true });
+    const before = `${JSON.stringify({ hooks: { Stop: { foreign: true } } }, null, 2)}\n`;
+    writeFileSync(path, before);
+    const opts = { ...silent, home };
+
+    expect(() => initCodex(cfg, opts)).toThrow(/hook event "Stop".*refusing to touch/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(existsSync(codexHookShimPath(cfg, opts))).toBe(false);
   });
 
   test("prunes owned Codex handlers inside mixed groups", () => {

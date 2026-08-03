@@ -5,15 +5,20 @@
  * interface so a second backend (Zellij, parked per DESIGN.md §5) can slot in
  * without touching callers.
  */
+import type { AgentKind } from "../types.ts";
 
 /** One pane in a mux session, as reported by the backend. */
 export interface PaneInfo {
   /** Backend-global pane id (tmux: "%3"). Stable for the pane's lifetime. */
   id: string;
+  /** PID of the pane's long-lived login shell. */
+  pid: number;
   /** Position within the window. */
   index: number;
   /** Durable bridge identity stored outside TUI-controlled display state. */
   agentId: string | null;
+  /** Present only while bridge's managed native launch remains live. */
+  managedProcess: string | null;
   /** Best-effort display title; native TUIs may overwrite it. */
   title: string;
   /** Command currently running in the pane (e.g. the user's shell). */
@@ -24,13 +29,46 @@ export interface PaneInfo {
 }
 
 /** Outcome of an injection attempt (DESIGN.md §4 injection etiquette). */
+export type PasteObservable =
+  | "literal"
+  | "claude-placeholder"
+  | "codex-placeholder";
+
+export type SendFailure =
+  | "verification-timeout"
+  | "ambiguous-observable";
+
 export interface SendResult {
-  /** Text was delivered (and echo-verified, unless verification was skipped). */
+  /** Text was delivered and receipt-verified, unless verification was skipped. */
   ok: boolean;
-  /** Echo verification ran and found the text in the pane. */
+  /** Verification ran and found exactly one expected pane observable. */
   verified: boolean;
-  /** The paste was retried once after a failed verification. */
+  /** Pane observation was retried once; the text itself is never pasted twice. */
   retried: boolean;
+  /** The exact observable which proved receipt, when verification succeeded. */
+  observable: PasteObservable | null;
+  /** Why verification failed; null for success or explicitly skipped verification. */
+  failure: SendFailure | null;
+}
+
+/** Verification policy for one terminal-boundary paste. */
+export type PasteVerification =
+  | { mode: "literal" }
+  | { mode: "native-tui"; agentKind: AgentKind };
+
+export interface SendTextOptions {
+  submit?: boolean;
+  /** Compatibility switch for launch commands which deliberately skip checking. */
+  verify?: boolean;
+  /** Defaults to literal echo; handoff delivery must select native-tui. */
+  verification?: PasteVerification;
+  /** Final domain revalidation after paste proof and immediately before Enter. */
+  beforeSubmit?: () => void | Promise<void>;
+}
+
+export interface ListPanesOptions {
+  /** Deliberate migration-only inspection of a pre-pin session's current window. */
+  legacyCurrentWindow?: boolean;
 }
 
 export interface MuxAdapter {
@@ -47,13 +85,14 @@ export interface MuxAdapter {
     session: string,
     opts: { cwd: string; width?: number; height?: number },
   ): Promise<string>;
-  /** Split a new pane into the session's current window; returns its id. */
+  /** Split a new pane into the bridge-managed window; returns its id. */
   splitPane(session: string, opts: { cwd: string }): Promise<string>;
   selectLayout(
     session: string,
     layout: "tiled" | "even-horizontal" | "even-vertical",
   ): Promise<void>;
-  listPanes(session: string): Promise<PaneInfo[]>;
+  /** List only the bridge-managed window, even when a scratch window is current. */
+  listPanes(session: string, opts?: ListPanesOptions): Promise<PaneInfo[]>;
   /** Visible pane text; opts.lines reaches that far back into scrollback. */
   capturePane(paneId: string, opts?: { lines?: number }): Promise<string>;
   /**
@@ -64,15 +103,15 @@ export interface MuxAdapter {
    */
   waitForShellReady(paneId: string, timeoutMs?: number): Promise<boolean>;
   /**
-   * Inject text as ONE paste (bracketed when the app requests it), echo-verify
-   * unless opts.verify === false (retrying the paste once on failure), and —
-   * only after the paste lands — send a single trailing Enter when
-   * opts.submit. Never per-line keystrokes.
+   * Inject text as ONE paste (bracketed when the app requests it), verify one
+   * exact pane observable unless opts.verify === false, retry observation once
+   * without re-pasting, and — only after verification — send one trailing
+   * Enter when opts.submit. Never per-line keystrokes.
    */
   sendText(
     paneId: string,
     text: string,
-    opts?: { submit?: boolean; verify?: boolean },
+    opts?: SendTextOptions,
   ): Promise<SendResult>;
   focusPane(session: string, paneId: string): Promise<void>;
   /** Persist the configured AgentId in backend-native pane metadata. */

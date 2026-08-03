@@ -53,7 +53,7 @@ export function renderBoard(status: StatusResponse, now: number): string {
         : a.lastEvent;
     const last =
       displayedEvent === null
-        ? a.kind === "codex" && a.state === "launching"
+        ? a.state === "launching"
           ? `${DIM}awaiting first observed turn${RESET}`
           : `${DIM}no events yet${RESET}`
         : `${displayedEvent.nativeType} ${DIM}${formatAge(now - displayedEvent.ts)} ago${RESET}`;

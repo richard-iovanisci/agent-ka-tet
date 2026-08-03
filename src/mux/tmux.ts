@@ -1,4 +1,15 @@
-import type { MuxAdapter, PaneInfo, SendResult } from "./adapter.ts";
+import { randomBytes } from "node:crypto";
+import { BRIDGE_MANAGED_PROCESS_OPTION } from "../attribution.ts";
+import type {
+  MuxAdapter,
+  ListPanesOptions,
+  PaneInfo,
+  PasteObservable,
+  PasteVerification,
+  SendFailure,
+  SendResult,
+  SendTextOptions,
+} from "./adapter.ts";
 
 /**
  * tmux backend for MuxAdapter. Every invocation is an argv array through
@@ -7,10 +18,10 @@ import type { MuxAdapter, PaneInfo, SendResult } from "./adapter.ts";
  *
  * Injection etiquette (DESIGN.md §4, load-bearing): text goes in as ONE
  * bracketed paste via a uniquely named tmux buffer (load-buffer from stdin +
- * paste-buffer -d -p), the echo is verified via capture-pane, the paste is
- * retried once on a failed verification, and a single trailing Enter is sent
- * only after the paste (+ verification) — never per-line send-keys, which is
- * the naive path that intermittently loses keystrokes.
+ * paste-buffer -d -p -r), then exactly one expected receipt observable is
+ * verified via capture-pane. A miss retries observation, never the paste, and
+ * one trailing Enter is sent only after verification — never per-line
+ * send-keys, which is the naive path that intermittently loses keystrokes.
  */
 
 export interface TmuxAdapterOptions {
@@ -18,6 +29,12 @@ export interface TmuxAdapterOptions {
   socketName?: string;
   /** tmux -f config file (tests use /dev/null to shut out the user's conf). */
   configFile?: string;
+  /** Per-process environment override (used to exercise locale behavior). */
+  environment?: Record<string, string | undefined>;
+  /** Verification timing overrides for deterministic receiver tests. */
+  verificationTimeoutMs?: number;
+  verificationPollMs?: number;
+  verificationSettleMs?: number;
 }
 
 interface RunResult {
@@ -26,27 +43,114 @@ interface RunResult {
   stderr: string;
 }
 
-const SEP = "\x1f"; // ASCII unit separator — cannot appear in tmux format output fields
-const PANE_FORMAT = [
+const PANE_FIELDS = [
   "#{pane_id}",
+  "#{pane_pid}",
   "#{pane_index}",
   "#{@agent-bridge-agent-id}",
+  `#{${BRIDGE_MANAGED_PROCESS_OPTION}}`,
   "#{pane_title}",
   "#{pane_current_command}",
   "#{pane_width}",
   "#{pane_height}",
   "#{pane_active}",
-].join(SEP);
+] as const;
+const PANE_FIELD_COUNT = PANE_FIELDS.length;
 
 /** How long echo-verification polls capture-pane before calling it a miss. */
 const VERIFY_TIMEOUT_MS = 2000;
 const VERIFY_POLL_MS = 50;
+/** Require an exact observation to remain unique across at least one redraw. */
+const VERIFY_SETTLE_MS = 100;
 /** Distinctive-fragment length for echo verification. */
 const VERIFY_FRAGMENT_CHARS = 40;
 const SESSION_MARKER_OPTION = "@agent-bridge-owner";
+const MANAGED_WINDOW_OPTION = "@agent-bridge-window-id";
+const MANAGED_WINDOW_MARKER_OPTION = "@agent-bridge-managed-window";
 const PANE_AGENT_ID_OPTION = "@agent-bridge-agent-id";
 
 let bufferSeq = 0;
+
+interface ObservableCounts {
+  literal: number;
+  expectedPlaceholder: number;
+  anyPlaceholder: number;
+}
+
+interface VerificationProbe {
+  fragment: string;
+  placeholderObservable: Exclude<PasteObservable, "literal"> | null;
+  expectedPlaceholder: RegExp | null;
+  anyPlaceholder: RegExp | null;
+  baseline: ObservableCounts;
+}
+
+type Observation =
+  | { state: "pending" }
+  | { state: "verified"; observable: PasteObservable }
+  | { state: "ambiguous" };
+
+function paneSeparator(): string {
+  // Printable ASCII survives tmux format rendering in both C and UTF-8
+  // locales. Per-call randomness makes collision with a TUI-controlled field
+  // negligible; exact field-count validation still fails closed on collision.
+  return `__agent_bridge_${randomBytes(16).toString("hex")}__`;
+}
+
+function parseDecimal(
+  value: string,
+  field: string,
+  line: string,
+  opts: { positive?: boolean } = {},
+): number {
+  if (!/^\d+$/u.test(value)) {
+    throw new Error(
+      `tmux list-panes: invalid ${field} in ${JSON.stringify(line)}`,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || (opts.positive === true && parsed < 1)) {
+    throw new Error(
+      `tmux list-panes: invalid ${field} in ${JSON.stringify(line)}`,
+    );
+  }
+  return parsed;
+}
+
+/** Strict parser kept separate so malformed format output can be regression-tested. */
+export function parsePaneLine(line: string, separator: string): PaneInfo {
+  const fields = line.split(separator);
+  if (fields.length !== PANE_FIELD_COUNT) {
+    throw new Error(`tmux list-panes: malformed line ${JSON.stringify(line)}`);
+  }
+  const [
+    id,
+    pidText,
+    indexText,
+    agentId,
+    managedProcess,
+    title,
+    command,
+    widthText,
+    heightText,
+    activeText,
+  ] = fields as [string, string, string, string, string, string, string, string, string, string];
+  if (!/^%\d+$/u.test(id) || (activeText !== "0" && activeText !== "1")) {
+    throw new Error(`tmux list-panes: malformed line ${JSON.stringify(line)}`);
+  }
+  return {
+    id,
+    pid: parseDecimal(pidText, "pane_pid", line, { positive: true }),
+    index: parseDecimal(indexText, "pane_index", line),
+    agentId: agentId.length > 0 ? agentId : null,
+    managedProcess: managedProcess.length > 0 ? managedProcess : null,
+    title,
+    command,
+    width: parseDecimal(widthText, "pane_width", line, { positive: true }),
+    height: parseDecimal(heightText, "pane_height", line, { positive: true }),
+    active: activeText === "1",
+  };
+}
 
 /** Exact-match session target (bare names are prefix-matched by tmux). */
 function exact(session: string): string {
@@ -75,21 +179,104 @@ export function verifyFragment(text: string): string {
   return last === undefined ? "" : last.slice(-VERIFY_FRAGMENT_CHARS);
 }
 
+function countMatches(text: string, pattern: RegExp | null): number {
+  if (pattern === null) return 0;
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  return Array.from(text.matchAll(new RegExp(pattern.source, flags))).length;
+}
+
+function observableCounts(screen: string, probe: Omit<VerificationProbe, "baseline">): ObservableCounts {
+  return {
+    literal: countOccurrences(screen, probe.fragment),
+    expectedPlaceholder: countMatches(screen, probe.expectedPlaceholder),
+    anyPlaceholder: countMatches(screen, probe.anyPlaceholder),
+  };
+}
+
+function nativePlaceholderPatterns(
+  agentKind: "claude" | "codex",
+  text: string,
+): {
+  expected: RegExp;
+  any: RegExp;
+  observable: Exclude<PasteObservable, "literal">;
+} {
+  if (agentKind === "codex") {
+    const characters = Array.from(text).length;
+    return {
+      expected: new RegExp(`\\[Pasted Content ${characters} chars\\](?: #\\d+)?`, "gu"),
+      any: /\[Pasted Content \d+ chars\](?: #\d+)?/gu,
+      observable: "codex-placeholder",
+    };
+  }
+  return {
+    // Claude documents the placeholder shape but not whether "+N lines"
+    // counts physical or additional lines, so exactness here is the single
+    // newly rendered paste token; tmux buffer verification covers the bytes.
+    expected: /\[Pasted text #\d+(?: \+\d+ lines)?\]/gu,
+    any: /\[Pasted text #\d+(?: \+\d+ lines)?\]/gu,
+    observable: "claude-placeholder",
+  };
+}
+
+function inspectObservation(probe: VerificationProbe, screen: string): Observation {
+  const now = observableCounts(screen, probe);
+
+  // Net count deltas are not proof: a redraw can remove one old placeholder
+  // while two new ones appear. Require an observable-free baseline and exact
+  // absolute post-paste cardinality so disappearance can never mask duplicates.
+  if (
+    probe.baseline.literal !== 0 || probe.baseline.expectedPlaceholder !== 0 ||
+    probe.baseline.anyPlaceholder !== 0
+  ) {
+    return { state: "ambiguous" };
+  }
+  if (now.literal > 1 || now.expectedPlaceholder > 1 || now.anyPlaceholder > 1) {
+    return { state: "ambiguous" };
+  }
+  if (now.literal === 1 && now.anyPlaceholder === 0) {
+    return { state: "verified", observable: "literal" };
+  }
+  if (now.literal > 0 && now.anyPlaceholder > 0) {
+    return { state: "ambiguous" };
+  }
+  if (now.anyPlaceholder === 0 && now.expectedPlaceholder === 0) {
+    return { state: "pending" };
+  }
+  if (
+    probe.placeholderObservable === null ||
+    now.anyPlaceholder !== 1 ||
+    now.expectedPlaceholder !== 1
+  ) {
+    return { state: "ambiguous" };
+  }
+  return { state: "verified", observable: probe.placeholderObservable };
+}
+
 export class TmuxAdapter implements MuxAdapter {
   /** ["tmux", ...socket/config flags] prepended to every invocation. */
   private readonly baseArgv: readonly string[];
+  private readonly environment: Record<string, string | undefined>;
+  private readonly verificationTimeoutMs: number;
+  private readonly verificationPollMs: number;
+  private readonly verificationSettleMs: number;
 
   constructor(opts: TmuxAdapterOptions = {}) {
     const argv = ["tmux"];
     if (opts.socketName !== undefined) argv.push("-L", opts.socketName);
     if (opts.configFile !== undefined) argv.push("-f", opts.configFile);
     this.baseArgv = argv;
+    this.environment = { ...process.env, ...opts.environment };
+    this.verificationTimeoutMs = opts.verificationTimeoutMs ?? VERIFY_TIMEOUT_MS;
+    this.verificationPollMs = opts.verificationPollMs ?? VERIFY_POLL_MS;
+    this.verificationSettleMs = opts.verificationSettleMs ?? VERIFY_SETTLE_MS;
   }
 
   /** Run tmux, never throwing on a non-zero exit. */
   private async run(args: string[], stdin?: string): Promise<RunResult> {
     const proc = Bun.spawn({
       cmd: [...this.baseArgv, ...args],
+      env: this.environment,
       stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
       stdout: "pipe",
       stderr: "pipe",
@@ -151,6 +338,66 @@ export class TmuxAdapter implements MuxAdapter {
     ).trim();
   }
 
+  /**
+   * Resolve the bridge-owned window without consulting tmux's mutable current
+   * window. Missing or inconsistent reciprocal markers fail closed. The sole
+   * legacy fallback is explicit and used only for verified baseline teardown.
+   */
+  private async managedWindowTarget(
+    session: string,
+    opts: ListPanesOptions = {},
+  ): Promise<string> {
+    const sessionId = await this.sessionId(session);
+    const stored = await this.run([
+      "show-options",
+      "-v",
+      "-t",
+      sessionId,
+      MANAGED_WINDOW_OPTION,
+    ]);
+    if (stored.exitCode !== 0 || stored.stdout.trim().length === 0) {
+      if (opts.legacyCurrentWindow === true) return exactWindow(session);
+      throw new Error(
+        `tmux session ${JSON.stringify(session)} has no managed window identity`,
+      );
+    }
+
+    const windowId = stored.stdout.trim();
+    if (!/^@\d+$/u.test(windowId)) {
+      throw new Error(
+        `tmux session ${JSON.stringify(session)} has invalid managed window id ${JSON.stringify(windowId)}`,
+      );
+    }
+    const identity = (
+      await this.exec([
+        "display-message",
+        "-p",
+        "-t",
+        windowId,
+        "#{session_id}:#{window_id}",
+      ])
+    ).trim();
+    if (identity !== `${sessionId}:${windowId}`) {
+      throw new Error(
+        `tmux managed window ${windowId} no longer belongs to session ${JSON.stringify(session)}`,
+      );
+    }
+    const marker = await this.run([
+      "show-options",
+      "-w",
+      "-v",
+      "-t",
+      windowId,
+      MANAGED_WINDOW_MARKER_OPTION,
+    ]);
+    if (marker.exitCode !== 0 || marker.stdout.trim() !== sessionId) {
+      throw new Error(
+        `tmux managed window ${windowId} is not reciprocally marked for session ${JSON.stringify(session)}`,
+      );
+    }
+    return windowId;
+  }
+
   async createSession(
     session: string,
     opts: { cwd: string; width?: number; height?: number },
@@ -168,14 +415,52 @@ export class TmuxAdapter implements MuxAdapter {
     if (opts.width !== undefined) args.push("-x", String(opts.width));
     if (opts.height !== undefined) args.push("-y", String(opts.height));
     args.push("-P", "-F", "#{pane_id}");
-    return (await this.exec(args)).trim();
+    const paneId = (await this.exec(args)).trim();
+    try {
+      const windowId = (
+        await this.exec([
+          "display-message",
+          "-p",
+          "-t",
+          paneId,
+          "#{window_id}",
+        ])
+      ).trim();
+      if (!/^@\d+$/u.test(windowId)) {
+        throw new Error(
+          `tmux returned invalid managed window id ${JSON.stringify(windowId)}`,
+        );
+      }
+      const target = await this.sessionId(session);
+      await this.exec([
+        "set-option",
+        "-w",
+        "-t",
+        windowId,
+        MANAGED_WINDOW_MARKER_OPTION,
+        target,
+      ]);
+      await this.exec([
+        "set-option",
+        "-t",
+        target,
+        MANAGED_WINDOW_OPTION,
+        windowId,
+      ]);
+      return paneId;
+    } catch (error) {
+      // Do not leave an unpinned bridge session behind after partial creation.
+      await this.run(["kill-session", "-t", exact(session)]);
+      throw error;
+    }
   }
 
   async splitPane(session: string, opts: { cwd: string }): Promise<string> {
+    const window = await this.managedWindowTarget(session);
     const out = await this.exec([
       "split-window",
       "-t",
-      exactWindow(session),
+      window,
       "-c",
       opts.cwd,
       "-P",
@@ -189,46 +474,24 @@ export class TmuxAdapter implements MuxAdapter {
     session: string,
     layout: "tiled" | "even-horizontal" | "even-vertical",
   ): Promise<void> {
-    await this.exec(["select-layout", "-t", exactWindow(session), layout]);
+    const window = await this.managedWindowTarget(session);
+    await this.exec(["select-layout", "-t", window, layout]);
   }
 
-  async listPanes(session: string): Promise<PaneInfo[]> {
+  async listPanes(session: string, opts: ListPanesOptions = {}): Promise<PaneInfo[]> {
+    const separator = paneSeparator();
+    const window = await this.managedWindowTarget(session, opts);
     const out = await this.exec([
       "list-panes",
       "-t",
-      exactWindow(session),
+      window,
       "-F",
-      PANE_FORMAT,
+      PANE_FIELDS.join(separator),
     ]);
     const panes: PaneInfo[] = [];
     for (const line of out.split("\n")) {
       if (line.length === 0) continue;
-      // tmux vis-encodes control characters when printing command output, so
-      // the \x1f separator can come back as the literal four chars "\037".
-      const [id, index, agentId, title, command, width, height, active] =
-        line.split(/\x1f|\\037/);
-      if (
-        id === undefined ||
-        index === undefined ||
-        agentId === undefined ||
-        title === undefined ||
-        command === undefined ||
-        width === undefined ||
-        height === undefined ||
-        active === undefined
-      ) {
-        throw new Error(`tmux list-panes: malformed line ${JSON.stringify(line)}`);
-      }
-      panes.push({
-        id,
-        index: Number.parseInt(index, 10),
-        agentId: agentId.length > 0 ? agentId : null,
-        title,
-        command,
-        width: Number.parseInt(width, 10),
-        height: Number.parseInt(height, 10),
-        active: active === "1",
-      });
+      panes.push(parsePaneLine(line, separator));
     }
     return panes;
   }
@@ -256,37 +519,65 @@ export class TmuxAdapter implements MuxAdapter {
   async sendText(
     paneId: string,
     text: string,
-    opts?: { submit?: boolean; verify?: boolean },
+    opts?: SendTextOptions,
   ): Promise<SendResult> {
+    if (opts?.verify === false && opts.verification !== undefined) {
+      throw new Error("sendText cannot combine verify:false with a verification policy");
+    }
     const verify = opts?.verify !== false;
-    const fragment = verifyFragment(text);
-    let verified = false;
-    let retried = false;
-
-    // Baseline BEFORE pasting: if the fragment is already on screen (same
-    // command sent earlier, prompt echo, …), a lost paste would otherwise be
-    // reported as verified. The paste must make the count go UP.
-    const baseline = verify && fragment.length > 0 ? countOccurrences(await this.captureJoined(paneId), fragment) : 0;
-
-    await this.paste(paneId, text);
+    const policy: PasteVerification = opts?.verification ?? { mode: "literal" };
+    let probe: VerificationProbe | null = null;
     if (verify) {
-      verified = await this.verifyEcho(paneId, fragment, baseline + 1);
-      if (!verified) {
+      const fragment = verifyFragment(text);
+      const placeholder = policy.mode === "native-tui"
+        ? nativePlaceholderPatterns(policy.agentKind, text)
+        : null;
+      const partial: Omit<VerificationProbe, "baseline"> = {
+        fragment,
+        placeholderObservable: placeholder?.observable ?? null,
+        expectedPlaceholder: placeholder?.expected ?? null,
+        anyPlaceholder: placeholder?.any ?? null,
+      };
+      probe = {
+        ...partial,
+        baseline: observableCounts(await this.captureJoined(paneId), partial),
+      };
+    }
+
+    let retried = false;
+    await this.paste(paneId, text);
+
+    let observation: Observation = verify ? { state: "pending" } : {
+      state: "verified",
+      observable: "literal",
+    };
+    if (probe !== null) {
+      observation = await this.verifyObservation(paneId, probe);
+      if (observation.state === "pending") {
+        // Retry only the capture/verification window. A second paste could
+        // race a delayed first echo and leave two packets under one Enter.
         retried = true;
-        await this.paste(paneId, text);
-        verified = await this.verifyEcho(paneId, fragment, baseline + 1);
+        observation = await this.verifyObservation(paneId, probe);
       }
     }
 
-    // ok = the text demonstrably landed (or we were told not to check).
+    const verified = verify && observation.state === "verified";
     const ok = verify ? verified : true;
+    const observable = verified && observation.state === "verified"
+      ? observation.observable
+      : null;
+    const failure: SendFailure | null = !verify || verified
+      ? null
+      : observation.state === "ambiguous"
+      ? "ambiguous-observable"
+      : "verification-timeout";
 
-    // Single trailing Enter, only after the paste (+ verification) — and never
-    // into a pane where the paste demonstrably did not land.
+    // Single trailing Enter, only after the one paste is proven to have landed.
     if (ok && opts?.submit === true) {
+      await opts.beforeSubmit?.();
       await this.exec(["send-keys", "-t", paneId, "Enter"]);
     }
-    return { ok, verified, retried };
+    return { ok, verified, retried, observable, failure };
   }
 
   async focusPane(_session: string, paneId: string): Promise<void> {
@@ -320,13 +611,25 @@ export class TmuxAdapter implements MuxAdapter {
 
   /**
    * One whole-text paste through a uniquely named buffer. -p pastes with
-   * bracketed-paste codes when the pane's application requested them; -d
-   * deletes the buffer after pasting.
+   * bracketed-paste codes when the pane's application requested them; -r
+   * preserves the packet's LF bytes instead of tmux's default LF -> CR
+   * translation; -d deletes the buffer after pasting.
    */
   private async paste(paneId: string, text: string): Promise<void> {
     const buf = `bridge-${process.pid}-${Date.now()}-${bufferSeq++}`;
     await this.exec(["load-buffer", "-b", buf, "-"], text);
-    await this.exec(["paste-buffer", "-d", "-p", "-b", buf, "-t", paneId]);
+    try {
+      const loaded = await this.exec(["show-buffer", "-b", buf]);
+      if (loaded !== text) {
+        throw new Error("tmux buffer content differed from the requested paste bytes");
+      }
+      await this.exec(["paste-buffer", "-d", "-p", "-r", "-b", buf, "-t", paneId]);
+    } catch (error) {
+      // Successful paste-buffer -d already removed it; otherwise clean up the
+      // uniquely owned buffer before propagating the failure.
+      await this.run(["delete-buffer", "-b", buf]);
+      throw error;
+    }
   }
 
   /** capture-pane with -J so a paste wrapped across pane-width lines rejoins. */
@@ -334,19 +637,31 @@ export class TmuxAdapter implements MuxAdapter {
     return this.exec(["capture-pane", "-p", "-J", "-t", paneId]);
   }
 
-  /**
-   * Echo verification: poll capture-pane until the fragment appears at least
-   * `minCount` times (baseline occurrences + 1, so pre-existing text on
-   * screen can't vouch for a lost paste) or the timeout lapses. An empty
-   * fragment (nothing distinctive to look for) verifies trivially.
-   */
-  private async verifyEcho(paneId: string, fragment: string, minCount: number): Promise<boolean> {
-    if (fragment.length === 0) return true;
-    const deadline = Date.now() + VERIFY_TIMEOUT_MS;
+  /** Poll until one expected delta remains exact across a short redraw window. */
+  private async verifyObservation(
+    paneId: string,
+    probe: VerificationProbe,
+  ): Promise<Observation> {
+    const deadline = Date.now() + this.verificationTimeoutMs;
+    let exactSince: number | null = null;
     for (;;) {
-      if (countOccurrences(await this.captureJoined(paneId), fragment) >= minCount) return true;
-      if (Date.now() >= deadline) return false;
-      await Bun.sleep(VERIFY_POLL_MS);
+      const observation = inspectObservation(
+        probe,
+        await this.captureJoined(paneId),
+      );
+      const now = Date.now();
+      if (observation.state === "ambiguous") return observation;
+      if (observation.state === "verified") {
+        exactSince ??= now;
+        if (now - exactSince >= this.verificationSettleMs) return observation;
+      } else {
+        exactSince = null;
+        if (now >= deadline) return observation;
+      }
+      // Once the exact delta appears, allow its settle window to finish even
+      // if it began just before the ordinary polling deadline.
+      if (exactSince === null && now >= deadline) return { state: "pending" };
+      await Bun.sleep(this.verificationPollMs);
     }
   }
 }

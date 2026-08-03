@@ -1,4 +1,8 @@
 import { realpathSync } from "node:fs";
+import {
+  BRIDGE_AGENT_ID_HEADER,
+  BRIDGE_CONFIG_FINGERPRINT_HEADER,
+} from "../attribution.ts";
 import { configFingerprint, type BridgeConfig } from "../config.ts";
 import type { AgentId, NormalizedEvent, StatusResponse } from "../types.ts";
 import { mapNativeEvent } from "../adapters/mappers.ts";
@@ -19,8 +23,9 @@ export interface DaemonHandle {
   port: number;
   stop(): Promise<void>;
   /**
-   * Shared append/apply path: store the event, fold it into the registry,
-   * and log it. Exposed for focused integration tests and future adapters.
+   * Shared projection/append path: correlate the event, preserve its accepted
+   * or fail-closed representation in history, and log it. Exposed for focused
+   * integration tests and future adapters.
    * Never throws.
    */
   ingest(event: NormalizedEvent): void;
@@ -52,6 +57,7 @@ export function startDaemon(
   const store = openStore(opts?.dbPath ?? cfg.db);
   const registry = createRegistry(cfg);
   const startedAt = Date.now();
+  const loadedConfigFingerprint = configFingerprint(cfg);
 
   function ingest(event: NormalizedEvent): void {
     try {
@@ -59,10 +65,11 @@ export function startDaemon(
       // touched. HTTP ingress normally derives identity from config, but the
       // public handle is also used by future in-process adapter feeds.
       registry.validate(event);
-      store.append(event);
-      const status = registry.apply(event);
+      const projected = registry.apply(event, (persistedEvent) => {
+        store.append(persistedEvent);
+      });
       console.log(
-        `[event] agent=${event.agent} type=${event.type} native=${event.payload.nativeType} state=${status.state}`,
+        `[event] agent=${event.agent} type=${projected.persistedEvent.type} native=${event.payload.nativeType} state=${projected.status.state}${projected.applied ? "" : " ignored=projection"}`,
       );
     } catch (err) {
       console.error(`[event] ingest error for ${event.agent}: ${String(err)}`);
@@ -89,7 +96,20 @@ export function startDaemon(
           (configured) => configured.id === agentId && configured.enabled,
         );
         if (agent === undefined) {
-          return json({ ok: false, error: `unknown or disabled agent "${agentId}"` }, 400);
+          // Stale repo-local hook definitions must never surface an error in a
+          // native TUI after an AgentId rename or disablement.
+          return new Response(null, { status: 204 });
+        }
+        // Repo-local hook definitions are visible to unmanaged sessions in the
+        // same cwd. Only the process launched in this pane carries both marker
+        // values. Missing/stale/mismatched markers are intentionally an empty
+        // success: observation must never make a native TUI depend on us.
+        if (
+          req.headers.get(BRIDGE_AGENT_ID_HEADER) !== agent.id ||
+          req.headers.get(BRIDGE_CONFIG_FINGERPRINT_HEADER) !==
+            loadedConfigFingerprint
+        ) {
+          return new Response(null, { status: 204 });
         }
         let body: unknown = {};
         try {
@@ -136,7 +156,7 @@ export function startDaemon(
             configDir: cfg.configDir,
             sourceRoot: cfg.sourceRoot,
             sourceFingerprint: cfg.sourceFingerprint,
-            configFingerprint: configFingerprint(cfg),
+            configFingerprint: loadedConfigFingerprint,
           },
           agents: registry.snapshot(),
         };

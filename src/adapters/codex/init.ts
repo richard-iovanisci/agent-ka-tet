@@ -1,8 +1,16 @@
 import { join } from "node:path";
+import {
+  BRIDGE_AGENT_ID_ENV,
+  BRIDGE_AGENT_ID_HEADER,
+  BRIDGE_CONFIG_FINGERPRINT_ENV,
+  BRIDGE_CONFIG_FINGERPRINT_HEADER,
+} from "../../attribution.ts";
 import { agentForKind, type BridgeConfig } from "../../config.ts";
 import { writeConfigFile, type WriteResult } from "../../util/configFile.ts";
 import {
   readJsonConfig,
+  arrayConfigEntry,
+  objectConfigSection,
   quoteShellArg,
   scopedShimsDir,
   serializeJson,
@@ -16,7 +24,7 @@ import {
  * Wire Codex CLI to the daemon through project-local .codex/hooks.json
  * command shims (stdin JSON → curl). We deliberately do not claim `notify`
  * setting; the Stop lifecycle hook is the canonical completion signal.
- * Schema verified against developers.openai.com/codex/hooks July 2026.
+ * Schema verified against learn.chatgpt.com/docs/hooks July 2026.
  *
  * Trust model: Codex records approval per hook-definition hash, so the writer
  * must stay byte-identical across runs — one interactive `/hooks` approval
@@ -39,7 +47,11 @@ function hookShimScript(url: string): string {
   return `#!/usr/bin/env bash
 # agent-bridge: forward a Codex hook payload (stdin JSON) to the local daemon.
 # Must NEVER fail or block the agent: short timeout, always exit 0.
-curl -fsS -m 2 -X POST -H 'content-type: application/json' --data-binary @- "${url}" >/dev/null 2>&1 || true
+curl -fsS -m 2 -X POST \
+  -H 'content-type: application/json' \
+  -H "${BRIDGE_AGENT_ID_HEADER}: \${${BRIDGE_AGENT_ID_ENV}:-}" \
+  -H "${BRIDGE_CONFIG_FINGERPRINT_HEADER}: \${${BRIDGE_CONFIG_FINGERPRINT_ENV}:-}" \
+  --data-binary @- "${url}" >/dev/null 2>&1 || true
 exit 0
 `;
 }
@@ -78,19 +90,18 @@ export function initCodex(cfg: BridgeConfig, opts: InitOptions = {}): CodexInitR
   const codex = agentForKind(cfg, "codex");
   if (codex === undefined) throw new Error("no Codex instance is configured");
 
-  // 1. Shims (through the diff+backup engine like everything else).
+  // Resolve the owned shim path before merging, but do not write anything
+  // until the user's existing hook shape has passed preservation checks.
   const hookShim = codexHookShimPath(cfg, opts);
-  writeShim(hookShim, hookShimScript(url), opts);
 
-  // 2. Project-local hooks: avoid observing unrelated Codex sessions.
+  // Project-local hooks avoid observing unrelated Codex sessions.
   const hooksPath = join(codex.cwd ?? cfg.repo, ".codex", "hooks.json");
   const root = readJsonConfig(hooksPath);
-  const hooks =
-    typeof root.hooks === "object" && root.hooks !== null && !Array.isArray(root.hooks)
-      ? (root.hooks as Record<string, unknown>)
-      : {};
+  const hooks = objectConfigSection(root, "hooks", hooksPath);
+  for (const event of HOOK_EVENTS) arrayConfigEntry(hooks, event, hooksPath);
+  writeShim(hookShim, hookShimScript(url), opts);
   for (const event of HOOK_EVENTS) {
-    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+    const existing = arrayConfigEntry(hooks, event, hooksPath);
     const foreign = existing
       .map((group) => pruneOwnedHandlers(group, opts))
       .filter((group) => group !== null);
@@ -126,10 +137,7 @@ export function removeCodexHooks(
   if (codex === undefined) throw new Error("no Codex instance is configured");
   const hooksPath = join(codex.cwd ?? cfg.repo, ".codex", "hooks.json");
   const root = readJsonConfig(hooksPath);
-  const hooks =
-    typeof root.hooks === "object" && root.hooks !== null && !Array.isArray(root.hooks)
-      ? (root.hooks as Record<string, unknown>)
-      : {};
+  const hooks = objectConfigSection(root, "hooks", hooksPath);
   let removed = false;
   for (const event of HOOK_EVENTS) {
     if (!Array.isArray(hooks[event])) continue;

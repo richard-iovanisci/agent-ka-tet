@@ -1,9 +1,18 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import {
+  BRIDGE_AGENT_ID_ENV,
+  BRIDGE_AGENT_ID_HEADER,
+  BRIDGE_CONFIG_FINGERPRINT_ENV,
+  BRIDGE_CONFIG_FINGERPRINT_HEADER,
+  envReference,
+} from "../../attribution.ts";
 import { agentForKind, type BridgeConfig } from "../../config.ts";
 import { writeConfigFile, type WriteResult } from "../../util/configFile.ts";
 import {
   readJsonConfig,
+  arrayConfigEntry,
+  objectConfigSection,
   quoteShellArg,
   scopedShimsDir,
   serializeJson,
@@ -46,7 +55,17 @@ function httpHandler(url: string): Record<string, unknown> {
     type: "http",
     url,
     timeout: 10,
-    headers: { "X-Agent-Bridge": "1" },
+    headers: {
+      "X-Agent-Bridge": "1",
+      [BRIDGE_AGENT_ID_HEADER]: envReference(BRIDGE_AGENT_ID_ENV),
+      [BRIDGE_CONFIG_FINGERPRINT_HEADER]: envReference(
+        BRIDGE_CONFIG_FINGERPRINT_ENV,
+      ),
+    },
+    allowedEnvVars: [
+      BRIDGE_AGENT_ID_ENV,
+      BRIDGE_CONFIG_FINGERPRINT_ENV,
+    ],
   };
 }
 
@@ -60,7 +79,11 @@ export function claudeSessionStartShimPath(
 function hookShimScript(url: string): string {
   return `#!/usr/bin/env bash
 # agent-bridge: forward a Claude Code command-hook payload to the local daemon.
-curl -fsS -m 2 -X POST -H 'content-type: application/json' --data-binary @- "${url}" >/dev/null 2>&1 || true
+curl -fsS -m 2 -X POST \
+  -H 'content-type: application/json' \
+  -H "${BRIDGE_AGENT_ID_HEADER}: \${${BRIDGE_AGENT_ID_ENV}:-}" \
+  -H "${BRIDGE_CONFIG_FINGERPRINT_HEADER}: \${${BRIDGE_CONFIG_FINGERPRINT_ENV}:-}" \
+  --data-binary @- "${url}" >/dev/null 2>&1 || true
 exit 0
 `;
 }
@@ -115,13 +138,17 @@ export function initClaude(cfg: BridgeConfig, opts: InitOptions = {}): WriteResu
   const url = claudeEventsUrl(cfg);
 
   const settings = readJsonConfig(path);
-  const hooks =
-    typeof settings.hooks === "object" && settings.hooks !== null && !Array.isArray(settings.hooks)
-      ? (settings.hooks as Record<string, unknown>)
-      : {};
+  const hooks = objectConfigSection(settings, "hooks", path);
+
+  // Validate every section we may replace before writing either the shim or
+  // settings. A malformed late entry (notably SessionStart) must leave the
+  // filesystem byte-for-byte untouched.
+  for (const event of [SESSION_START, ...HOOK_EVENTS.map((entry) => entry.event)]) {
+    arrayConfigEntry(hooks, event, path);
+  }
 
   for (const { event, matcher } of HOOK_EVENTS) {
-    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+    const existing = arrayConfigEntry(hooks, event, path);
     const foreign = existing
       .map((group) => pruneOwnedHandlers(group, opts))
       .filter((group) => group !== null);
@@ -131,9 +158,7 @@ export function initClaude(cfg: BridgeConfig, opts: InitOptions = {}): WriteResu
   }
   const sessionStartShim = claudeSessionStartShimPath(cfg, opts);
   writeShim(sessionStartShim, hookShimScript(url), opts);
-  const sessionStartExisting = Array.isArray(hooks[SESSION_START])
-    ? hooks[SESSION_START]
-    : [];
+  const sessionStartExisting = arrayConfigEntry(hooks, SESSION_START, path);
   const sessionStartForeign = sessionStartExisting
     .map((group) => pruneOwnedHandlers(group, opts))
     .filter((group) => group !== null);
@@ -168,10 +193,7 @@ export function removeClaudeHooks(
   }
 
   const settings = readJsonConfig(path);
-  const hooks =
-    typeof settings.hooks === "object" && settings.hooks !== null && !Array.isArray(settings.hooks)
-      ? (settings.hooks as Record<string, unknown>)
-      : {};
+  const hooks = objectConfigSection(settings, "hooks", path);
   let removed = false;
   for (const event of [SESSION_START, ...HOOK_EVENTS.map((entry) => entry.event)]) {
     if (!Array.isArray(hooks[event])) continue;

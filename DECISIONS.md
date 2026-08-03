@@ -113,3 +113,186 @@ Deviations from DESIGN.md are logged here **before** implementation. Format: dat
 **Why:** Authenticated session evidence records `toolDenialKind: "user-rejected"` in Claude's transcript for each Escape but shows no corresponding hook event. Claude's current hook reference explicitly says `PermissionDenied` does not run for manual denial, while tool-result hooks cannot run for a tool that never executed. Declaring idle without an observable resolution could violate the idle-only injection safety invariant.
 
 **Impact:** After Escape, `needs_you` may remain visible until the next `UserPromptSubmit`, `Stop`, tool-result, failure, session-end, or other clearing event. Re-subscribing to `Notification:idle_prompt` as a delayed idle observation remains a possible hook-only improvement, but it requires an authenticated proof that the notification fires after dismissal and never while an approval dialog remains open before it can become trusted lifecycle state.
+
+## 2026-07-31 — Attribute events to bridge-launched native processes
+
+**What:** `bridge up` launches each native TUI with process-scoped
+`AGENT_BRIDGE_AGENT_ID=<AgentId>` and
+`AGENT_BRIDGE_CONFIG_FINGERPRINT=<loaded config fingerprint>`. Claude HTTP hook
+headers expand these allowlisted process environment values, and the
+Claude/Codex command shims forward them as
+`X-Agent-Bridge-Agent-Id` and `X-Agent-Bridge-Config-Fingerprint`. The daemon
+accepts an event only when route AgentId, marker AgentId, and its loaded config
+fingerprint agree. Missing, stale, or mismatched markers receive an empty 204
+and do not mutate event history, native-session binding, or live state.
+
+**Why:** Project-local hooks and cwd validation exclude other repositories but
+cannot distinguish an independently launched TUI of the same kind in the same
+working directory. Phase 1 handoffs need the source transcript and target idle
+state to belong to the actual panes Agent Bridge manages. Process inheritance
+provides that provenance while leaving both native TUIs unmodified.
+
+**Impact:** Unmanaged same-project sessions remain fully usable and their hook
+failures or rejections remain invisible to the native tool, but they cannot be
+mistaken for a managed source or target. The markers are local attribution,
+not authentication against an adversarial local process. Config writers must
+preserve their existing diff, backup, foreign-setting, and idempotency rules.
+
+The managed launch also owns a tmux pane option containing its AgentId, config
+fingerprint, random run token, and foreground wrapper PID. The option is cleared
+on normal wrapper exit. Immediately before injection, the bridge requires the
+marker PID to be live and still be a child of that pane's long-lived login
+shell. This is a terminal-target liveness/ownership check only: semantic
+`working`, `idle`, and attention state still come exclusively from native
+hooks. Its purpose is to fail closed when a stale `idle` projection outlives a
+TUI that has returned to the fallback shell.
+
+## 2026-07-31 — Freeze approve-mode handoffs at the latest accepted Stop
+
+**What:** The first Phase 1 delivery path creates an immutable packet from the
+source agent's latest accepted semantic `Stop`. It records packet id, source and
+target AgentIds, source native-session id, source event id/sequence/timestamp,
+the exact `last_assistant_message`, and creation time. Transcript enrichment
+must be tied to that same completed turn; Git status, changed paths, and diff
+statistics are explicitly a creation-time repository snapshot and are labeled
+as such rather than represented as source-turn provenance. Preview,
+approval, and injection resolve the packet id and never fetch “latest” again.
+Approval revalidates target ownership and semantic idle immediately before the
+bracketed paste and again after its observable is proven, immediately before
+the single Enter. The verifier may open one additional observation window, but it never
+pastes the bytes a second time; otherwise delivery fails closed after the first
+paste.
+The packet ends with a unique id marker and its receipt binds the approved bytes
+by SHA-256; delivery re-reads and verifies that identity before touching tmux.
+
+Successful or failed delivery writes separate durable delivery state/receipt
+with packet id, target native session, attempt/outcome, and timestamps. The
+receipt attests only to what the terminal boundary proved; packet immutability
+does not require delivery state itself to be immutable. Failed, denied, stale, or
+crash-ambiguous delivery does not rewrite the packet and is not automatically
+replayed; retry or replacement is explicit.
+
+Approved deliveries also take a create-only reservation scoped to the target
+AgentId. A concurrent contender fails immediately rather than queues. The
+reservation is released only after a later target `turn.start` in the same
+native session contains the packet's unique footer in its submitted prompt,
+and its provider turn token is stored durably in the receipt before release,
+proving that this exact input entered native processing. A crash, missing
+correlation, or any existing reservation leaves it in place for explicit
+reconciliation; approve mode never performs implicit stale takeover. This is an
+input-serialization guard, not a claim that the target understood the handoff
+and not a synthetic lifecycle transition.
+
+**Why:** A source can continue working while a human reviews a handoff. Rebuilding
+at approval time would silently change what was approved, while mutating the
+packet with delivery state would destroy the approved snapshot. Explicit receipts
+also prevent echo verification from being overstated as agent comprehension
+and make ambiguous restart recovery fail safely instead of duplicating input.
+
+**Impact:** Approve mode is the current/default implementation slice. If its
+snapshot is stale, the operator creates a new packet. Idle-gated auto mode,
+shared tasks, and semantic acknowledgement remain separate follow-on work and
+cannot weaken the immutable-packet or separate-receipt boundary.
+
+## 2026-07-31 — Correlate lifecycle state before authorizing injection
+
+**What:** Only genuine native-session starts may produce normalized
+`session.start`: Claude `startup`, `resume`, `clear`, and `fork`, and Codex
+`startup`, `resume`, and `clear`. Compaction, missing, and unknown sources are
+stored as `raw` and cannot change state, attention, or session binding. The
+registry rejects every session start while the managed projection is already
+`working` or `needs_you`, including a different-session start from nested
+provider work; it cannot rebind and expose a false idle gate. The
+registry tracks the provider turn token (`prompt_id` for Claude, `turn_id` for
+Codex); a completion or error may close only the currently active matching
+turn, and a previously seen start token cannot later roll correlation backward.
+`raw` and terminal events cannot rebind a live session. A
+provenance-validated `turn.start` may establish a missing binding so Codex
+remains honestly `launching` until its first observed semantic turn and either
+managed TUI can recover after a daemon-only restart without restarting its
+native session.
+
+**Why:** Both providers can emit compaction-related SessionStart events while a
+turn is still active, and hook delivery may be concurrent or out of order.
+Mapping every SessionStart to idle or accepting a delayed older Stop can expose
+a busy native TUI as idle to the delivery gate.
+
+**Impact:** Lifecycle ambiguity now fails closed instead of authorizing
+terminal input. Compaction remains visible in retained history without
+pretending that the agent is idle, and normal first-turn Codex binding remains
+supported without pane scraping or synthetic prompts.
+
+Projection commits only after the exact accepted or demoted event has been
+appended durably; an append failure cannot advance `/status` without matching
+history. Stale, renamed, or disabled hook routes return the same empty 204 as
+other ignored hook input so observation never becomes a native-TUI dependency.
+
+## 2026-07-31 — Keep approve mode outside the managed tmux session
+
+**What:** The first Phase 1 `bridge handoff` command is a third-terminal
+operation. It refuses before focusing a managed pane when conventional
+`TMUX`/`TMUX_PANE` markers identify a tmux client; deliberately stripping those
+markers is unsupported rather than treated as a security boundary. Packet
+creation additionally requires the source to be currently
+idle, even though its immutable content comes from the latest accepted Stop.
+The managed tmux window is pinned by identity rather than inferred from the
+session's current window. Missing or inconsistent reciprocal session/window
+markers fail closed; current-window fallback exists only inside explicitly
+verified legacy teardown.
+
+**Why:** Focusing the target before reading approval can redirect the
+operator's `DELIVER <id>` keystrokes when the CLI itself runs inside tmux.
+Requiring current source idle keeps this first approve-mode slice simple while
+still allowing the source to continue after the packet is frozen. Pinning the
+window lets scratch windows coexist without changing which panes are eligible
+for delivery.
+
+**Impact:** Run `bridge handoff` beside `bridge top` and `bridge attach` in a
+separate terminal. In-session orchestration and source-working packet creation
+remain possible later UX extensions, not implicit behavior in this safety
+slice.
+
+## 2026-07-31 — Grow an operator console over isolated project runtimes
+
+**What:** The north-star terminal UI is a control-plane projection organized as
+`project → task/work item → group run → agent run → native session`. It may
+surface a cross-cutting Needs-you queue, but agent lifecycle, task lifecycle,
+and handoff lifecycle remain distinct. Entering a live agent focuses and
+attaches its real tmux pane. Re-entering a stopped conversation, when added,
+uses the adapter's native resume/continue command and exact recorded session
+reference; the bridge does not replay conversation text.
+
+Each project keeps its own daemon, config identity, event database, and tmux
+ownership. A later multi-project console aggregates a registry of those
+isolated runtime cells instead of replacing them with one machine-wide daemon.
+
+**Why:** This yields the useful Claude-agents-view ergonomics without building
+a unified chat client or making one project's runtime/failure authoritative for
+another. Separating task from prompt and task completion from native `Stop`
+also prevents the board from presenting an idle turn as completed work.
+
+**Impact:** Phase 1 adds only the local handoff records and visibility required
+for its exit test. The shared task plane, group/worktree launcher, native resume
+actions, trustworthy observed model/effort telemetry, and global multi-project
+navigation remain in their later phases. Active adapter kinds remain Claude
+Code and Codex exclusively.
+
+## 2026-08-03 — Explain unobserved recovery state for either adapter
+
+**What:** When the current daemon has no accepted semantic event for a managed
+agent, `bridge top` keeps the normalized state `launching` and explains it as
+`awaiting first observed turn` for either Claude Code or Codex. It does not
+reconstruct an idle state from the pane, transcript, or a previous daemon.
+
+**Why:** Authenticated Phase 1 recovery testing on macOS showed that both native
+TUIs remain usable after a daemon-only restart, but the new in-memory registry
+cannot know what happened while it was offline and neither already-running TUI
+must immediately emit another `SessionStart`. Calling either agent idle before
+a fresh trusted lifecycle event would weaken the idle-only injection gate.
+
+**Impact:** A fresh untouched Codex TUI retains its existing first-turn behavior.
+After daemon-only recovery, either agent may temporarily read
+`launching  awaiting first observed turn`; its next real semantic turn safely
+re-establishes the native-session binding and normal state transitions. Here,
+`launching` describes the daemon's unobserved lifecycle projection, not whether
+the native process is running or usable.

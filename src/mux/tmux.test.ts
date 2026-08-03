@@ -1,5 +1,19 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { TmuxAdapter, countOccurrences, verifyFragment } from "./tmux.ts";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  TmuxAdapter,
+  countOccurrences,
+  parsePaneLine,
+  verifyFragment,
+} from "./tmux.ts";
 
 /**
  * Runs against a REAL tmux server (CLAUDE.md: no mocks) on a throwaway
@@ -10,11 +24,15 @@ import { TmuxAdapter, countOccurrences, verifyFragment } from "./tmux.ts";
 const SOCKET = `bridge-test-${process.pid}`;
 const SESSION = "mux-adapter-test";
 const CWD = process.cwd();
+const COLLAPSED_RECEIVER = fileURLToPath(
+  new URL("./fixtures/collapsedPasteReceiver.ts", import.meta.url),
+);
 
 const tmux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
 
 let firstPane = "";
 const splitPanes: string[] = [];
+let receiverSeq = 0;
 
 afterAll(async () => {
   // Tear the whole throwaway server down; ignore failure (already gone).
@@ -39,6 +57,23 @@ async function pollFor(
   }
 }
 
+async function rawTmux(args: string[]): Promise<string> {
+  const proc = Bun.spawn({
+    cmd: ["tmux", "-L", SOCKET, "-f", "/dev/null", ...args],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`tmux ${args[0] ?? ""} exited ${exitCode}: ${stderr.trim()}`);
+  }
+  return stdout;
+}
+
 function waitForOutput(paneId: string, needle: string): Promise<boolean> {
   return pollFor(async () => (await tmux.capturePane(paneId)).includes(needle));
 }
@@ -48,12 +83,137 @@ function waitForPrompt(paneId: string): Promise<boolean> {
   return pollFor(async () => /\S/.test(await tmux.capturePane(paneId)));
 }
 
+function shellWord(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+interface ReceiverAudit {
+  payloads: string[];
+  submitted: number;
+}
+
+interface ReceiverHarness {
+  mux: TmuxAdapter;
+  session: string;
+  pane: string;
+  outputPath: string;
+  auditPath: string;
+  directory: string;
+}
+
+async function startCollapsedReceiver(
+  kind: "claude" | "codex",
+  behavior:
+    | "normal"
+    | "literal"
+    | "both"
+    | "silent"
+    | "duplicate"
+    | "replace-duplicate"
+    | "delayed",
+): Promise<ReceiverHarness> {
+  const session = `mux-receiver-${process.pid}-${receiverSeq++}`;
+  const directory = mkdtempSync(join(tmpdir(), "bridge-mux-receiver-"));
+  const outputPath = join(directory, "submitted.txt");
+  const auditPath = join(directory, "audit.json");
+  const receiverMux = new TmuxAdapter({
+    socketName: SOCKET,
+    configFile: "/dev/null",
+    verificationTimeoutMs: 100,
+    verificationPollMs: 10,
+    verificationSettleMs: 20,
+  });
+  const pane = await receiverMux.createSession(session, {
+    cwd: CWD,
+    width: 180,
+    height: 40,
+  });
+  expect(await receiverMux.waitForShellReady(pane)).toBe(true);
+  const command = [
+    "bun",
+    shellWord(COLLAPSED_RECEIVER),
+    kind,
+    behavior,
+    shellWord(outputPath),
+    shellWord(auditPath),
+  ].join(" ");
+  const launched = await receiverMux.sendText(pane, command, { submit: true });
+  expect(launched.ok).toBe(true);
+  expect(
+    await pollFor(async () =>
+      (await receiverMux.capturePane(pane)).includes(
+        `COLLAPSED_RECEIVER_READY ${kind} ${behavior}`,
+      )
+    ),
+  ).toBe(true);
+  return {
+    mux: receiverMux,
+    session,
+    pane,
+    outputPath,
+    auditPath,
+    directory,
+  };
+}
+
+function receiverAudit(harness: ReceiverHarness): ReceiverAudit {
+  return JSON.parse(readFileSync(harness.auditPath, "utf8")) as ReceiverAudit;
+}
+
+async function disposeReceiver(harness: ReceiverHarness): Promise<void> {
+  if (await harness.mux.hasSession(harness.session)) {
+    await harness.mux.killSession(harness.session);
+  }
+  rmSync(harness.directory, { recursive: true, force: true });
+}
+
 describe("countOccurrences", () => {
   test("non-overlapping counting", () => {
     expect(countOccurrences("abcabcabc", "abc")).toBe(3);
     expect(countOccurrences("aaaa", "aa")).toBe(2);
     expect(countOccurrences("xyz", "q")).toBe(0);
     expect(countOccurrences("xyz", "")).toBe(0);
+  });
+});
+
+describe("parsePaneLine", () => {
+  const separator = "__pane_separator__";
+  const fields = [
+    "%7",
+    "1234",
+    "0",
+    "claude_worker_1",
+    "pid:1234",
+    "title_with_under_scores",
+    "zsh",
+    "120",
+    "40",
+    "1",
+  ];
+
+  test("requires exactly ten fields and strict numeric values", () => {
+    expect(parsePaneLine(fields.join(separator), separator)).toMatchObject({
+      id: "%7",
+      pid: 1234,
+      index: 0,
+      width: 120,
+      height: 40,
+      active: true,
+    });
+    expect(() => parsePaneLine([...fields, "extra"].join(separator), separator))
+      .toThrow(/malformed line/);
+    for (const [index, bad] of [[1, "12x"], [2, "NaN"], [7, "0"], [8, "-1"]] as const) {
+      const malformed = [...fields];
+      malformed[index] = bad;
+      expect(() => parsePaneLine(malformed.join(separator), separator)).toThrow(
+        /invalid|malformed/,
+      );
+    }
+    const invalidActive = [...fields];
+    invalidActive[9] = "2";
+    expect(() => parsePaneLine(invalidActive.join(separator), separator)).toThrow(
+      /malformed/,
+    );
   });
 });
 
@@ -100,14 +260,125 @@ describe("TmuxAdapter", () => {
 
     for (const p of panes) {
       expect(p.id).toMatch(/^%\d+$/);
+      expect(p.pid).toBeGreaterThan(0);
       expect(Number.isInteger(p.index)).toBe(true);
       expect(p.width).toBeGreaterThan(0);
       expect(p.height).toBeGreaterThan(0);
       expect(p.agentId).toBeNull();
+      expect(p.managedProcess).toBeNull();
       expect(typeof p.title).toBe("string");
       expect(p.command.length).toBeGreaterThan(0); // the user's shell
     }
     expect(panes.filter((p) => p.active).length).toBe(1);
+  });
+
+  test("managed pane operations ignore a different current scratch window", async () => {
+    const before = await tmux.listPanes(SESSION);
+    const managedIds = before.map((pane) => pane.id);
+    const scratchWindow = (
+      await rawTmux([
+        "new-window",
+        "-t",
+        `=${SESSION}:`,
+        "-n",
+        "scratch",
+        "-P",
+        "-F",
+        "#{window_id}",
+      ])
+    ).trim();
+    expect(scratchWindow).toMatch(/^@\d+$/);
+    expect(
+      (await rawTmux([
+        "display-message",
+        "-p",
+        "-t",
+        `=${SESSION}:`,
+        "#{window_id}",
+      ])).trim(),
+    ).toBe(scratchWindow);
+
+    expect((await tmux.listPanes(SESSION)).map((pane) => pane.id)).toEqual(
+      managedIds,
+    );
+    const added = await tmux.splitPane(SESSION, { cwd: CWD });
+    await tmux.selectLayout(SESSION, "tiled");
+    const after = await tmux.listPanes(SESSION);
+    expect(after.map((pane) => pane.id)).toEqual([...managedIds, added]);
+    expect(
+      (await rawTmux([
+        "list-panes",
+        "-t",
+        scratchWindow,
+        "-F",
+        "#{pane_id}",
+      ])).trim().split("\n"),
+    ).toHaveLength(1);
+
+    const managedWindow = (
+      await rawTmux([
+        "display-message",
+        "-p",
+        "-t",
+        firstPane,
+        "#{window_id}",
+      ])
+    ).trim();
+    const sessionId = (
+      await rawTmux([
+        "display-message",
+        "-p",
+        "-t",
+        firstPane,
+        "#{session_id}",
+      ])
+    ).trim();
+
+    await rawTmux([
+      "set-option",
+      "-u",
+      "-t",
+      sessionId,
+      "@agent-bridge-window-id",
+    ]);
+    await expect(tmux.listPanes(SESSION)).rejects.toThrow(/no managed window identity/);
+
+    await rawTmux([
+      "set-option",
+      "-t",
+      sessionId,
+      "@agent-bridge-window-id",
+      scratchWindow,
+    ]);
+    await expect(tmux.listPanes(SESSION)).rejects.toThrow(/not reciprocally marked/);
+
+    await rawTmux([
+      "set-option",
+      "-t",
+      sessionId,
+      "@agent-bridge-window-id",
+      managedWindow,
+    ]);
+    await rawTmux([
+      "set-option",
+      "-w",
+      "-u",
+      "-t",
+      managedWindow,
+      "@agent-bridge-managed-window",
+    ]);
+    await expect(tmux.listPanes(SESSION)).rejects.toThrow(/not reciprocally marked/);
+    await rawTmux([
+      "set-option",
+      "-w",
+      "-t",
+      managedWindow,
+      "@agent-bridge-managed-window",
+      sessionId,
+    ]);
+    expect((await tmux.listPanes(SESSION)).map((pane) => pane.id)).toEqual(
+      [...managedIds, added],
+    );
   });
 
   test("sendText + submit: paste, verify, Enter, output lands", async () => {
@@ -148,7 +419,13 @@ describe("TmuxAdapter", () => {
     const result = await tmux.sendText(spare, ": unverified-paste", {
       verify: false,
     });
-    expect(result).toEqual({ ok: true, verified: false, retried: false });
+    expect(result).toEqual({
+      ok: true,
+      verified: false,
+      retried: false,
+      observable: null,
+      failure: null,
+    });
   });
 
   test("verifyFragment picks the tail of the last non-empty line", () => {
@@ -162,8 +439,211 @@ describe("TmuxAdapter", () => {
     await tmux.setPaneTitle(firstPane, "claude");
     await tmux.setPaneTitle(firstPane, "✳ Claude Code");
     const pane = (await tmux.listPanes(SESSION)).find((p) => p.id === firstPane);
-    expect(pane?.title).toBe("✳ Claude Code");
+    // C-locale tmux replaces the unrepresentable glyph with an underscore;
+    // the durable ASCII identity marker remains exact in either locale.
+    expect(pane).toBeDefined();
+    expect(["✳ Claude Code", "_ Claude Code"]).toContain(pane?.title ?? "");
     expect(pane?.agentId).toBe("claude");
+  });
+
+  test("listPanes is C-locale safe and preserves underscores", async () => {
+    await tmux.setPaneAgentId(firstPane, "claude_worker_1");
+    await tmux.setPaneTitle(firstPane, "title_with_under_scores");
+    const cLocaleMux = new TmuxAdapter({
+      socketName: SOCKET,
+      configFile: "/dev/null",
+      environment: { LC_ALL: "C", LANG: "C" },
+    });
+    const pane = (await cLocaleMux.listPanes(SESSION)).find(
+      (candidate) => candidate.id === firstPane,
+    );
+    expect(pane?.agentId).toBe("claude_worker_1");
+    expect(pane?.title).toBe("title_with_under_scores");
+    expect(pane?.pid).toBeGreaterThan(0);
+  });
+
+  test("native-TUI policy verifies Claude and Codex collapsed pastes exactly once", async () => {
+    const packet = [
+      "---",
+      "id: handoff-collapse-test",
+      "---",
+      "# Handoff",
+      "x".repeat(1_100),
+      "Agent Bridge packet handoff-collapse-test",
+    ].join("\n");
+
+    for (const kind of ["claude", "codex"] as const) {
+      const harness = await startCollapsedReceiver(kind, "normal");
+      try {
+        const result = await harness.mux.sendText(harness.pane, packet, {
+          submit: true,
+          verification: { mode: "native-tui", agentKind: kind },
+        });
+        expect(result).toEqual({
+          ok: true,
+          verified: true,
+          retried: false,
+          observable: `${kind}-placeholder`,
+          failure: null,
+        });
+        expect(
+          await pollFor(async () => existsSync(harness.outputPath)),
+        ).toBe(true);
+        expect(readFileSync(harness.outputPath, "utf8")).toBe(packet);
+        expect(receiverAudit(harness)).toEqual({
+          payloads: [packet],
+          submitted: 1,
+        });
+      } finally {
+        await disposeReceiver(harness);
+      }
+    }
+  }, 15_000);
+
+  test("native-TUI policy accepts one literal receipt for either provider", async () => {
+    for (const kind of ["claude", "codex"] as const) {
+      const harness = await startCollapsedReceiver(kind, "literal");
+      const packet = `small packet for ${kind}\nAgent Bridge packet literal-${kind}`;
+      try {
+        const result = await harness.mux.sendText(harness.pane, packet, {
+          submit: true,
+          verification: { mode: "native-tui", agentKind: kind },
+        });
+        expect(result).toEqual({
+          ok: true,
+          verified: true,
+          retried: false,
+          observable: "literal",
+          failure: null,
+        });
+        expect(await pollFor(async () => existsSync(harness.outputPath))).toBe(true);
+        expect(receiverAudit(harness)).toEqual({
+          payloads: [packet],
+          submitted: 1,
+        });
+      } finally {
+        await disposeReceiver(harness);
+      }
+    }
+  }, 15_000);
+
+  test("a delayed native observable retries capture without re-pasting", async () => {
+    const harness = await startCollapsedReceiver("codex", "delayed");
+    const packet = `${"d".repeat(1_050)}\nAgent Bridge packet delayed`;
+    try {
+      const result = await harness.mux.sendText(harness.pane, packet, {
+        submit: true,
+        verification: { mode: "native-tui", agentKind: "codex" },
+      });
+      expect(result).toEqual({
+        ok: true,
+        verified: true,
+        retried: true,
+        observable: "codex-placeholder",
+        failure: null,
+      });
+      expect(await pollFor(async () => existsSync(harness.outputPath))).toBe(true);
+      expect(receiverAudit(harness).payloads).toEqual([packet]);
+    } finally {
+      await disposeReceiver(harness);
+    }
+  });
+
+  test("missing native observable fails after one paste and sends no Enter", async () => {
+    const harness = await startCollapsedReceiver("claude", "silent");
+    const packet = ["one", "two", "three", "Agent Bridge packet silent"].join("\n");
+    try {
+      const result = await harness.mux.sendText(harness.pane, packet, {
+        submit: true,
+        verification: { mode: "native-tui", agentKind: "claude" },
+      });
+      expect(result).toEqual({
+        ok: false,
+        verified: false,
+        retried: true,
+        observable: null,
+        failure: "verification-timeout",
+      });
+      expect(receiverAudit(harness)).toEqual({
+        payloads: [packet],
+        submitted: 0,
+      });
+      expect(existsSync(harness.outputPath)).toBe(false);
+    } finally {
+      await disposeReceiver(harness);
+    }
+  });
+
+  test("multiple or conflicting native observables are ambiguous", async () => {
+    for (const behavior of ["duplicate", "both"] as const) {
+      const harness = await startCollapsedReceiver("codex", behavior);
+      const packet = `${"a".repeat(1_050)}\nAgent Bridge packet ${behavior}`;
+      try {
+        const result = await harness.mux.sendText(harness.pane, packet, {
+          submit: true,
+          verification: { mode: "native-tui", agentKind: "codex" },
+        });
+        expect(result).toEqual({
+          ok: false,
+          verified: false,
+          retried: false,
+          observable: null,
+          failure: "ambiguous-observable",
+        });
+        expect(receiverAudit(harness)).toEqual({
+          payloads: [packet],
+          submitted: 0,
+        });
+        expect(existsSync(harness.outputPath)).toBe(false);
+      } finally {
+        await disposeReceiver(harness);
+      }
+    }
+  }, 15_000);
+
+  test("redraw cannot hide two new placeholders behind one disappearing old one", async () => {
+    const harness = await startCollapsedReceiver("claude", "replace-duplicate");
+    const packet = `${"r".repeat(1_050)}\nAgent Bridge packet redraw-duplicate`;
+    try {
+      const result = await harness.mux.sendText(harness.pane, packet, {
+        submit: true,
+        verification: { mode: "native-tui", agentKind: "claude" },
+      });
+      expect(result).toEqual({
+        ok: false,
+        verified: false,
+        retried: false,
+        observable: null,
+        failure: "ambiguous-observable",
+      });
+      expect(receiverAudit(harness)).toEqual({
+        payloads: [packet],
+        submitted: 0,
+      });
+    } finally {
+      await disposeReceiver(harness);
+    }
+  });
+
+  test("beforeSubmit failure leaves the proven paste unsubmitted", async () => {
+    const harness = await startCollapsedReceiver("codex", "literal");
+    const packet = "pre-submit check\nAgent Bridge packet pre-submit";
+    try {
+      await expect(harness.mux.sendText(harness.pane, packet, {
+        submit: true,
+        verification: { mode: "native-tui", agentKind: "codex" },
+        beforeSubmit: () => {
+          throw new Error("managed process exited");
+        },
+      })).rejects.toThrow("managed process exited");
+      expect(receiverAudit(harness)).toEqual({
+        payloads: [packet],
+        submitted: 0,
+      });
+      expect(existsSync(harness.outputPath)).toBe(false);
+    } finally {
+      await disposeReceiver(harness);
+    }
   });
 
   test("focusPane moves the active flag", async () => {

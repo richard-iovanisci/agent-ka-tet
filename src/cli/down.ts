@@ -108,7 +108,8 @@ export async function down(cfg: BridgeConfig, opts: DownOptions): Promise<number
       rawMarker === null &&
       legacyOwned &&
       legacyPaneTitlesMatch(
-        (await opts.mux.listPanes(cfg.session)).map((pane) => pane.title),
+        (await opts.mux.listPanes(cfg.session, { legacyCurrentWindow: true }))
+          .map((pane) => pane.title),
         status,
       );
     if (marker?.configDir !== cfg.configDir && !legacySessionOwned) {

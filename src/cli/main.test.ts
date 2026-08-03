@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseHandoffArgs } from "./main.ts";
 
 const BRIDGE_BIN = fileURLToPath(new URL("../../bin/bridge", import.meta.url));
 const fixtures: string[] = [];
@@ -59,6 +60,30 @@ function runBridge(
 }
 
 describe("bridge argument validation", () => {
+  test("handoff requires two agent ids and one bounded task", () => {
+    expect(
+      parseHandoffArgs([
+        "claude",
+        "codex",
+        "--task",
+        "Review the current implementation",
+      ]),
+    ).toEqual({
+      from: "claude",
+      to: "codex",
+      task: "Review the current implementation",
+    });
+    expect(() => parseHandoffArgs(["claude", "codex"])).toThrow(
+      /missing required option/,
+    );
+    expect(() =>
+      parseHandoffArgs(["claude", "codex", "--task", " "]),
+    ).toThrow(/non-empty/);
+    expect(() =>
+      parseHandoffArgs(["claude", "codex", "--auto", "--task", "x"]),
+    ).toThrow(/unknown option/);
+  });
+
   test("down --help prints help without dispatching teardown", () => {
     const { repo, home } = fixture();
     const result = runBridge(repo, home, ["down", "--help"]);

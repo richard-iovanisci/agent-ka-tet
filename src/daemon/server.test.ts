@@ -2,6 +2,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  BRIDGE_AGENT_ID_HEADER,
+  BRIDGE_CONFIG_FINGERPRINT_HEADER,
+} from "../attribution.ts";
 import { configFingerprint, defaultConfig } from "../config.ts";
 import type { AgentStatus, StatusResponse } from "../types.ts";
 import type { StoredEvent } from "./store.ts";
@@ -21,10 +25,29 @@ afterAll(async () => {
   await daemon.stop();
 });
 
-async function post(path: string, body: string): Promise<Response> {
+interface PostOptions {
+  attributed?: boolean;
+  agentId?: string;
+  fingerprint?: string;
+}
+
+async function post(
+  path: string,
+  body: string,
+  opts: PostOptions = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (opts.attributed !== false) {
+    headers[BRIDGE_AGENT_ID_HEADER] =
+      opts.agentId ?? path.slice("/events/".length);
+    headers[BRIDGE_CONFIG_FINGERPRINT_HEADER] =
+      opts.fingerprint ?? configFingerprint(cfg);
+  }
   return fetch(`${base}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body,
   });
 }
@@ -72,20 +95,54 @@ describe("daemon HTTP API", () => {
     }
   });
 
+  test("unmanaged or stale hook processes are silently ignored", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    const body = hookBody({
+      hook_event_name: "SessionStart",
+      session_id: "unmanaged-session",
+    });
+    for (const opts of [
+      { attributed: false },
+      { agentId: "codex" },
+      { fingerprint: "stale-config-fingerprint" },
+    ] satisfies PostOptions[]) {
+      const response = await post("/events/claude", body, opts);
+      expect(response.status).toBe(204);
+      expect(await response.text()).toBe("");
+    }
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
+    const claude = agent(await getStatus(), "claude");
+    expect(claude.state).toBe("launching");
+    expect(claude.sessionId).toBeNull();
+  });
+
   test("claude lifecycle: SessionStart -> idle, UserPromptSubmit -> working, Stop -> idle", async () => {
-    let res = await post("/events/claude", hookBody({ hook_event_name: "SessionStart", session_id: "s1" }));
+    let res = await post("/events/claude", hookBody({
+      hook_event_name: "SessionStart",
+      session_id: "s1",
+      source: "startup",
+    }));
     expect(res.status).toBe(204);
     expect(await res.text()).toBe("");
     let status = await getStatus();
     expect(agent(status, "claude").state).toBe("idle");
     expect(agent(status, "claude").sessionId).toBe("s1");
 
-    res = await post("/events/claude", hookBody({ hook_event_name: "UserPromptSubmit", session_id: "s1" }));
+    res = await post("/events/claude", hookBody({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "s1",
+      prompt_id: "claude-turn-1",
+    }));
     expect(res.status).toBe(204);
     status = await getStatus();
     expect(agent(status, "claude").state).toBe("working");
 
-    res = await post("/events/claude", hookBody({ hook_event_name: "Stop", session_id: "s1" }));
+    res = await post("/events/claude", hookBody({
+      hook_event_name: "Stop",
+      session_id: "s1",
+      prompt_id: "claude-turn-1",
+    }));
     expect(res.status).toBe(204);
     status = await getStatus();
     expect(agent(status, "claude").state).toBe("idle");
@@ -219,9 +276,21 @@ describe("daemon HTTP API", () => {
   });
 
   test("codex lifecycle is normalized through its own adapter kind", async () => {
-    await post("/events/codex", hookBody({ hook_event_name: "SessionStart", session_id: "c1" }));
-    await post("/events/codex", hookBody({ hook_event_name: "UserPromptSubmit", session_id: "c1" }));
-    const res = await post("/events/codex", hookBody({ hook_event_name: "Stop", session_id: "c1" }));
+    await post("/events/codex", hookBody({
+      hook_event_name: "SessionStart",
+      session_id: "c1",
+      source: "startup",
+    }));
+    await post("/events/codex", hookBody({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "c1",
+      turn_id: "codex-turn-1",
+    }));
+    const res = await post("/events/codex", hookBody({
+      hook_event_name: "Stop",
+      session_id: "c1",
+      turn_id: "codex-turn-1",
+    }));
     expect(res.status).toBe(204);
 
     const status = await getStatus();
@@ -235,9 +304,13 @@ describe("daemon HTTP API", () => {
     expect(rows[0]?.session_id).toBe("c1");
   });
 
-  test("unknown agent is rejected", async () => {
+  test("unknown or stale hook agent is ignored with empty success", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
     const res = await post("/events/gemini", hookBody({ hook_event_name: "Stop" }));
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
   });
 
   test("missing, malformed, or invalid-JSON cwd fails closed with empty success", async () => {
@@ -307,6 +380,23 @@ describe("daemon HTTP API", () => {
     expect(after.some((row) => row.native_type === "mismatch")).toBe(false);
   });
 
+  test("a failed history append cannot advance live status", async () => {
+    const before = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    const body: Record<string, unknown> = { turn_id: "cyclic-turn" };
+    body.self = body;
+    daemon.ingest({
+      agent: "codex",
+      kind: "codex",
+      type: "turn.start",
+      sessionId: "c1",
+      ts: Date.now(),
+      payload: { nativeType: "UserPromptSubmit", body },
+    });
+    const after = (await (await fetch(`${base}/events`)).json()) as StoredEvent[];
+    expect(after).toHaveLength(before.length);
+    expect(agent(await getStatus(), "codex").state).toBe("idle");
+  });
+
   test("custom id works and realpath accepts an equivalent symlinked cwd", async () => {
     const realRepo = mkdtempSync(join(tmpdir(), "bridge-real-cwd-"));
     const linkedRepo = `${realRepo}-link`;
@@ -318,10 +408,15 @@ describe("daemon HTTP API", () => {
       const customBase = `http://127.0.0.1:${custom.port}`;
       const response = await fetch(`${customBase}/events/claude-primary`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          [BRIDGE_AGENT_ID_HEADER]: "claude-primary",
+          [BRIDGE_CONFIG_FINGERPRINT_HEADER]: configFingerprint(customCfg),
+        },
         body: JSON.stringify({
           hook_event_name: "SessionStart",
           session_id: "custom-session",
+          source: "startup",
           cwd: realRepo,
         }),
       });
@@ -334,6 +429,84 @@ describe("daemon HTTP API", () => {
       expect(rows[0]?.agent).toBe("claude-primary");
     } finally {
       await custom.stop();
+    }
+  });
+
+  test("stale and uncorrelated completions are stored as raw without idling the active turn", async () => {
+    const isolatedCfg = defaultConfig(process.cwd());
+    const isolated = startDaemon(isolatedCfg, { port: 0, dbPath: ":memory:" });
+    const isolatedBase = `http://127.0.0.1:${isolated.port}`;
+    const headers = {
+      "content-type": "application/json",
+      [BRIDGE_AGENT_ID_HEADER]: "claude",
+      [BRIDGE_CONFIG_FINGERPRINT_HEADER]: configFingerprint(isolatedCfg),
+    };
+    const send = (body: Record<string, unknown>) =>
+      fetch(`${isolatedBase}/events/claude`, {
+        method: "POST",
+        headers,
+        body: hookBody(body, isolatedCfg.repo),
+      });
+
+    try {
+      await send({
+        hook_event_name: "SessionStart",
+        session_id: "correlated-session",
+        source: "startup",
+      });
+      await send({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "correlated-session",
+        prompt_id: "older-prompt",
+      });
+      await send({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "correlated-session",
+        prompt_id: "active-prompt",
+      });
+      await send({
+        hook_event_name: "Stop",
+        session_id: "correlated-session",
+        prompt_id: "older-prompt",
+      });
+      await send({
+        hook_event_name: "Stop",
+        session_id: "correlated-session",
+      });
+
+      let status = (await (
+        await fetch(`${isolatedBase}/status`)
+      ).json()) as StatusResponse;
+      expect(agent(status, "claude").state).toBe("working");
+      expect(agent(status, "claude").sessionId).toBe("correlated-session");
+      expect(agent(status, "claude").lastEvent?.type).toBe("turn.start");
+
+      let rows = (await (
+        await fetch(`${isolatedBase}/events?agent=claude`)
+      ).json()) as StoredEvent[];
+      expect(rows.slice(0, 2).map((row) => row.type)).toEqual(["raw", "raw"]);
+      expect(rows.slice(0, 2).map((row) => row.native_type)).toEqual([
+        "Stop",
+        "Stop",
+      ]);
+
+      await send({
+        hook_event_name: "Stop",
+        session_id: "correlated-session",
+        prompt_id: "active-prompt",
+      });
+      status = (await (
+        await fetch(`${isolatedBase}/status`)
+      ).json()) as StatusResponse;
+      expect(agent(status, "claude").state).toBe("idle");
+      expect(agent(status, "claude").lastEvent?.type).toBe("turn.complete");
+
+      rows = (await (
+        await fetch(`${isolatedBase}/events?agent=claude&limit=1`)
+      ).json()) as StoredEvent[];
+      expect(rows[0]?.type).toBe("turn.complete");
+    } finally {
+      await isolated.stop();
     }
   });
 });

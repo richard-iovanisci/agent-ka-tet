@@ -5,6 +5,7 @@ import { down } from "./down.ts";
 import { attach } from "./attach.ts";
 import { runInit } from "./init.ts";
 import { top } from "./top.ts";
+import { handoff, type HandoffArgs } from "./handoff.ts";
 
 const COMMAND_FLAGS = {
   up: new Set(["--existing-session-only"]),
@@ -20,7 +21,31 @@ function isBridgeCommand(command: string): command is BridgeCommand {
   return Object.hasOwn(COMMAND_FLAGS, command);
 }
 
-/** `bridge` CLI dispatch: up | down | attach | init | top */
+export function parseHandoffArgs(args: string[]): HandoffArgs {
+  const positionals: string[] = [];
+  let task: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--task") {
+      if (task !== null) throw new Error('duplicate option "--task"');
+      const value = args[++i];
+      if (value === undefined || value.trim().length === 0) {
+        throw new Error('option "--task" requires a non-empty value');
+      }
+      task = value.trim();
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`unknown option "${arg}"`);
+    positionals.push(arg);
+  }
+  if (positionals.length !== 2) {
+    throw new Error("expected exactly <from-agent> <to-agent>");
+  }
+  if (task === null) throw new Error('missing required option "--task"');
+  return { from: positionals[0]!, to: positionals[1]!, task };
+}
+
+/** `bridge` CLI dispatch for lifecycle, display, and handoff commands. */
 export async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
 
@@ -29,12 +54,11 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  if (!isBridgeCommand(cmd)) {
+  if (cmd !== "handoff" && !isBridgeCommand(cmd)) {
     console.error(`bridge: unknown command "${cmd}"`);
     printHelp();
     return 1;
   }
-  const allowedFlags = COMMAND_FLAGS[cmd];
 
   const args = argv.slice(1);
   // Subcommand help must be handled before loading config or dispatching. In
@@ -43,6 +67,28 @@ export async function main(argv: string[]): Promise<number> {
     printHelp();
     return 0;
   }
+  if (cmd === "handoff") {
+    let handoffArgs: HandoffArgs;
+    try {
+      handoffArgs = parseHandoffArgs(args);
+    } catch (error) {
+      console.error(
+        `bridge handoff: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      printHelp();
+      return 2;
+    }
+    try {
+      const cfg = loadConfigWithMigrationNotice();
+      return await handoff(cfg, handoffArgs, { mux: new TmuxAdapter() });
+    } catch (error) {
+      console.error(
+        `bridge handoff: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 1;
+    }
+  }
+  const allowedFlags = COMMAND_FLAGS[cmd];
   const invalid = args.find((arg) => !allowedFlags.has(arg));
   if (invalid !== undefined) {
     console.error(`bridge ${cmd}: unknown option or argument "${invalid}"`);
@@ -108,5 +154,7 @@ commands:
   attach           attach to the tmux session
   init [--dry-run] wire agent hook/event surfaces to the daemon (diff + backup first)
   top [--once]     live per-agent state board (events only, no scraping)
+  handoff <from> <to> --task <text>
+                   prepare, preview, approve, and idle-gated deliver a handoff
 `);
 }

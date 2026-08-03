@@ -61,6 +61,39 @@ export function readJsonConfig(path: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * Read an optional object-valued config section without silently replacing a
+ * malformed user value. Missing sections may be created; present arrays,
+ * scalars, and null are refused through the same preservation policy as a
+ * malformed top-level file.
+ */
+export function objectConfigSection(
+  root: Record<string, unknown>,
+  key: string,
+  path: string,
+): Record<string, unknown> {
+  if (!Object.hasOwn(root, key)) return {};
+  const value = root[key];
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  throw new Error(`${path}: expected ${JSON.stringify(key)} to be a JSON object — refusing to touch it`);
+}
+
+/** Preserve a present per-event hook value unless it has the documented array shape. */
+export function arrayConfigEntry(
+  section: Record<string, unknown>,
+  key: string,
+  path: string,
+): unknown[] {
+  if (!Object.hasOwn(section, key)) return [];
+  const value = section[key];
+  if (Array.isArray(value)) return value;
+  throw new Error(
+    `${path}: expected hook event ${JSON.stringify(key)} to be a JSON array — refusing to touch it`,
+  );
+}
+
 export function serializeJson(obj: unknown): string {
   return `${JSON.stringify(obj, null, 2)}\n`;
 }

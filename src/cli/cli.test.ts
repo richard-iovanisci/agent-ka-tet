@@ -10,6 +10,12 @@ import {
   defaultConfig,
   CONFIG_FILENAME,
 } from "../config.ts";
+import {
+  BRIDGE_AGENT_ID_ENV,
+  BRIDGE_CONFIG_FINGERPRINT_ENV,
+  BRIDGE_MANAGED_PROCESS_OPTION,
+  managedProcessMarkerPrefix,
+} from "../attribution.ts";
 import type { AgentStatus, StatusResponse } from "../types.ts";
 import { TmuxAdapter } from "../mux/tmux.ts";
 import { daemonPidFile } from "../paths.ts";
@@ -169,7 +175,7 @@ describe("renderBoard", () => {
     expect(board).toContain("127.0.0.1:4770");
   });
 
-  test("explains Codex's unobserved launching state without inventing an event", () => {
+  test("explains either agent's unobserved launching state without inventing an event", () => {
     const now = Date.now();
     const status = fixtureStatus(now);
     status.agents = [
@@ -188,7 +194,7 @@ describe("renderBoard", () => {
     const board = renderBoard(status, now);
     const lines = board.split("\n");
     expect(lines.find((line) => line.includes("claude"))).toContain(
-      "no events yet",
+      "awaiting first observed turn",
     );
     expect(lines.find((line) => line.includes("codex"))).toContain(
       "awaiting first observed turn",
@@ -229,12 +235,29 @@ describe("renderBoard", () => {
 });
 
 describe("launchCommand", () => {
-  test("returns the configured native-TUI command", () => {
+  test("exports managed-process attribution around the native-TUI command", () => {
     const cfg = defaultConfig("/x");
-    expect(launchCommand(cfg.agents[0]!)).toBe("claude");
-    expect(launchCommand({ ...cfg.agents[1]!, command: "codex --profile pair" })).toBe(
-      "codex --profile pair",
+    const command = launchCommand(cfg.agents[0]!, cfg, "run-token-1");
+    expect(command).toContain(`${BRIDGE_AGENT_ID_ENV}='claude'`);
+    expect(command).toContain(
+      `${BRIDGE_CONFIG_FINGERPRINT_ENV}='${configFingerprint(cfg)}'`,
     );
+    expect(command).toContain(BRIDGE_MANAGED_PROCESS_OPTION);
+    expect(command).toContain(
+      managedProcessMarkerPrefix("claude", configFingerprint(cfg), "run-token-1"),
+    );
+    expect(command).toContain(`sh -c \"$1\"`);
+    expect(command).toEndWith("bridge-managed 'claude'");
+
+    const custom = launchCommand(
+      { ...cfg.agents[1]!, command: "exec codex --profile pair" },
+      cfg,
+      "run-token-2",
+    );
+    expect(custom).toContain(
+      managedProcessMarkerPrefix("codex", configFingerprint(cfg), "run-token-2"),
+    );
+    expect(custom).toEndWith("bridge-managed 'exec codex --profile pair'");
   });
 });
 
@@ -342,11 +365,20 @@ describe("bridge up/down against real tmux + real daemon", () => {
           daemonPort: PORT,
           db: join(repo, "events.sqlite"),
           agents: [
-            // echo markers: lets the test assert the launch command actually
-            // EXECUTED in the pane (a paste that lands before the shell is
-            // ready echoes to the tty but never runs — a real regression).
-            { id: "claude", kind: "claude", command: "echo bridge-launched-claude" },
-            { id: "codex", kind: "codex", command: "echo bridge-launched-codex" },
+            // Output markers prove both that the launch command executed and
+            // that its process-scoped attribution reached a native child.
+            {
+              id: "claude",
+              kind: "claude",
+              command:
+                "printf 'bridge-launched-claude:%s\\nbridge-fingerprint:%s\\n' \"$AGENT_BRIDGE_AGENT_ID\" \"$AGENT_BRIDGE_CONFIG_FINGERPRINT\"",
+            },
+            {
+              id: "codex",
+              kind: "codex",
+              command:
+                "printf 'bridge-launched-codex:%s\\nbridge-fingerprint:%s\\n' \"$AGENT_BRIDGE_AGENT_ID\" \"$AGENT_BRIDGE_CONFIG_FINGERPRINT\"",
+            },
           ],
         }),
       );
@@ -368,16 +400,22 @@ describe("bridge up/down against real tmux + real daemon", () => {
       expect(panes.every((pane) => pane.width < 220 && pane.height >= 50)).toBe(true);
       expect(await daemonHealthy(PORT)).toBe(true);
 
-      // Launch commands must have EXECUTED (not just been pasted): the echo
-      // marker only appears in output when the shell ran the command.
+      // Launch commands must have EXECUTED (not just been pasted), with both
+      // managed-process markers available to their process trees.
       for (const pane of panes) {
         const executed = await pollFor(async () => {
           const text = await mux.capturePane(pane.id);
-          // marker on a line of its own = command output, not the echoed paste
-          return text.split("\n").some((l) => l.trim().startsWith("bridge-launched-"));
+          const output = text.split("\n").map((line) => line.trim());
+          return (
+            output.includes(`bridge-launched-${pane.agentId}:${pane.agentId}`) &&
+            output.includes(`bridge-fingerprint:${configFingerprint(cfg)}`)
+          );
         });
         expect(executed).toBe(true);
       }
+      expect(await pollFor(async () =>
+        (await mux.listPanes(SESSION)).every((pane) => pane.managedProcess === null)
+      )).toBe(true);
 
       // status endpoint contains exactly the configured two-agent roster
       const status = (await (await fetch(`http://127.0.0.1:${PORT}/status`)).json()) as StatusResponse;

@@ -22,6 +22,7 @@ describe("Claude mapper", () => {
       const event = mapNativeEvent(CLAUDE, {
         hook_event_name: native,
         session_id: "s1",
+        ...(native === "SessionStart" ? { source: "startup" } : {}),
       });
       expect(event.agent).toBe("primary-claude");
       expect(event.kind).toBe("claude");
@@ -29,6 +30,36 @@ describe("Claude mapper", () => {
       expect(event.sessionId).toBe("s1");
       expect(event.payload.nativeType).toBe(native);
     }
+  });
+
+  test("only provider-valid SessionStart sources establish a Claude session", () => {
+    for (const source of ["startup", "resume", "clear", "fork"]) {
+      const event = mapNativeEvent(CLAUDE, {
+        hook_event_name: "SessionStart",
+        session_id: "s1",
+        source,
+      });
+      expect(event.type).toBe("session.start");
+      expect(event.payload.nativeType).toBe("SessionStart");
+    }
+
+    for (const source of ["compact", "unknown", "", null, 42]) {
+      const body = {
+        hook_event_name: "SessionStart",
+        session_id: "s2",
+        source,
+      };
+      const event = mapNativeEvent(CLAUDE, body);
+      expect(event.type).toBe("raw");
+      expect(event.sessionId).toBe("s2");
+      expect(event.payload.nativeType).toBe("SessionStart");
+      expect(event.payload.body).toBe(body);
+    }
+
+    expect(mapNativeEvent(CLAUDE, {
+      hook_event_name: "SessionStart",
+      session_id: "s3",
+    }).type).toBe("raw");
   });
 
   test("notification subtypes", () => {
@@ -90,6 +121,7 @@ describe("Codex mapper", () => {
       const event = mapNativeEvent(CODEX, {
         hook_event_name: native,
         session_id: "c1",
+        ...(native === "SessionStart" ? { source: "startup" } : {}),
       });
       expect(event.agent).toBe("review_codex");
       expect(event.kind).toBe("codex");
@@ -97,6 +129,36 @@ describe("Codex mapper", () => {
       expect(event.sessionId).toBe("c1");
       expect(event.payload.nativeType).toBe(native);
     }
+  });
+
+  test("only provider-valid SessionStart sources establish a Codex session", () => {
+    for (const source of ["startup", "resume", "clear"]) {
+      const event = mapNativeEvent(CODEX, {
+        hook_event_name: "SessionStart",
+        session_id: "c1",
+        source,
+      });
+      expect(event.type).toBe("session.start");
+      expect(event.payload.nativeType).toBe("SessionStart");
+    }
+
+    for (const source of ["compact", "fork", "unknown", "", null, 42]) {
+      const body = {
+        hook_event_name: "SessionStart",
+        session_id: "c2",
+        source,
+      };
+      const event = mapNativeEvent(CODEX, body);
+      expect(event.type).toBe("raw");
+      expect(event.sessionId).toBe("c2");
+      expect(event.payload.nativeType).toBe("SessionStart");
+      expect(event.payload.body).toBe(body);
+    }
+
+    expect(mapNativeEvent(CODEX, {
+      hook_event_name: "SessionStart",
+      session_id: "c3",
+    }).type).toBe("raw");
   });
 
   test("permission request exposes a human-readable digest", () => {

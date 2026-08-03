@@ -1,22 +1,67 @@
 # Progress
 
-Current phase: **0 — Dual-TUI foundation (reframed)**
+Current phase: **1 — Bidirectional handoffs**
 
-Active branch: `codex/phase-0-two-agent`
+Active branch: `codex/phase-1-handoffs`
 
-The original four-provider Phase 0 implementation remains the baseline in Git history. Phase 0 is reopened to make Claude Code + Codex the complete active v0 surface and to revise its live acceptance test accordingly.
+## Phase 0 acceptance
 
-Current static gate on macOS: **103 tests pass**, strict TypeScript passes, and `scripts/verify-phase0.sh static` reports **8 pass / 0 fail / 0 warn**. Runtime ownership, repo-local hooks, legacy cleanup, and the safety-hardened live verifier are implemented.
+The Claude Code + Codex dual-TUI foundation is complete. The authenticated
+interactive verifier reported **44 pass / 0 fail / 0 warn** on both supported
+targets:
 
-The authenticated macOS verifier completed **44 / 44 checks again on July 28**, validating the pane-identity, idle-reminder, first-observed-turn, permission, and daemon-independence fixes. Its visual follow-up is now covered: Claude's detailed `⚠ Bash` badge and `PermissionRequest` source remain stable when the delayed generic permission notification arrives, while the daemon still retains that notification as its literal latest event. Notification-only consent prompts remain real `needs_you` signals. Manual denial/Escape has no corresponding Claude hook, so attention safely clears on the next trusted lifecycle event rather than an inferred timeout. macOS live acceptance is complete; a targeted restart smoke check remains for the display correction, and WSL2 is still pending.
+- macOS: accepted July 28, 2026;
+- WSL2 Ubuntu: accepted July 31, 2026.
+
+The accepted baseline preserves two unmodified native TUIs in real tmux panes,
+event-only lifecycle state, stable pane ownership, permission attention,
+Codex's honest first-observed-turn state, daemon independence, and safe daemon
+recovery. At the Phase 0 gate, 103 Bun tests and strict TypeScript passed, and
+`scripts/verify-phase0.sh static` reported 8 pass / 0 fail / 0 warn.
+
+## Phase 1 current slice
+
+The first implementation slice is deliberately approve-mode only:
+
+- attribute lifecycle events to the exact bridge-launched native processes;
+- bind each managed `AgentId`/pane to its observed native session;
+- snapshot an immutable packet from the source's latest accepted `Stop`;
+- preview and approve that exact packet id;
+- revalidate target ownership and semantic idle immediately before injection;
+- deliver through one bracketed paste, exact native-TUI observable
+  verification, one observation-only retry, and one Enter;
+- write separate durable terminal-delivery state/receipt;
+- support the same path in both directions.
+
+Idle-gated auto mode follows only after this path passes its own authenticated
+safety checks. The shared task plane, pair/worktree launcher, model/effort and
+usage telemetry, native resume actions, and global multi-project operator
+console are not part of this first slice.
+
+Current automated gate: **187 Bun tests / 0 failures / 1,194 assertions** in
+both the normal UTF-8 environment and plain `LC_ALL=C`; strict TypeScript is
+green, and Phase 0 static compatibility reports **8 pass / 0 fail / 0 warn**
+in both locales on macOS. The independent review and consensus hardening are
+implemented. Authenticated approve-mode acceptance passed on macOS on August 3,
+2026, including both delivery directions, frozen preview, non-idle refusal,
+managed-session attribution, daemon loss/recovery, ambiguous-delivery safety,
+and receipt semantics. The remaining gate for this slice is the same
+authenticated acceptance run in WSL2.
+
+The macOS recovery run also confirmed the conservative post-restart behavior:
+both still-usable native TUIs remain `launching  awaiting first observed turn`
+in the new daemon until each produces a fresh semantic turn and re-establishes
+its session binding. This is expected fail-closed state, not process failure.
 
 | Phase | Branch | Status |
 |---|---|---|
-| 0 — Dual-TUI foundation | `codex/phase-0-two-agent` | reopened; in progress |
-| 1 — Bidirectional handoffs | — | not started |
+| 0 — Dual-TUI foundation | `codex/phase-0-two-agent` | complete; 44/44 on macOS and WSL2 |
+| 1 — Bidirectional handoffs | `codex/phase-1-handoffs` | active; macOS accepted, WSL2 authenticated acceptance pending |
 | 2 — Shared task plane | — | not started |
 | 3 — Pair workflow | — | not started |
 | 4 — Rate-aware routing | — | not started |
-| 5 — Extensibility + optional human layer | — | parked until the two-agent workflow is proven |
+| 5 — Multi-project operator layer + proven extensibility | — | not started |
 
-Phase 0 is complete only after the revised Claude/Codex live verification passes on macOS and WSL2.
+The operator-console north star remains Claude Code and Codex exclusively. It
+will grow incrementally over the proven project-local runtime rather than
+replacing either native TUI or broadening the adapter matrix.
