@@ -95,6 +95,11 @@ describe("disposable pilot configuration", () => {
     expect(existsSync(join(cfg.agents[1]!.workspace, "claude-only.txt"))).toBe(false);
     expect(existsSync(cfg.socketPath)).toBe(false);
     expect(existsSync(join(cfg.root, "endpoint.json"))).toBe(false);
+    const hooks = readPrivateJson<{ hooks: Record<string, unknown> }>(join(cfg.repo, ".codex", "hooks.json"));
+    expect(Object.keys(hooks.hooks)).toHaveLength(7);
+    const prepared = readFileSync(join(cfg.repo, ".codex", "hooks.json"), "utf8");
+    for (const token of [cfg.operatorToken, ...cfg.agents.map((agent) => agent.token)])
+      expect(prepared).not.toContain(token);
   });
 
   test("refuses an existing destination without modifying its contents", () => {
@@ -260,6 +265,7 @@ describe("generated native configuration", () => {
   test("rejects symlinked Codex parent directories before creating any native configuration", () => {
     const cfg = pilot();
     const outside = directory();
+    rmSync(join(cfg.repo, ".codex"), { recursive: true });
     writeFileSync(join(outside, "keep.txt"), "outside pilot");
     for (const parent of [cfg.repo, ...cfg.agents.map((agent) => agent.workspace)]) {
       const path = join(parent, ".codex");
@@ -277,6 +283,7 @@ describe("generated native configuration", () => {
   test("rejects invalid caller destinations and endpoint ports before native writes", () => {
     const cfg = pilot();
     const outside = directory();
+    const prepared = readFileSync(join(cfg.repo, ".codex", "hooks.json"), "utf8");
     expect(() => writeNativeConfig({ ...cfg, repo: outside }, endpoint)).toThrow(
       /invalid pilot derived paths/,
     );
@@ -284,7 +291,7 @@ describe("generated native configuration", () => {
       expect(() => writeNativeConfig(cfg, { ...endpoint, port })).toThrow(/invalid pilot endpoint port/);
     expect(readdirSync(outside)).toEqual([]);
     expect(existsSync(join(cfg.root, "claude.settings.json"))).toBe(false);
-    expect(existsSync(join(cfg.repo, ".codex"))).toBe(false);
+    expect(readFileSync(join(cfg.repo, ".codex", "hooks.json"), "utf8")).toBe(prepared);
   });
 
   test("generates token-free configs with command-only SessionStart and main-checkout Codex hooks", () => {
@@ -295,7 +302,15 @@ describe("generated native configuration", () => {
     const codexPath = join(cfg.repo, ".codex", "hooks.json");
     const settings = readPrivateJson<{
       hooks: Record<string, Array<{ hooks: Array<Record<string, unknown>> }>>;
+      permissions: { allow: string[] };
     }>(settingsPath);
+    expect(settings.permissions.allow).toEqual([
+      "mcp__agent-bridge__bridge_send_message",
+      "mcp__agent-bridge__bridge_read_message",
+      "mcp__agent-bridge__bridge_ack_message",
+      "mcp__agent-bridge__bridge_list_agents",
+      "mcp__agent-bridge__bridge_inbox",
+    ]);
     expect(settings.hooks.SessionStart![0]!.hooks[0]!.type).toBe("command");
     for (const event of ["UserPromptSubmit", "Stop", "SessionEnd", "PermissionRequest", "PostToolUse"]) {
       const hook = settings.hooks[event]![0]!.hooks[0]!;

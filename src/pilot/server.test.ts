@@ -22,6 +22,7 @@ class FakeCodex {
   startError: Error | null = null;
   peerError: Error | null = null;
   operatorError: Error | null = null;
+  nameError: Error | null = null;
   onPeer?: (input: Parameters<CodexClient["sendPeer"]>[0]) => void;
   notifications = new Set<(event: CodexNotification) => void>();
   responses = new Set<(event: CodexResponse) => void>();
@@ -34,6 +35,9 @@ class FakeCodex {
   }
   async bindThread(id: string) {
     this.bound.push(id);
+  }
+  async setThreadName() {
+    if (this.nameError) throw this.nameError;
   }
   async sendPeer(input: Parameters<CodexClient["sendPeer"]>[0]) {
     this.peers.push(input);
@@ -353,6 +357,32 @@ describe("native pilot coordinator", () => {
     expect((await f.request("/operator/connect", {})).status).toBe(400);
     expect(f.native.starts).toBe(1);
     expect((await f.status()).agents.find((a) => a.agentId === "codex")!.sessionId).toBeNull();
+  });
+
+  test("retains native binding errors without losing the accepted thread identity", async () => {
+    const f = fixture();
+    f.native.nameError = new CodexRequestError("name", "thread/name/set", "rpc", {
+      code: -32601,
+      message: "unsupported",
+    });
+    expect((await f.request("/operator/connect", {})).status).toBe(400);
+    const status = await f.status();
+    expect(status.agents.find((a) => a.agentId === "codex")!.sessionId).toBe(f.native.threadId);
+    expect(status.observations.find((o) => o.name === "thread/name/set")!.data).toEqual({
+      requestId: "name",
+      reason: "rpc",
+      error: { code: -32601, message: "unsupported" },
+    });
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toHaveLength(0);
+    f.native.nameError = null;
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    expect(f.native.bound).toEqual([f.native.threadId]);
+    await f.restart();
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toEqual([f.native.threadId, f.native.threadId]);
+    expect((await f.status()).agents.find((a) => a.agentId === "codex")!.sessionId).toBe(f.native.threadId);
   });
 
   test("refuses private socket connection when its owned host is gone", async () => {

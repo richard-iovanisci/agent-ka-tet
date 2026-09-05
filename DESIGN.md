@@ -41,7 +41,9 @@ reviewer acceptance; idle turns and process exits never complete tasks.
 ## Routes and delivery authority
 
 Source investigation used Claude Code **2.1.261** and Codex **0.153.4 (`3d2ee51`)**.
-These are evidence coordinates, not claims about installed versions or passed native pilots.
+The installed versions passed one authenticated nonce round trip; see `PROGRESS.md` for its limits.
+This Codex build required experimental `historyMode: legacy` at startup and a native thread name
+to persist the empty thread before TUI resume. Peer ingress itself remains `turn/start` + `toolOutput`.
 
 | Traffic | Contract |
 |---|---|
@@ -62,7 +64,8 @@ ingress only; later tool/permission hooks apply. Use app-server turn/item events
 activity. Plan-mode admission never grants execution.
 
 Channel availability, draft survival, peer-triggered hook coverage, and provider acceptance
-require native pilots. Claude native inbox socket frames remain research-only. Native Claude
+require separate observations; one active-turn exchange does not cover the matrix. Claude native
+inbox socket frames remain research-only. Native Claude
 routes may reach same-user sessions outside the fleet; Bridge policy there is advisory and
 native controls apply. Record actual inbound policy, including plan mode's bypass-class behavior
 when bypass is available. Unknown/stale policy never implies acceptance.
@@ -135,6 +138,11 @@ responses. Codex linked-worktree hooks redirect each discovered project layer to
 main-checkout `.codex` destination, preserving nested paths. Ordinary worktree MCP/model config
 remains local. Honor native project/hook trust; install `SessionEnd` and `Interrupt` within their
 timeout budgets.
+
+Prepare secret-free Codex hook definitions before launch. Establish native project and definition
+trust in a setup TUI, then exit before creating the private host: an already-loaded untrusted
+project layer may keep its hooks disabled. Pilot Claude settings allow the five Bridge MCP tools
+explicitly; other native permissions remain unchanged.
 
 ## Proof gates
 

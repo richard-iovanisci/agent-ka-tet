@@ -11,6 +11,7 @@ export interface CodexClientInfo {
 export interface CodexConnectOptions {
   socketPath: string;
   clientInfo: CodexClientInfo;
+  experimentalApi?: boolean;
   requestTimeoutMs?: number;
   connectTimeoutMs?: number;
 }
@@ -20,6 +21,7 @@ export interface CodexThreadOptions {
   model?: string;
   approvalPolicy?: "on-request" | "untrusted";
   sandbox?: "read-only" | "workspace-write";
+  historyMode?: "legacy";
   config?: Record<string, unknown>;
 }
 
@@ -93,6 +95,7 @@ export class CodexClient {
   private constructor(
     private readonly transport: UnixWebSocket,
     private readonly timeoutMs: number,
+    private readonly experimentalApi: boolean,
   ) {
     transport.onMessage((text) => this.receive(text));
     transport.onDisconnect((error) => this.disconnected(error));
@@ -109,7 +112,7 @@ export class CodexClient {
       socketPath: options.socketPath,
       connectTimeoutMs: options.connectTimeoutMs,
     });
-    const client = new CodexClient(transport, timeout);
+    const client = new CodexClient(transport, timeout, options.experimentalApi === true);
     try {
       await client.request("initialize", {
         clientInfo: {
@@ -117,6 +120,7 @@ export class CodexClient {
           ...(info.title === undefined ? {} : { title: info.title }),
           version: info.version,
         },
+        ...(client.experimentalApi ? { capabilities: { experimentalApi: true } } : {}),
       });
       await transport.sendText(JSON.stringify({ method: "initialized" }));
       return client;
@@ -166,6 +170,9 @@ export class CodexClient {
     if (this.boundThread || this.binding || this.threadStarted)
       throw new Error("This Codex client already started or bound a thread");
     if (!isAbsolute(options.cwd)) throw new Error("Thread cwd must be absolute");
+    if (options.historyMode !== undefined && (options.historyMode !== "legacy" || !this.experimentalApi)) {
+      throw new Error("Legacy thread history requires explicit experimental API opt-in");
+    }
     if (options.sandbox !== undefined && !["read-only", "workspace-write"].includes(options.sandbox)) {
       throw new Error("Unsupported pilot sandbox");
     }
@@ -180,6 +187,7 @@ export class CodexClient {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.approvalPolicy === undefined ? {} : { approvalPolicy: options.approvalPolicy }),
       ...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
+      ...(options.historyMode === undefined ? {} : { historyMode: options.historyMode }),
       ...(options.config === undefined ? {} : { config: options.config }),
     };
     const requestId = randomUUID();
@@ -190,6 +198,19 @@ export class CodexClient {
       return { requestId, threadId: thread.id, thread };
     } catch (error) {
       throw new CodexRequestError(requestId, "thread/start", "protocol", result);
+    }
+  }
+
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    uuid(threadId);
+    if (!name.trim() || name.length > 200) throw new Error("Thread name must contain 1–200 characters");
+    if (this.boundThread !== undefined && this.boundThread !== threadId) {
+      throw new Error("Thread name recipient must match the bound native thread");
+    }
+    const requestId = randomUUID();
+    const result = await this.request("thread/name/set", { threadId, name }, requestId);
+    if (!object(result) || Object.keys(result).length !== 0) {
+      throw new CodexRequestError(requestId, "thread/name/set", "protocol", result);
     }
   }
 

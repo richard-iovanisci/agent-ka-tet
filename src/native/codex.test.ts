@@ -86,7 +86,8 @@ async function fixture(handle?: (message: Rpc, peer: Peer) => boolean | void) {
   return {
     messages,
     peers,
-    connect: (requestTimeoutMs = 500) => connectCodex({ socketPath, clientInfo: INFO, requestTimeoutMs }),
+    connect: (requestTimeoutMs = 500, experimentalApi = false) =>
+      connectCodex({ socketPath, clientInfo: INFO, requestTimeoutMs, experimentalApi }),
     async close() {
       for (const peer of peers) peer.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -96,6 +97,123 @@ async function fixture(handle?: (message: Rpc, peer: Peer) => boolean | void) {
 }
 
 describe("Codex native peer client", () => {
+  test("opts into legacy history explicitly and names before binding without creating input", async () => {
+    const host = await fixture();
+    try {
+      const client = await host.connect(500, true);
+      const started = await client.startThread({
+        cwd: "/tmp/pilot-work",
+        historyMode: "legacy",
+        sandbox: "read-only",
+        approvalPolicy: "on-request",
+      });
+      await client.setThreadName(started.threadId, "Agent Bridge S13 legacy pilot");
+      await client.bindThread(started.threadId);
+      expect(host.messages.map((message) => message.method)).toEqual([
+        "initialize",
+        "initialized",
+        "thread/start",
+        "thread/name/set",
+        "thread/resume",
+      ]);
+      expect(host.messages[0]?.params).toEqual({
+        clientInfo: INFO,
+        capabilities: { experimentalApi: true },
+      });
+      expect(host.messages[2]?.params).toEqual({
+        cwd: "/tmp/pilot-work",
+        historyMode: "legacy",
+        sandbox: "read-only",
+        approvalPolicy: "on-request",
+      });
+      expect(host.messages[3]).toEqual({
+        id: expect.any(String),
+        method: "thread/name/set",
+        params: { threadId: THREAD, name: "Agent Bridge S13 legacy pilot" },
+      });
+      expect(host.messages[4]?.params).toEqual({ threadId: THREAD, excludeTurns: true });
+      expect(host.messages.every((message) => !("input" in (message.params ?? {})))).toBe(true);
+      await client.sendPeer({ messageId: "legacy-peer", envelope: "peer envelope", requestId: "legacy-rpc" });
+      expect(host.messages.at(-1)?.params).toEqual({
+        threadId: THREAD,
+        input: [],
+        toolOutput: { name: "bridge_receive_message", namespace: "agent_bridge", output: "peer envelope" },
+      });
+      client.close();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("rejects legacy history without opt-in before sending thread/start", async () => {
+    const host = await fixture();
+    try {
+      const client = await host.connect();
+      await expect(client.startThread({ cwd: "/tmp/pilot-work", historyMode: "legacy" })).rejects.toThrow(
+        /opt-in/,
+      );
+      expect(host.messages.some((message) => message.method === "thread/start")).toBe(false);
+      await client.startThread({ cwd: "/tmp/pilot-work" });
+      expect(host.messages[0]?.params).toEqual({ clientInfo: INFO });
+      expect(host.messages.at(-1)?.params).toEqual({ cwd: "/tmp/pilot-work" });
+      client.close();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("validates metadata names and exact native thread identities before I/O", async () => {
+    const host = await fixture();
+    try {
+      const client = await host.connect();
+      await expect(client.setThreadName("recent", "pilot")).rejects.toThrow(/UUID/);
+      await expect(client.setThreadName(THREAD, "  ")).rejects.toThrow(/name/);
+      await expect(client.setThreadName(THREAD, "x".repeat(201))).rejects.toThrow(/name/);
+      await client.bindThread(THREAD);
+      await expect(client.setThreadName(OTHER, "other")).rejects.toThrow(/bound/);
+      expect(host.messages.some((message) => message.method === "thread/name/set")).toBe(false);
+      await client.setThreadName(THREAD, "x".repeat(200));
+      expect(host.messages.at(-1)?.params).toEqual({ threadId: THREAD, name: "x".repeat(200) });
+      client.close();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("requires the stable empty metadata response and retains raw errors without retry", async () => {
+    for (const response of [
+      { result: null },
+      { result: [] },
+      { result: { changed: true } },
+      {
+        error: { code: -32603, message: "metadata persistence failed" },
+      },
+    ]) {
+      const host = await fixture((message, peer) => {
+        if (message.method !== "thread/name/set") return;
+        peer.send(JSON.stringify({ id: message.id, ...response }));
+        return true;
+      });
+      try {
+        const client = await host.connect();
+        const failure = await client.setThreadName(THREAD, "pilot").catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(CodexRequestError);
+        expect(failure).toMatchObject({
+          requestId: host.messages.at(-1)?.id,
+          method: "thread/name/set",
+          reason: "error" in response ? "rpc" : "protocol",
+          outcome: "uncertain",
+          rawError: "error" in response ? response.error : response.result,
+        });
+        expect(host.messages.filter((message) => message.method === "thread/name/set")).toHaveLength(1);
+        expect(host.messages.some((message) => message.method === "turn/start")).toBe(false);
+        client.close();
+      } finally {
+        await host.close();
+      }
+    }
+  });
+
   test("initializes, starts approved thread, binds exact UUID, and emits only tool-tier peer input", async () => {
     const host = await fixture();
     try {

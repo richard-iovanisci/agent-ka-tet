@@ -40,6 +40,7 @@ export interface PilotConfig {
   tmuxSession: string;
   operatorToken: string;
   runId: string;
+  codexHistoryMode?: "legacy";
   agents: PilotAgent[];
 }
 
@@ -104,6 +105,8 @@ const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 function validatePilot(cfg: PilotConfig, canonical: string): void {
   if (!cfg || cfg.version !== 1 || cfg.root !== canonical || !/^[a-f0-9]{12}$/.test(cfg.id))
     throw new Error("invalid pilot identity");
+  if (cfg.codexHistoryMode !== undefined && cfg.codexHistoryMode !== "legacy")
+    throw new Error("unsupported pilot Codex history mode");
   if (
     !Array.isArray(cfg.agents) ||
     cfg.agents.length !== 2 ||
@@ -267,6 +270,7 @@ export function preparePilot(directory?: string): PilotConfig {
       tmuxSession: `bridge-pilot-${id}`,
       operatorToken: randomBytes(32).toString("hex"),
       runId: run.id,
+      codexHistoryMode: "legacy",
       agents,
     };
     writePrivateJson(pilotFile(root, "pilot.json"), cfg);
@@ -282,6 +286,8 @@ export function preparePilot(directory?: string): PilotConfig {
         "- New Claude Code and Codex native TUIs in a private tmux server.",
         "- Separate disposable Git worktrees; normal native trust and permissions.",
         "- One private Codex app-server; Claude development Channel; Bridge MCP tools.",
+        "- Codex uses legacy history via an experimental startup capability; Astra with ultra reasoning.",
+        "- Claude allows only the five Bridge MCP tools through this pilot's private settings file.",
         "- Operator starts a nonce-only Codex → Claude → Codex exchange after checking both TUIs.",
         "- No automatic composer mutation, approval forwarding, or retry after ambiguity.",
         "- Eight messages maximum, four reply hops, one-hour expiry from preparation.",
@@ -294,6 +300,14 @@ export function preparePilot(directory?: string): PilotConfig {
         "```sh",
         "claude --version",
         "codex --version",
+        `env -u AGENT_BRIDGE_URL -u AGENT_BRIDGE_TOKEN codex -c 'model_reasoning_effort="ultra"' --model gpt-6-astra --cd ${shellQuote(repo)}`,
+        "```",
+        "",
+        "In this setup TUI, trust the disposable project and enable its seven prepared /hooks handlers.",
+        "Exit without submitting a prompt. Project trust must precede the private host; approving it",
+        "after launch does not activate hooks in an already-loaded untrusted project layer.",
+        "",
+        "```sh",
         `${bridge} launch ${target} --live`,
         `${bridge} attach ${target}`,
         "```",
@@ -336,7 +350,26 @@ export function preparePilot(directory?: string): PilotConfig {
     store.close();
   }
   chmodSync(cfg.db, 0o600);
+  writeCodexHooks(cfg);
   return cfg;
+}
+
+function writeCodexHooks(cfg: PilotConfig): void {
+  const directory = join(cfg.repo, ".codex");
+  if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
+  const command = `${shellQuote(process.execPath)} ${shellQuote(sourceFile("../native/hook.ts"))}`;
+  const hooks = Object.fromEntries(
+    [
+      "SessionStart",
+      "UserPromptSubmit",
+      "Stop",
+      "PermissionRequest",
+      "PostToolUse",
+      "SessionEnd",
+      "Interrupt",
+    ].map((event) => [event, [{ hooks: [{ type: "command", command, timeout: 1 }] }]]),
+  );
+  writeNativeJson(join(directory, "hooks.json"), { hooks });
 }
 
 export function writeNativeConfig(cfg: PilotConfig, endpoint: PilotEndpoint): void {
@@ -377,22 +410,14 @@ export function writeNativeConfig(cfg: PilotConfig, endpoint: PilotEndpoint): vo
   ]) {
     hooks[event] = [{ hooks: [http] }];
   }
-  writeNativeJson(pilotFile(cfg.root, "claude.settings.json"), { hooks });
+  const allow = ["send_message", "read_message", "ack_message", "list_agents", "inbox"].map(
+    (name) => `mcp__agent-bridge__bridge_${name}`,
+  );
+  writeNativeJson(pilotFile(cfg.root, "claude.settings.json"), { hooks, permissions: { allow } });
   writeNativeJson(pilotFile(cfg.root, "claude.mcp.json"), {
     mcpServers: { "agent-bridge": { command: process.execPath, args: [mcp, "--channel"] } },
   });
-  const codexHooks = Object.fromEntries(
-    [
-      "SessionStart",
-      "UserPromptSubmit",
-      "Stop",
-      "PermissionRequest",
-      "PostToolUse",
-      "SessionEnd",
-      "Interrupt",
-    ].map((event) => [event, [{ hooks: [{ type: "command", command, timeout: 1 }] }]]),
-  );
-  writeNativeJson(join(cfg.repo, ".codex", "hooks.json"), { hooks: codexHooks });
+  writeCodexHooks(cfg);
 }
 
 export function shellQuote(value: string): string {

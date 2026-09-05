@@ -141,7 +141,7 @@ async function stopPilot(cfg: PilotConfig): Promise<void> {
         return processVerifiedGone(record) && (role === "coordinator" || processVerifiedGone(record, true));
       }),
     "some pilot processes remain alive or unverified; inspect before further teardown",
-    8_000,
+    30_000,
   );
   if (await mux.hasSession(cfg.tmuxSession)) await (await ownedMux(cfg)).killSession(cfg.tmuxSession);
 }

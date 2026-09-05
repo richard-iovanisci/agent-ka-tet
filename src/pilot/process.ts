@@ -61,7 +61,7 @@ export async function runProcess(role: string, root: string, agentId?: string): 
   } else if (agent.kind === "codex") {
     const { threadId } = readPrivateJson<{ threadId: string }>(agentFile(root, agent.id, "thread"));
     command = "codex";
-    args = ["resume", threadId, "--remote", `unix://${cfg.socketPath}`];
+    args = ["resume", threadId, "--remote", `unix://${cfg.socketPath}`, "--cd", agent.workspace];
   } else {
     command = "claude";
     env.MCP_PROTOCOL_NEGOTIATION = "legacy";
@@ -89,8 +89,8 @@ export async function runProcess(role: string, root: string, agentId?: string): 
   };
   const onInt = () => forward("SIGINT"),
     onTerm = () => forward("SIGTERM");
-  process.once("SIGINT", onInt);
-  process.once("SIGTERM", onTerm);
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
   const result = await new Promise<number>((resolve) => {
     child.once("error", () => resolve(1));
     child.once("exit", (code) => resolve(code ?? 1));

@@ -23,6 +23,7 @@ import {
 type NativeClient = Pick<
   CodexClient,
   | "startThread"
+  | "setThreadName"
   | "bindThread"
   | "sendPeer"
   | "startOperatorTurn"
@@ -296,6 +297,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
         connectCodex({
           socketPath: cfg.socketPath,
           clientInfo: { name: "agent_bridge", title: "Agent Bridge", version: "0.0.1" },
+          experimentalApi: cfg.codexHistoryMode === "legacy",
         }));
       connectingClient = client;
       if (closed) throw new Error("coordinator is stopping");
@@ -332,6 +334,9 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
               cwd: codexAgent.workspace,
               sandbox: "read-only",
               approvalPolicy: "on-request",
+              model: "gpt-6-astra",
+              config: { model_reasoning_effort: "ultra" },
+              ...(cfg.codexHistoryMode ? { historyMode: cfg.codexHistoryMode } : {}),
             });
             threadId = started.threadId;
             writePrivateJson(threadIntentFile, {
@@ -354,6 +359,8 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
       }
       if (closed) throw new Error("coordinator is stopping");
       observeCodex(client, runtime);
+      if (cfg.codexHistoryMode === "legacy")
+        await client.setThreadName(runtime.sessionId!, `${cfg.tmuxSession}-codex`);
       await client.bindThread(runtime.sessionId!);
       if (closed) throw new Error("coordinator is stopping");
       if (!hostAlive()) throw new Error("Codex host ownership changed during binding");
@@ -368,6 +375,15 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
       codex = client;
       readiness(runtime);
     } catch (error) {
+      const runtime = store.runtime(codexAgent.runtimeId);
+      if (runtime.sessionId && error instanceof CodexRequestError) {
+        store.appendObservation(runtime.id, {
+          source: "codex-rpc",
+          name: error.method,
+          sessionId: runtime.sessionId,
+          data: { requestId: error.requestId, reason: error.reason, error: error.rawError },
+        });
+      }
       client?.close();
       throw error;
     } finally {
@@ -474,15 +490,13 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
   ): unknown {
     switch (name) {
       case "bridge_list_agents":
-        return store
-          .runtimes()
-          .map(({ agentId, kind, sessionId, ready, paused }) => ({
-            agentId,
-            kind,
-            bound: sessionId !== null,
-            ready,
-            paused,
-          }));
+        return store.runtimes().map(({ agentId, kind, sessionId, ready, paused }) => ({
+          agentId,
+          kind,
+          bound: sessionId !== null,
+          ready,
+          paused,
+        }));
       case "bridge_inbox":
         return store.listMessages(credential);
       case "bridge_read_message":

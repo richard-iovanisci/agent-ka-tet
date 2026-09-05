@@ -40,13 +40,19 @@ async function fixture() {
     [
       'import { writeFileSync } from "node:fs";',
       "const capture = process.env.FIXTURE_CAPTURE!;",
+      "const signals: string[] = [];",
+      "const exitAfterSignals = Number(process.env.FIXTURE_EXIT_AFTER_SIGNALS);",
+      'for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => {',
+      "  signals.push(signal);",
+      '  writeFileSync(capture + ".signal", signals.join("\\n"), { mode: 0o600 });',
+      "  if (signals.length >= exitAfterSignals) process.exit(0);",
+      "});",
       "writeFileSync(capture, JSON.stringify({",
       "  pid: process.pid, argv: process.argv.slice(2),",
       "  credentialMatches: process.env.AGENT_BRIDGE_TOKEN === process.env.FIXTURE_EXPECTED_TOKEN,",
       "  endpointMatches: process.env.AGENT_BRIDGE_URL === process.env.FIXTURE_EXPECTED_URL,",
       "  negotiation: process.env.MCP_PROTOCOL_NEGOTIATION,",
       "}), { mode: 0o600 });",
-      'process.on("SIGTERM", () => { writeFileSync(capture + ".signal", "SIGTERM", { mode: 0o600 }); process.exit(0); });',
       "setInterval(() => {}, 1000);",
     ].join("\n"),
     { mode: 0o600 },
@@ -83,7 +89,7 @@ async function fixture() {
     cfg,
     endpoint,
     coordinator,
-    async start(role: "codex-host" | "claude" | "codex") {
+    async start(role: "codex-host" | "claude" | "codex", exitAfterSignals = 1) {
       const agentId = role === "codex-host" ? "codex" : role;
       const agent = cfg.agents.find((candidate) => candidate.id === agentId)!;
       const capturePath = join(cfg.root, `${role}.fixture.json`);
@@ -102,6 +108,7 @@ async function fixture() {
           AGENT_BRIDGE_URL: "http://127.0.0.1:1",
           MCP_PROTOCOL_NEGOTIATION: "auto",
           FIXTURE_CAPTURE: capturePath,
+          FIXTURE_EXIT_AFTER_SIGNALS: String(exitAfterSignals),
           FIXTURE_EXPECTED_TOKEN: agent.token,
           FIXTURE_EXPECTED_URL: `http://127.0.0.1:${endpoint.port}`,
         },
@@ -120,11 +127,17 @@ async function fixture() {
     async close() {
       for (const child of children)
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-      await Promise.all(children.map((child) => child.exited));
       for (const role of ["claude", "codex", "codex-host"]) {
         const record = processRecord(cfg.root, role);
+        if (processAlive(record, true)) {
+          await until(
+            () => existsSync(join(cfg.root, `${role}.fixture.json.signal`)) || !processAlive(record, true),
+            "fake native child did not observe teardown signal",
+          );
+        }
         if (processAlive(record, true)) process.kill(record!.childPid!, "SIGTERM");
       }
+      await Promise.all(children.map((child) => child.exited));
       rmSync(cfg.socketDir, { recursive: true, force: true });
       rmSync(cfg.root, { recursive: true, force: true });
     },
@@ -132,11 +145,46 @@ async function fixture() {
 }
 
 describe("pilot wrappers with isolated fake native executables", () => {
+  test.each(["SIGTERM", "SIGINT"] as const)(
+    "forwards repeated %s while retaining the owned native child until it exits",
+    async (signal) => {
+      const host = await fixture();
+      try {
+        const native = await host.start("codex-host", 2);
+        native.wrapper.kill(signal);
+        await until(
+          () => existsSync(native.capturePath + ".signal"),
+          "fake native child did not observe its first signal",
+        );
+        expect(readFileSync(native.capturePath + ".signal", "utf8")).toBe(signal);
+        expect(processAlive(native.record)).toBe(true);
+        expect(processAlive(native.record, true)).toBe(true);
+        expect(processRecord(host.cfg.root, "codex-host")?.exited).toBe(false);
+        native.wrapper.kill(signal);
+        expect(await native.wrapper.exited).toBe(0);
+        expect(readFileSync(native.capturePath + ".signal", "utf8")).toBe(`${signal}\n${signal}`);
+        expect(processVerifiedGone(native.record)).toBe(true);
+        expect(processVerifiedGone(native.record, true)).toBe(true);
+        expect(processRecord(host.cfg.root, "codex-host")?.exited).toBe(true);
+      } finally {
+        await host.close();
+      }
+    },
+    10_000,
+  );
+
   test("passes only the bound Codex UUID and private endpoint to the native TUI", async () => {
     const host = await fixture();
     try {
       const native = await host.start("codex");
-      expect(native.capture.argv).toEqual(["resume", THREAD, "--remote", `unix://${host.cfg.socketPath}`]);
+      expect(native.capture.argv).toEqual([
+        "resume",
+        THREAD,
+        "--remote",
+        `unix://${host.cfg.socketPath}`,
+        "--cd",
+        host.cfg.agents[1]!.workspace,
+      ]);
       expect(native.capture.credentialMatches).toBe(true);
       expect(native.capture.endpointMatches).toBe(true);
       expect(native.record.pid).toBe(native.wrapper.pid);
