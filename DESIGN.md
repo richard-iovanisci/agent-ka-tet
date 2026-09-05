@@ -91,7 +91,7 @@ Credentials establish authorship; a digest establishes only content identity.
 | Receipt dimension | Values |
 |---|---|
 | Policy | ready, held, refused, expired, cancelled |
-| Attempt | prepared, sending, native accepted, rejected, ambiguous |
+| Attempt | prepared, sending, channel written, native accepted, rejected, ambiguous |
 | Application | unread, fetched, acknowledged, replied |
 
 RPC success, notification write, native send observation, turn completion, and ACK prove different

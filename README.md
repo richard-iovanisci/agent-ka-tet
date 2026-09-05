@@ -3,46 +3,47 @@
 Coordinate Claude Code and Codex in their native interactive TUIs, side by side in tmux.
 The operator can enter either session and type normally.
 
-Development and execution currently target **macOS only**. The existing implementation
-launches one Claude and one Codex, observes semantic lifecycle events, displays their
-state, and delivers operator-approved handoffs. Native peer routes and the durable
-task/review loop are under implementation; their live acceptance gates have not passed.
-Windows and Linux, including WSL2, follow the working macOS prototype.
+**macOS prototype in progress.** Native messaging is implemented behind an isolated pilot;
+live acceptance is pending. Task/review orchestration and configurable fleets come next.
+Windows and Linux, including WSL2, follow a working macOS prototype.
 
-## Use the current implementation
+## Develop
 
-Install Bun, tmux 3.2 or newer, Claude Code, and Codex; authenticate the native agents.
-From this source checkout:
+Install Bun, tmux 3.2+, Claude Code, and Codex. From this checkout:
 
 ```sh
 bun install
-bun test
-bun run typecheck
+./scripts/check.sh
 ```
 
-From the project where the agents will work, use the absolute path to this checkout:
+## Native messaging pilot
+
+Authenticate Claude Code and Codex normally. Prepare a new disposable directory and read
+its generated `PLAN.md` before launching authenticated sessions:
 
 ```sh
-bun /path/to/agent-bridge/bin/bridge init --dry-run
-bun /path/to/agent-bridge/bin/bridge init
-bun /path/to/agent-bridge/bin/bridge up
-bun /path/to/agent-bridge/bin/bridge top
-bun /path/to/agent-bridge/bin/bridge attach
+bun bin/bridge pilot prepare /tmp/my-bridge-pilot
+bun bin/bridge pilot launch /tmp/my-bridge-pilot --live
+bun bin/bridge pilot attach /tmp/my-bridge-pilot
 ```
 
-`init` prints configuration diffs and creates backups. In the trusted target project,
-review the installed Codex hook definitions using `/hooks` inside Codex.
-Configuration is optional; see [bridge.config.example.jsonc](bridge.config.example.jsonc).
-
-After both sessions are observed and the source completes a turn, a separate terminal can run:
+Review native trust, development Channel, MCP, and Codex `/hooks` prompts. Detach with
+**Ctrl-b d**, then confirm both TUIs are usable:
 
 ```sh
-bun /path/to/agent-bridge/bin/bridge handoff claude codex --task "Review this result"
-bun /path/to/agent-bridge/bin/bridge down
+bun bin/bridge pilot ready /tmp/my-bridge-pilot claude
+bun bin/bridge pilot ready /tmp/my-bridge-pilot codex
+bun bin/bridge pilot start /tmp/my-bridge-pilot
+bun bin/bridge pilot status /tmp/my-bridge-pilot
+bun bin/bridge pilot stop /tmp/my-bridge-pilot
 ```
 
-`handoff` previews the frozen packet and requires its exact delivery confirmation,
-an empty composer, and a semantically idle target. `down` terminates this project's
-managed native TUIs and coordinator. Run `bridge --help` for the complete current CLI.
+The pilot requests one Codex → Claude → Codex nonce exchange. It uses separate worktrees,
+a private Codex host, a Claude development Channel, and authenticated Bridge MCP tools.
+Receipts distinguish native delivery from recipient read/ACK. Ambiguous attempts stay held.
+Native permissions remain in the TUIs; entering a session pauses Bridge delivery to it.
+
+The earlier `init`, `up`, `top`, `attach`, `handoff`, and `down` commands remain available
+for operator-approved handoffs. Run `bun bin/bridge --help` for their usage.
 
 [Design contract](DESIGN.md) · [Implementation status](PROGRESS.md) · [Contributor instructions](AGENTS.md)

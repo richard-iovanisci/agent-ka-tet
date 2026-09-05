@@ -27,7 +27,7 @@ import {
   codexHookShimPath,
   removeCodexHooks,
 } from "./codex/init.ts";
-import { retireLegacyIntegrations } from "./retireLegacy.ts";
+import { runInit } from "../cli/init.ts";
 import { quoteShellArg } from "./initCommon.ts";
 
 const silent = { print: () => {} };
@@ -563,96 +563,20 @@ describe("initCodex", () => {
   });
 });
 
-describe("legacy integration retirement", () => {
-  test("removes exact old notify and agy blocks but preserves unrelated config", () => {
-    const { home } = setup();
-    const opts = { ...silent, home };
-    const codexDir = join(home, ".codex");
-    mkdirSync(codexDir, { recursive: true });
-    const notifyShim = join(
-      home,
-      ".local",
-      "state",
-      "agent-bridge",
-      "shims",
-      "bridge-codex-notify.sh",
-    );
-    writeFileSync(
-      join(codexDir, "config.toml"),
-      `# agent-bridge: forward turn-complete notifications to the daemon\nnotify = ["${notifyShim}"]\nmodel = "keep"\n`,
-    );
-    const oldHookShim = join(
-      home,
-      ".local",
-      "state",
-      "agent-bridge",
-      "shims",
-      "bridge-codex-hook.sh",
-    );
-    writeFileSync(
-      join(codexDir, "hooks.json"),
-      JSON.stringify({
-        hooks: {
-          SessionStart: [{ hooks: [{ type: "command", command: oldHookShim }] }],
-          Stop: [{
-            matcher: "keep-metadata",
-            hooks: [
-              { type: "command", command: oldHookShim },
-              { type: "command", command: "/foreign.sh" },
-            ],
-          }],
-        },
-      }),
-    );
-
-    const agyDir = join(home, ".gemini", "config");
-    mkdirSync(agyDir, { recursive: true });
-    const block: Record<string, unknown> = {};
-    for (const event of ["PreToolUse", "PostToolUse", "Stop"]) {
-      block[event] = [{
-        matcher: "*",
-        hooks: [{
-          type: "command",
-          command: join(
-            home,
-            ".local",
-            "state",
-            "agent-bridge",
-            "shims",
-            `bridge-agy-hook-${event}.sh`,
-          ),
-          timeout: 10,
-        }],
-      }];
-    }
-    writeFileSync(
-      join(agyDir, "hooks.json"),
-      JSON.stringify({ "agent-bridge": block, foreign: { keep: true } }),
-    );
-
-    expect(retireLegacyIntegrations(opts)).toBe(0);
-    expect(readFileSync(join(codexDir, "config.toml"), "utf8")).toBe(
-      'model = "keep"\n',
-    );
-    const codexHooks = JSON.parse(readFileSync(join(codexDir, "hooks.json"), "utf8"));
-    expect(codexHooks.hooks.SessionStart).toBeUndefined();
-    expect(codexHooks.hooks.Stop).toEqual([{
-      matcher: "keep-metadata",
-      hooks: [{ type: "command", command: "/foreign.sh" }],
-    }]);
-    const after = JSON.parse(readFileSync(join(agyDir, "hooks.json"), "utf8"));
-    expect(after["agent-bridge"]).toBeUndefined();
-    expect(after.foreign).toEqual({ keep: true });
-  });
-
-  test("leaves a modified legacy agy block untouched", () => {
-    const { home } = setup();
-    const opts = { ...silent, home };
-    const path = join(home, ".gemini", "config", "hooks.json");
-    mkdirSync(join(home, ".gemini", "config"), { recursive: true });
-    const before = '{"agent-bridge":{"Stop":[]},"foreign":true}';
-    writeFileSync(path, before);
-    expect(retireLegacyIntegrations(opts)).toBe(0);
-    expect(readFileSync(path, "utf8")).toBe(before);
+describe("runInit", () => {
+  test("installs project hooks without rewriting global native settings", () => {
+    const { cfg, home, repo } = setup();
+    const globalDir = join(home, ".codex");
+    mkdirSync(globalDir);
+    const notifyPath = join(home, ".local", "state", "agent-bridge", "shims", "bridge-codex-notify.sh");
+    const settings = {
+      "config.toml": `# agent-bridge: forward turn-complete notifications to the daemon\nnotify = ["${notifyPath}"]\nmodel = "keep"\n`,
+      "hooks.json": JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "/global-hook.sh" }] }] } }),
+    };
+    for (const [name, content] of Object.entries(settings)) writeFileSync(join(globalDir, name), content);
+    expect(runInit(cfg, { ...silent, home })).toBe(0);
+    for (const [name, content] of Object.entries(settings)) expect(readFileSync(join(globalDir, name), "utf8")).toBe(content);
+    expect(existsSync(join(repo, ".claude", "settings.json"))).toBe(true);
+    expect(existsSync(join(repo, ".codex", "hooks.json"))).toBe(true);
   });
 });

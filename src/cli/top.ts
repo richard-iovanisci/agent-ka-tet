@@ -2,12 +2,6 @@ import type { BridgeConfig } from "../config.ts";
 import type { AgentState, StatusResponse } from "../types.ts";
 import { daemonMatchesConfig, fetchDaemonStatus } from "./daemonClient.ts";
 
-/**
- * `bridge top` — single-pane ANSI board. State comes from daemon events,
- * never from scraping; polling the daemon over HTTP is fine for v0
- * (HANDOFF.md build order #7).
- */
-
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";

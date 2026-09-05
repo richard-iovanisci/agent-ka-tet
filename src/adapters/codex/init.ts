@@ -20,17 +20,7 @@ import {
   type InitOptions,
 } from "../initCommon.ts";
 
-/**
- * Wire Codex CLI to the daemon through project-local .codex/hooks.json
- * command shims (stdin JSON → curl). We deliberately do not claim `notify`
- * setting; the Stop lifecycle hook is the canonical completion signal.
- * Schema verified against learn.chatgpt.com/docs/hooks July 2026.
- *
- * Trust model: Codex records approval per hook-definition hash, so the writer
- * must stay byte-identical across runs — one interactive `/hooks` approval
- * then survives re-runs (DECISIONS.md 2026-07-07).
- */
-
+// Stable hook definitions preserve Codex's hash-bound trust across installs.
 const HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse"] as const;
 
 export function codexEventsUrl(cfg: BridgeConfig): string {

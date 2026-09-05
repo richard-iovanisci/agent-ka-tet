@@ -14,7 +14,7 @@ import {
 export interface AgentConfig {
   /** Stable configured instance identity used by panes, state, and handoffs. */
   id: AgentId;
-  /** Native-TUI adapter implementation. v0 supports Claude Code and Codex. */
+  /** Native-TUI adapter implementation. */
   kind: AgentKind;
   enabled: boolean;
   /** Shell command that launches the native TUI (never a headless mode). */
@@ -41,10 +41,8 @@ export interface BridgeConfig {
    * The daemon is spawned with this — NOT cfg.repo, which may point elsewhere.
    */
   configDir: string;
-  /** Ordered instance roster. Phase 0 permits one instance per adapter kind. */
+  /** Ordered roster; this launcher supports one instance per adapter kind. */
   agents: AgentConfig[];
-  /** True when an origin/phase-0 object roster was normalized in memory. */
-  legacyAgentsConfig: boolean;
 }
 
 export function stateDir(): string {
@@ -103,7 +101,6 @@ export function defaultConfig(repo: string): BridgeConfig {
       { id: "claude", kind: "claude", enabled: true, command: "claude" },
       { id: "codex", kind: "codex", enabled: true, command: "codex" },
     ],
-    legacyAgentsConfig: false,
   };
 }
 
@@ -180,10 +177,8 @@ export function loadConfig(dir: string = process.cwd()): BridgeConfig {
   if (o.repo !== undefined) cfg.repo = resolve(repo, expectString(o.repo, "repo"));
 
   if (o.agents !== undefined) {
-    const agents = Array.isArray(o.agents)
-      ? parseCurrentRoster(o.agents, repo)
-      : parseLegacyRoster(o.agents, repo, path);
-    cfg.legacyAgentsConfig = !Array.isArray(o.agents);
+    if (!Array.isArray(o.agents)) throw new Error(`${path}: "agents" must be an ordered array`);
+    const agents = parseCurrentRoster(o.agents, repo);
     validateRoster(agents, path);
     cfg.agents = agents;
   }
@@ -209,39 +204,6 @@ function parseCurrentRoster(raw: unknown[], repo: string): AgentConfig[] {
     agents.push(agent);
   }
   return agents;
-}
-
-/** Read enough of origin/phase-0's object roster to support a safe reset. */
-function parseLegacyRoster(raw: unknown, repo: string, path: string): AgentConfig[] {
-  if (typeof raw !== "object" || raw === null) {
-    throw new Error(`${path}: "agents" must be an ordered array`);
-  }
-  const legacy = raw as Record<string, unknown>;
-  const allowed = new Set(["claude", "codex", "agy", "opencode"]);
-  for (const key of Object.keys(legacy)) {
-    if (!allowed.has(key)) throw new Error(`${path}: unknown legacy agent "${key}"`);
-  }
-  return AGENT_KINDS.map((kind) => {
-    const value = legacy[kind];
-    if (value !== undefined && (typeof value !== "object" || value === null)) {
-      throw new Error(`${path}: agents.${kind} must be an object`);
-    }
-    const fields = (value ?? {}) as Record<string, unknown>;
-    const agent: AgentConfig = {
-      id: kind,
-      kind,
-      enabled: fields.enabled === undefined
-        ? true
-        : expectBoolean(fields.enabled, `agents.${kind}.enabled`),
-      command: fields.command === undefined
-        ? kind
-        : expectString(fields.command, `agents.${kind}.command`),
-    };
-    if (fields.cwd !== undefined) {
-      agent.cwd = resolve(repo, expectString(fields.cwd, `agents.${kind}.cwd`));
-    }
-    return agent;
-  });
 }
 
 /** Return the configured instance for an adapter kind, if present. */
@@ -291,14 +253,14 @@ function validateRoster(agents: AgentConfig[], path: string): void {
   for (const agent of agents) {
     if (ids.has(agent.id)) throw new Error(`${path}: duplicate agent id "${agent.id}"`);
     if (kinds.has(agent.kind)) {
-      throw new Error(`${path}: multiple "${agent.kind}" instances are not supported in Phase 0`);
+      throw new Error(`${path}: multiple "${agent.kind}" instances are not supported by this launcher`);
     }
     ids.add(agent.id);
     kinds.add(agent.kind);
   }
   for (const kind of AGENT_KINDS) {
     if (!kinds.has(kind)) {
-      throw new Error(`${path}: Phase 0 requires one configured "${kind}" instance`);
+      throw new Error(`${path}: this launcher requires one configured "${kind}" instance`);
     }
   }
 }

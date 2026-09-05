@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import { BRIDGE_MANAGED_PROCESS_OPTION } from "../attribution.ts";
 import type {
   MuxAdapter,
-  ListPanesOptions,
   PaneInfo,
   PasteObservable,
   PasteVerification,
@@ -10,19 +9,6 @@ import type {
   SendResult,
   SendTextOptions,
 } from "./adapter.ts";
-
-/**
- * tmux backend for MuxAdapter. Every invocation is an argv array through
- * Bun.spawn — never a shell string — so session names, titles, and injected
- * text can't be re-interpreted by a shell.
- *
- * Injection etiquette (DESIGN.md §4, load-bearing): text goes in as ONE
- * bracketed paste via a uniquely named tmux buffer (load-buffer from stdin +
- * paste-buffer -d -p -r), then exactly one expected receipt observable is
- * verified via capture-pane. A miss retries observation, never the paste, and
- * one trailing Enter is sent only after verification — never per-line
- * send-keys, which is the naive path that intermittently loses keystrokes.
- */
 
 export interface TmuxAdapterOptions {
   /** tmux -L socket name (tests use a throwaway socket per run). */
@@ -338,15 +324,8 @@ export class TmuxAdapter implements MuxAdapter {
     ).trim();
   }
 
-  /**
-   * Resolve the bridge-owned window without consulting tmux's mutable current
-   * window. Missing or inconsistent reciprocal markers fail closed. The sole
-   * legacy fallback is explicit and used only for verified baseline teardown.
-   */
-  private async managedWindowTarget(
-    session: string,
-    opts: ListPanesOptions = {},
-  ): Promise<string> {
+  /** Resolve the pinned window; never infer ownership from the current window. */
+  private async managedWindowTarget(session: string): Promise<string> {
     const sessionId = await this.sessionId(session);
     const stored = await this.run([
       "show-options",
@@ -356,7 +335,6 @@ export class TmuxAdapter implements MuxAdapter {
       MANAGED_WINDOW_OPTION,
     ]);
     if (stored.exitCode !== 0 || stored.stdout.trim().length === 0) {
-      if (opts.legacyCurrentWindow === true) return exactWindow(session);
       throw new Error(
         `tmux session ${JSON.stringify(session)} has no managed window identity`,
       );
@@ -478,9 +456,9 @@ export class TmuxAdapter implements MuxAdapter {
     await this.exec(["select-layout", "-t", window, layout]);
   }
 
-  async listPanes(session: string, opts: ListPanesOptions = {}): Promise<PaneInfo[]> {
+  async listPanes(session: string): Promise<PaneInfo[]> {
     const separator = paneSeparator();
-    const window = await this.managedWindowTarget(session, opts);
+    const window = await this.managedWindowTarget(session);
     const out = await this.exec([
       "list-panes",
       "-t",

@@ -1,0 +1,113 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import {
+  agentFile,
+  loadPilot,
+  pilotFile,
+  readPrivateJson,
+  sourceFile,
+  type PilotEndpoint,
+} from "./config.ts";
+import { recordProcess } from "./processState.ts";
+import { startPilotServer } from "./server.ts";
+
+export async function runProcess(role: string, root: string, agentId?: string): Promise<number> {
+  const cfg = loadPilot(root);
+  if (role === "coordinator") {
+    const endpointFile = pilotFile(root, "endpoint.json");
+    const previous = existsSync(endpointFile) ? readPrivateJson<PilotEndpoint>(endpointFile) : null;
+    const server = startPilotServer(cfg, { port: previous?.port ?? 0 });
+    console.log(`pilot coordinator listening on 127.0.0.1:${server.endpoint.port}`);
+    await new Promise<void>((resolve) => {
+      let stopping = false;
+      const stop = async () => {
+        if (stopping) return;
+        stopping = true;
+        await server.stop();
+        resolve();
+      };
+      process.once("SIGINT", () => {
+        void stop();
+      });
+      process.once("SIGTERM", () => {
+        void stop();
+      });
+    });
+    return 0;
+  }
+  const endpoint = readPrivateJson<PilotEndpoint>(pilotFile(root, "endpoint.json"));
+  const agent = cfg.agents.find((a) => a.id === (role === "codex-host" ? "codex" : agentId));
+  if (!agent || !["codex-host", "agent"].includes(role)) throw new Error("invalid pilot process role");
+  const processRole = role === "agent" ? agent.id : role;
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    AGENT_BRIDGE_URL: `http://127.0.0.1:${endpoint.port}`,
+    AGENT_BRIDGE_TOKEN: agent.token,
+  };
+  let command: string, args: string[];
+  if (role === "codex-host") {
+    command = "codex";
+    args = [
+      "-c",
+      `mcp_servers.agent_bridge.command=${JSON.stringify(process.execPath)}`,
+      "-c",
+      `mcp_servers.agent_bridge.args=${JSON.stringify([sourceFile("../native/mcp.ts")])}`,
+      "-c",
+      `mcp_servers.agent_bridge.env_vars=${JSON.stringify(["AGENT_BRIDGE_URL", "AGENT_BRIDGE_TOKEN"])}`,
+      "app-server",
+      "--listen",
+      `unix://${cfg.socketPath}`,
+    ];
+  } else if (agent.kind === "codex") {
+    const { threadId } = readPrivateJson<{ threadId: string }>(agentFile(root, agent.id, "thread"));
+    command = "codex";
+    args = ["resume", threadId, "--remote", `unix://${cfg.socketPath}`];
+  } else {
+    command = "claude";
+    env.MCP_PROTOCOL_NEGOTIATION = "legacy";
+    args = [
+      "--session-id",
+      agent.sessionId!,
+      "--name",
+      `${cfg.tmuxSession}-claude`,
+      "--settings",
+      pilotFile(root, "claude.settings.json"),
+      "--mcp-config",
+      pilotFile(root, "claude.mcp.json"),
+      "--strict-mcp-config",
+      "--dangerously-load-development-channels",
+      "server:agent-bridge",
+      "--append-system-prompt",
+      `The operator approved the Agent Bridge nonce pilot ${cfg.id}. For a Bridge Channel notification, read the message with bridge_read_message and acknowledge it with bridge_ack_message. If the peer body is exactly PING ${cfg.id}, reply to codex with exactly PONG ${cfg.id}, idempotencyKey ${cfg.id}:pong, and replyTo the incoming message ID. Use only Bridge MCP tools; do not edit files, run commands, or send further replies. Keep the native permission controls.`,
+    ];
+  }
+  recordProcess(root, processRole);
+  const child = spawn(command, args, { cwd: agent.workspace, env, stdio: "inherit" });
+  if (child.pid !== undefined) recordProcess(root, processRole, child.pid);
+  const forward = (signal: NodeJS.Signals) => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  const onInt = () => forward("SIGINT"),
+    onTerm = () => forward("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
+  const result = await new Promise<number>((resolve) => {
+    child.once("error", () => resolve(1));
+    child.once("exit", (code) => resolve(code ?? 1));
+  });
+  process.off("SIGINT", onInt);
+  process.off("SIGTERM", onTerm);
+  recordProcess(root, processRole, child.pid, true);
+  return result;
+}
+
+if (import.meta.main) {
+  const [role, root, agentId] = process.argv.slice(2);
+  try {
+    if (!role || !root) throw new Error("pilot process requires role and directory");
+    process.exitCode = await runProcess(role, root, agentId);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : "pilot process failed");
+    process.exitCode = 1;
+  }
+}

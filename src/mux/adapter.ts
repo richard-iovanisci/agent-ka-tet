@@ -66,11 +66,6 @@ export interface SendTextOptions {
   beforeSubmit?: () => void | Promise<void>;
 }
 
-export interface ListPanesOptions {
-  /** Deliberate migration-only inspection of a pre-pin session's current window. */
-  legacyCurrentWindow?: boolean;
-}
-
 export interface MuxAdapter {
   hasSession(session: string): Promise<boolean>;
   /** Store/read a backend-native session marker used to prevent cross-repo reuse. */
@@ -92,7 +87,7 @@ export interface MuxAdapter {
     layout: "tiled" | "even-horizontal" | "even-vertical",
   ): Promise<void>;
   /** List only the bridge-managed window, even when a scratch window is current. */
-  listPanes(session: string, opts?: ListPanesOptions): Promise<PaneInfo[]>;
+  listPanes(session: string): Promise<PaneInfo[]>;
   /** Visible pane text; opts.lines reaches that far back into scrollback. */
   capturePane(paneId: string, opts?: { lines?: number }): Promise<string>;
   /**
