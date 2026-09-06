@@ -13,7 +13,8 @@ type ConsoleAgent = Pick<
 };
 
 export interface ConsoleStatus {
-  run?: { id: string; paused: boolean } | null;
+  run?: { id: string; paused: boolean; expiresAt?: number } | null;
+  serverNow?: number;
   startIntent?: {
     state: "submitting" | "accepted" | "ambiguous";
     requestId?: string;
@@ -111,14 +112,22 @@ export function renderConsole(
     notice?: string;
     connected?: boolean;
     secrets?: readonly string[];
+    now?: number;
   } = {},
 ): string {
   const width = Math.max(1, Math.min(240, (options.width ?? 100) - 1));
   const height = Math.max(1, Math.min(100, (options.height ?? 30) - 1));
   const safe = (value: unknown) => terminalText(value, options.secrets);
+  const validTime = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 8.64e15;
+  const now = validTime(status.serverNow) ? status.serverNow : validTime(options.now) ? options.now : Date.now();
+  const expiresAt = status.run?.expiresAt;
+  const expired = validTime(expiresAt) && expiresAt <= now;
   const lines = [
     `Agent Bridge | ${safe(status.run?.id ?? "native run")} | ${options.connected === false ? "coordinator unavailable; state unverified" : status.run?.paused ? "run paused" : "connected"}`,
   ];
+  if (validTime(expiresAt))
+    lines.push(`Run ${expired ? "EXPIRED" : "expires"} at ${new Date(expiresAt).toISOString()}`);
   const start = status.startIntent;
   lines.push(
     !start
@@ -173,7 +182,9 @@ export function renderConsole(
   }
   const footer = [
     "j/k or arrows select | Enter native TUI (pauses) | p pause | s start | q exit",
-    "r resume: confirms native session and trust/tools are ready for peer input.",
+    expired
+      ? "Resume/start unavailable: run expired. Enter attaches; p pauses; q exits."
+      : "r resume: confirms native session and trust/tools are ready for peer input.",
     "Detach native TUI: Ctrl-b d. Agent stays paused until r. q leaves sessions running.",
     safe(options.notice ?? ""),
   ];

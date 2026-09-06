@@ -13,6 +13,7 @@ import {
 } from "../native/codex.ts";
 import { agentFile, pilotFile, preparePilot, readPrivateJson, writePrivateJson } from "./config.ts";
 import { pilotRequest, startPilotServer, type PilotServerOptions } from "./server.ts";
+import { openCoordinationStore } from "../coordination/store.ts";
 
 class FakeCodex {
   threadId = randomUUID();
@@ -84,6 +85,7 @@ class FakeCodex {
 }
 
 interface Status {
+  serverNow: number;
   run: Run;
   agents: RuntimeAttempt[];
   messages: MessageRecord[];
@@ -502,12 +504,40 @@ describe("native pilot coordinator", () => {
     expect(existsSync(pilotFile(f.cfg.root, "start.json"))).toBe(false);
   });
 
-  test("revalidates expiry before starting the operator turn", async () => {
+  test("reports expiry precisely and rejects resume/start without changing pause or native state", async () => {
     let now = Date.now();
     const f = fixture({ now: () => now });
     await f.ready();
-    now = (await f.status()).run.expiresAt + 1;
-    expect((await f.request("/operator/start", {})).status).toBe(400);
+    now = (await f.status()).run.expiresAt;
+    expect((await f.status()).serverNow).toBe(now);
+    const expected = {
+      error: `run expired at ${new Date(now).toISOString()}; prepare a new run for peer delivery`,
+    };
+    for (const agentId of ["claude", "codex"]) {
+      const paused = await f.request("/operator/pause", { agentId });
+      expect(paused.status).toBe(200);
+      expect(paused.data.paused).toBe(true);
+      const resumed = await f.request("/operator/ready", { agentId, confirmNative: true });
+      expect(resumed).toEqual({ status: 400, data: expected });
+    }
+    expect(await f.request("/operator/start", {})).toEqual({ status: 400, data: expected });
+    expect((await f.status()).agents.every((agent) => agent.paused && !agent.ready)).toBe(true);
+    expect(f.native.operators).toHaveLength(0);
+    expect(existsSync(pilotFile(f.cfg.root, "start.json"))).toBe(false);
+  });
+
+  test("distinguishes a paused run from an expired run", async () => {
+    const f = fixture();
+    await f.ready();
+    const store = openCoordinationStore(f.cfg.db);
+    try {
+      store.pauseRun(f.cfg.runId, true);
+    } finally {
+      store.close();
+    }
+    const expected = { status: 400, data: { error: "run is paused; peer delivery is held" } };
+    expect(await f.request("/operator/ready", { agentId: "claude", confirmNative: true })).toEqual(expected);
+    expect(await f.request("/operator/start", {})).toEqual(expected);
     expect(f.native.operators).toHaveLength(0);
   });
 

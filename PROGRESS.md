@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-09-05. **The macOS 1+1 prototype is ready for manual validation.**
+Updated: 2026-09-06. **The macOS 1+1 prototype is ready for manual validation.**
 
 ## Working
 
@@ -8,6 +8,7 @@ Updated: 2026-09-05. **The macOS 1+1 prototype is ready for manual validation.**
 - Versioned task claim, submit, and review operations persist with their peer notifications.
 - Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
 - The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
+- Run expiry is shown separately from agent pause; expired runs retain native entry and inspection.
 - Coordinator recovery preserves native sessions; uncertain sends remain held.
 - Accepted linear commits export as a patch. The source checkout stays unchanged.
 
@@ -47,7 +48,7 @@ snapshots, and `2026-09-05-task-export-verification.json`. The completed pair is
 
 ## Checks
 
-`scripts/check.sh`: **360 passed, 0 failed**, 2,635 assertions across 28 files (87.76 s);
+`scripts/check.sh`: **364 passed, 0 failed**, 2,680 assertions across 28 files (86.27 s);
 typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
 

@@ -123,6 +123,16 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
   let closed = false;
   let endpoint: PilotEndpoint;
 
+  function requireOpenRun(): void {
+    const run = store.run(cfg.runId);
+    if (!run) throw new Error("run is unavailable");
+    if (run.expiresAt <= now())
+      throw new Error(
+        `run expired at ${new Date(run.expiresAt).toISOString()}; prepare a new run for peer delivery`,
+      );
+    if (run.paused) throw new Error("run is paused; peer delivery is held");
+  }
+
   function reconcileStartup(runtime: RuntimeAttempt): RuntimeAttempt {
     if (runtime.sessionId || runtime.revoked || runtime.exited) return runtime;
     const pending = pendingStartup.get(runtime.id);
@@ -361,8 +371,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
           }
           threadId = intent.threadId;
         } else {
-          const run = store.run(cfg.runId);
-          if (!run || run.paused || run.expiresAt <= now()) throw new Error("pilot run is paused or expired");
+          requireOpenRun();
           const intent = {
             runtimeId: runtime.id,
             intentId: randomUUID(),
@@ -627,6 +636,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                 return json({
                   pilot: cfg.id,
                   endpoint,
+                  serverNow: now(),
                   run: store.run(cfg.runId),
                   agents: store.runtimes().map((runtime) => ({
                     ...runtime,
@@ -657,9 +667,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                   confirmed.delete(runtime.id);
                   store.pauseRuntime(runtime.id, true);
                 } else {
-                  const run = store.run(cfg.runId);
-                  if (!run || run.paused || run.expiresAt <= now())
-                    throw new Error("pilot run is paused or expired");
+                  requireOpenRun();
                   if (args.confirmNative !== true || !nativeAlive(agent.id))
                     throw new Error("confirm the owned native TUI is attached and usable");
                   if (!runtime.sessionId) throw new Error("native session is not bound");
@@ -671,9 +679,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
               }
               if (path === "/operator/start") {
                 refreshReadiness();
-                const run = store.run(cfg.runId);
-                if (!run || run.paused || run.expiresAt <= now())
-                  throw new Error("pilot run is paused or expired");
+                requireOpenRun();
                 if (!codex || store.runtimes().some((r) => !r.ready || r.paused))
                   throw new Error("both native TUIs must be confirmed ready");
                 const startFile = pilotFile(cfg.root, "start.json");

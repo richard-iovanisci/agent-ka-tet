@@ -129,6 +129,8 @@ Enter/pause blocks new Bridge dispatch to the target and preserves visibility of
 it does not interrupt tools or native peer traffic. Explicit resume revalidates binding and policy.
 Apply message/task/run budgets, expiry, throttles, and a follow-up limit. Missing required roster
 members fail launch; only explicitly optional members may be skipped with a warning.
+Show the run expiry independently of agent pause. Expiry blocks resume/start and peer delivery;
+native entry and completed results remain available for inspection.
 
 ## Observation and configuration
 

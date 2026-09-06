@@ -276,6 +276,80 @@ describe("native run console", () => {
     expect(offline).not.toContain("route ready");
   });
 
+  test("shows exact expiry using server time without changing observed run or agent flags", () => {
+    const expiresAt = Date.parse("2026-09-06T03:43:31.511Z");
+    const value = status();
+    value.run!.expiresAt = expiresAt;
+    value.tasks![0]!.state = "accepted";
+    value.agents[0]!.paused = true;
+    value.agents[0]!.ready = false;
+    value.serverNow = expiresAt - 1;
+    const before = renderConsole(value, 0, { now: expiresAt + 60_000, width: 120 });
+    expect(before).toContain("Run expires at 2026-09-06T03:43:31.511Z");
+    expect(before).not.toContain("run expired");
+    value.serverNow = expiresAt;
+    const expired = renderConsole(value, 0, { now: expiresAt - 60_000, width: 120 });
+    expect(expired).toContain("Run EXPIRED at 2026-09-06T03:43:31.511Z");
+    expect(expired).toContain("Resume/start unavailable: run expired. Enter attaches; p pauses; q exits.");
+    expect(expired).toContain("Agent Bridge | run-one | connected");
+    expect(expired).not.toContain("run paused");
+    expect(expired).toContain("claude | bound | route held | paused yes");
+    expect(expired).toContain("codex | bound | route ready | paused no");
+    expect(expired).toContain("accepted v3");
+    expect(value.run!.paused).toBe(false);
+    const offline = renderConsole(value, 0, { connected: false });
+    expect(offline).toContain("state unverified");
+    expect(offline).toContain("Run EXPIRED at 2026-09-06T03:43:31.511Z");
+  });
+
+  test("expiry display falls back to the supplied clock and tolerates missing or invalid timestamps", () => {
+    const expiresAt = Date.parse("2026-09-06T03:43:31.511Z");
+    const value = status();
+    value.run!.expiresAt = expiresAt;
+    expect(renderConsole(value, 0, { now: expiresAt - 1 })).toContain("Run expires at");
+    expect(renderConsole(value, 0, { now: expiresAt })).toContain("Run EXPIRED at");
+    value.serverNow = Number.NaN;
+    expect(renderConsole(value, 0, { now: expiresAt })).toContain("Run EXPIRED at");
+    for (const invalid of [undefined, Number.NaN, Infinity, 1e20]) {
+      value.run!.expiresAt = invalid;
+      const output = renderConsole(value, 0, { now: expiresAt });
+      expect(output).not.toContain("Run EXPIRED");
+      expect(output).not.toContain("Invalid Date");
+    }
+  });
+
+  test("expired presentation keeps action authority on the server and preserves attach, pause and quit", async () => {
+    const expiresAt = Date.parse("2026-09-06T03:43:31.511Z");
+    const value = { ...status(), serverNow: expiresAt, run: { id: "expired-run", paused: false, expiresAt } };
+    const calls: string[] = [], attached: string[] = [];
+    const f = fixture({
+      request: async (path) => {
+        calls.push(path);
+        if (path === "/operator/ready" || path === "/operator/start")
+          throw new Error("run expired at 2026-09-06T03:43:31.511Z; prepare a new run for peer delivery");
+        return value;
+      },
+      attach: async (agentId) => { attached.push(agentId); return 0; },
+    });
+    const running = runConsoleSession(cfg, f.options);
+    try {
+      await until(() => f.writes.some((text) => text.includes("Run EXPIRED")));
+      f.input.key("r");
+      await until(() => f.writes.some((text) => text.includes("Action not confirmed")));
+      f.input.key("s");
+      await until(() => calls.includes("/operator/start"));
+      await Bun.sleep(5);
+      f.input.key("p");
+      await until(() => f.writes.some((text) => text.includes("claude paused.")));
+      f.input.key("\r");
+      await until(() => attached.length === 1 && f.input.isRaw);
+      expect(calls).toContain("/operator/ready");
+      expect(calls).toContain("/operator/pause");
+      expect(attached).toEqual(["claude"]);
+      expect(calls.some((path) => path.includes("stop"))).toBe(false);
+    } finally { f.input.key("q"); expect(await running).toBe(0); }
+  });
+
   test("shows persisted start receipts and refuses another start for every recorded state", async () => {
     expect(renderConsole(status(), 0)).toContain("Start: not submitted");
     for (const state of ["accepted", "ambiguous", "submitting"] as const) {

@@ -34,10 +34,12 @@ bun bin/bridge run console /path/to/run
 | s | Start the task once |
 | q | Close the console; sessions keep running |
 
+To detach, press Control+B, release both keys, then press lowercase d.
 Review native trust and tool prompts before pressing r for each agent, then s.
 Entering a session pauses its Bridge delivery until you resume it. Unsent drafts stay in the
 native composer. Native shell/file permission requests are handled in that session.
 The nine Bridge tools are pre-approved within the run; peer messages cannot grant permissions.
+Runs expire after four hours. An expired run stays inspectable; resume and start require a new run.
 
 ## Finish or recover
 
