@@ -3,6 +3,8 @@ import { existsSync, realpathSync } from "node:fs";
 import { openCoordinationStore } from "../coordination/store.ts";
 import type { RuntimeAttempt, SendMessageInput } from "../coordination/types.ts";
 import { connectCodex, CodexRequestError, type CodexClient } from "../native/codex.ts";
+import { validateArtifact } from "../run/artifact.ts";
+import { reviewerPrompt } from "../run/prompts.ts";
 import {
   agentFile,
   pilotFile,
@@ -66,6 +68,16 @@ function matches(a: string, b: string): boolean {
 function string(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${name} is required`);
   return value;
+}
+
+function fields(args: Record<string, unknown>, allowed: string[]): void {
+  if (Object.keys(args).some((key) => !allowed.includes(key))) throw new Error("unsupported tool field");
+}
+
+function taskVersion(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1)
+    throw new Error("expectedVersion must be a positive integer");
+  return value as number;
 }
 
 export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions = {}) {
@@ -164,6 +176,34 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
     for (const runtime of store.runtimes()) readiness(runtime);
   }
 
+  function activity(runtime: RuntimeAttempt): { activity: string; attention?: string } {
+    let state = "awaiting native event";
+    let attention: string | undefined;
+    const pending = new Set<string>();
+    for (const observation of store.observations(1000).reverse()) {
+      if (observation.runtimeId !== runtime.id || observation.sessionId !== runtime.sessionId) continue;
+      const data = object(observation.data) ? observation.data : {};
+      if (observation.source === "codex-server-request") pending.add(String(data.requestId));
+      if (observation.source === "codex-app-server") {
+        if (observation.name === "serverRequest/resolved") pending.delete(String(data.requestId));
+        if (observation.name === "thread/status/changed" && object(data.status))
+          state = String(data.status.type);
+      }
+      if (observation.source !== "native-hook" || runtime.kind !== "claude") continue;
+      if (observation.name === "UserPromptSubmit") {
+        state = "turn started";
+        attention = undefined;
+      }
+      if (observation.name === "Stop") state = "turn completed";
+      if (observation.name === "PermissionRequest") attention = "Native permission request";
+      if (observation.name === "PermissionDenied") attention = "Native permission denied";
+      if (observation.name === "PostToolUse") attention = undefined;
+      if (observation.name === "SessionEnd") state = "session ended";
+    }
+    if (pending.size) attention = "Native approval pending";
+    return { activity: state, ...(attention ? { attention } : {}) };
+  }
+
   function holdBinding(runtime: RuntimeAttempt, name: string, data: unknown, revoke = false): void {
     confirmed.delete(runtime.id);
     channelConnected.delete(runtime.id);
@@ -218,6 +258,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
             : object(params.turn) && typeof params.turn.id === "string"
               ? params.turn.id
               : undefined;
+        if (method.endsWith("/delta") || method === "thread/tokenUsage/updated") return;
         store.appendObservation(runtime.id, {
           source: "codex-app-server",
           name: method,
@@ -488,6 +529,49 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
     name: string,
     args: Record<string, unknown>,
   ): unknown {
+    if (name.startsWith("bridge_task_")) {
+      if (!cfg.task) throw new Error("this run has no task");
+      const task = store.readTask(credential);
+      if (!task) throw new Error("task not found");
+      if (name === "bridge_task_read") {
+        fields(args, []);
+        return {
+          ...task,
+          role: runtime.id === task.implementerRuntimeId ? "implementer" : "reviewer",
+          baseCommit: cfg.task.baseCommit,
+        };
+      }
+      const identity = {
+        taskId: string(args.taskId, "taskId"),
+        expectedVersion: taskVersion(args.expectedVersion),
+      };
+      if (name === "bridge_task_claim") {
+        fields(args, ["taskId", "expectedVersion"]);
+        return store.claimTask(credential, identity);
+      }
+      if (name === "bridge_task_submit") {
+        fields(args, ["taskId", "expectedVersion", "commit", "summary"]);
+        if (runtime.id !== task.implementerRuntimeId)
+          throw new Error("only the assigned implementer can submit");
+        const commit = string(args.commit, "commit");
+        validateArtifact(cfg, commit);
+        return store.submitTask(credential, {
+          ...identity,
+          artifact: { commit, summary: string(args.summary, "summary") },
+        });
+      }
+      if (name === "bridge_task_review") {
+        fields(args, ["taskId", "expectedVersion", "decision", "summary"]);
+        if (args.decision !== "accept" && args.decision !== "changes_requested")
+          throw new Error("invalid review decision");
+        return store.reviewTask(credential, {
+          ...identity,
+          decision: args.decision,
+          summary: string(args.summary, "summary"),
+        });
+      }
+      throw new Error("unknown task tool");
+    }
     switch (name) {
       case "bridge_list_agents":
         return store.runtimes().map(({ agentId, kind, sessionId, ready, paused }) => ({
@@ -544,7 +628,12 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                   pilot: cfg.id,
                   endpoint,
                   run: store.run(cfg.runId),
-                  agents: store.runtimes(),
+                  agents: store.runtimes().map((runtime) => ({
+                    ...runtime,
+                    available: nativeAlive(runtime.agentId) && (runtime.kind !== "codex" || hostAlive()),
+                    ...activity(runtime),
+                  })),
+                  tasks: store.task() ? [store.task()] : [],
                   messages: store.messages(),
                   observations: store.observations(100),
                   threadIntent: existsSync(threadIntentFile) ? readPrivateJson(threadIntentFile) : null,
@@ -594,7 +683,9 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                   );
                 const requestId = randomUUID();
                 writePrivateJson(startFile, { state: "submitting", requestId });
-                const text = `Run the approved Agent Bridge nonce pilot. Use bridge_send_message to send exactly PING ${cfg.id} to claude, with idempotencyKey ${cfg.id}:ping. When the PONG reply arrives, call bridge_read_message and bridge_ack_message for its message ID, then report the nonce round trip complete. Do not edit files, run shell commands, or send further messages. Use only Bridge MCP tools.`;
+                const text = cfg.task
+                  ? reviewerPrompt(cfg)
+                  : `Run the approved Agent Bridge nonce pilot. Use bridge_send_message to send exactly PING ${cfg.id} to claude, with idempotencyKey ${cfg.id}:ping. When the PONG reply arrives, call bridge_read_message and bridge_ack_message for its message ID, then report the nonce round trip complete. Do not edit files, run shell commands, or send further messages. Use only Bridge MCP tools.`;
                 try {
                   const result = await codex.startOperatorTurn({ text, requestId });
                   writePrivateJson(startFile, { state: "accepted", ...result });
@@ -702,7 +793,12 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
   };
 }
 
-export async function pilotRequest(cfg: PilotConfig, path: string, body?: unknown): Promise<unknown> {
+export async function pilotRequest(
+  cfg: PilotConfig,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const endpoint = readPrivateJson<PilotEndpoint>(pilotFile(cfg.root, "endpoint.json"));
   const owner = processRecord(cfg.root, "coordinator");
   if (
@@ -721,7 +817,7 @@ export async function pilotRequest(cfg: PilotConfig, path: string, body?: unknow
     redirect: "error",
     headers: { authorization: `Bearer ${cfg.operatorToken}`, "content-type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(35_000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(35_000)]) : AbortSignal.timeout(35_000),
   });
   const data = await response.json();
   if (!response.ok)

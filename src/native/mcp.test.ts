@@ -151,7 +151,7 @@ describe("Bridge MCP tools", () => {
     await ready(f.server, "2024-11-05");
     await f.server.receive(rpc(2, "tools/list"));
     expect(f.packets().at(-1).result.tools).toEqual(BRIDGE_TOOLS);
-    const tools: Array<[string, Record<string, string>]> = [
+    const tools: Array<[string, Record<string, unknown>]> = [
       [
         "bridge_send_message",
         { to: "codex", body: "Review\nthis α result", idempotencyKey: "send-1", replyTo: "previous" },
@@ -160,7 +160,28 @@ describe("Bridge MCP tools", () => {
       ["bridge_ack_message", { messageId: "m1" }],
       ["bridge_list_agents", {}],
       ["bridge_inbox", {}],
+      ["bridge_task_read", {}],
+      ["bridge_task_claim", { taskId: "task-1", expectedVersion: 1 }],
+      [
+        "bridge_task_submit",
+        {
+          taskId: "task-1",
+          expectedVersion: 2,
+          commit: "a".repeat(40),
+          summary: "Changed source; tests passed.",
+        },
+      ],
+      [
+        "bridge_task_review",
+        {
+          taskId: "task-1",
+          expectedVersion: 3,
+          decision: "accept",
+          summary: "Independently verified source.",
+        },
+      ],
     ];
+    expect(BRIDGE_TOOLS.map((tool) => tool.name)).toEqual(tools.map(([name]) => name));
     for (const [name, args] of tools) {
       await f.server.receive(rpc(3, "tools/call", { name, arguments: args }));
       const call = f.calls.at(-1)!;
@@ -175,6 +196,103 @@ describe("Bridge MCP tools", () => {
     }
     expect(f.lines.join(" ")).not.toContain(env.AGENT_BRIDGE_TOKEN);
     expect(f.reports).toEqual([]);
+    await f.server.close();
+  });
+
+  test("declares strict versioned task schemas without caller-supplied roles or authority", async () => {
+    const tasks = BRIDGE_TOOLS.filter((tool) => tool.name.startsWith("bridge_task_"));
+    expect(tasks.map((tool) => tool.inputSchema.required)).toEqual([
+      [],
+      ["taskId", "expectedVersion"],
+      ["taskId", "expectedVersion", "commit", "summary"],
+      ["taskId", "expectedVersion", "decision", "summary"],
+    ]);
+    for (const tool of tasks) {
+      expect(tool.inputSchema.additionalProperties).toBe(false);
+      expect(tool.inputSchema.properties).not.toHaveProperty("role");
+      expect(tool.inputSchema.properties).not.toHaveProperty("authority");
+      if (tool.name !== "bridge_task_read") {
+        expect(tool.inputSchema.properties.expectedVersion).toEqual({
+          type: "integer",
+          minimum: 1,
+          maximum: Number.MAX_SAFE_INTEGER,
+        });
+      }
+    }
+    const review = tasks.find((tool) => tool.name === "bridge_task_review")!;
+    expect(review.inputSchema.properties.decision).toEqual({
+      type: "string",
+      enum: ["accept", "changes_requested"],
+    });
+  });
+
+  test("rejects malformed task transitions before HTTP and accepts declared version and summary bounds", async () => {
+    const f = fixture();
+    await ready(f.server);
+    const claim = { taskId: "task-1", expectedVersion: 1 };
+    const submit = { ...claim, commit: "a".repeat(40), summary: "Source verified." };
+    const review = { ...claim, decision: "accept", summary: "Source independently verified." };
+    const invalid: Array<[string, Record<string, unknown>]> = [
+      ["bridge_task_read", { taskId: "another-task" }],
+      ["bridge_task_claim", { taskId: "task-1" }],
+      ...[0, -1, 1.5, "1", null, true, Number.MAX_SAFE_INTEGER + 1].map(
+        (expectedVersion): [string, Record<string, unknown>] => [
+          "bridge_task_claim",
+          { ...claim, expectedVersion },
+        ],
+      ),
+      ["bridge_task_claim", { ...claim, role: "implementer" }],
+      ["bridge_task_claim", { ...claim, authority: "operator" }],
+      ["bridge_task_claim", { ...claim, taskId: " " }],
+      ["bridge_task_submit", { ...submit, commit: "HEAD" }],
+      ["bridge_task_submit", { ...submit, commit: "a".repeat(39) }],
+      ["bridge_task_submit", { ...submit, commit: "A".repeat(40) }],
+      ["bridge_task_submit", { ...submit, commit: "x".repeat(40) }],
+      ["bridge_task_submit", { ...submit, summary: " " }],
+      ["bridge_task_submit", { ...submit, summary: "x".repeat(4097) }],
+      ["bridge_task_review", { ...review, summary: "é".repeat(2049) }],
+      ["bridge_task_review", { ...review, decision: "approved" }],
+      ["bridge_task_review", { ...review, decision: true }],
+      ["bridge_task_review", { ...review, commit: "a".repeat(40) }],
+    ];
+    for (const [name, args] of invalid) {
+      await f.server.receive(rpc(2, "tools/call", { name, arguments: args }));
+      expect(f.packets().at(-1).result.isError).toBe(true);
+    }
+    expect(f.calls).toEqual([]);
+    const args = {
+      ...review,
+      expectedVersion: Number.MAX_SAFE_INTEGER,
+      decision: "changes_requested",
+      summary: "é".repeat(2048),
+    };
+    await f.server.receive(rpc(3, "tools/call", { name: "bridge_task_review", arguments: args }));
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]!.body).toEqual(args);
+    await f.server.close();
+  });
+
+  test("keeps failed task mutations uncertain without retrying or changing the submitted version", async () => {
+    const f = fixture({ response: () => new Response(null, { status: 409 }) });
+    await ready(f.server);
+    for (const [name, args] of [
+      ["bridge_task_claim", { taskId: "task-1", expectedVersion: 1 }],
+      [
+        "bridge_task_submit",
+        { taskId: "task-1", expectedVersion: 2, commit: "a".repeat(40), summary: "Implemented." },
+      ],
+      [
+        "bridge_task_review",
+        { taskId: "task-1", expectedVersion: 3, decision: "accept", summary: "Reviewed." },
+      ],
+    ] as const) {
+      const before = f.calls.length;
+      await f.server.receive(rpc(2, "tools/call", { name, arguments: args }));
+      expect(f.calls).toHaveLength(before + 1);
+      expect(f.calls.at(-1)!.body).toEqual(args);
+      expect(f.packets().at(-1).result.isError).toBe(true);
+    }
+    expect(f.lines.join(" ")).not.toContain(env.AGENT_BRIDGE_TOKEN);
     await f.server.close();
   });
 

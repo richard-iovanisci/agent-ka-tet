@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CoordinationError, openCoordinationStore } from "./store.ts";
-import type { CreateRunInput, CreateRuntimeInput, RuntimeKind } from "./types.ts";
+import type { CreateRunInput, CreateRuntimeInput, RuntimeKind, SubmitTaskInput } from "./types.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -498,5 +498,262 @@ describe("run limits and checkout ownership", () => {
     const reopened = f.open();
     expect(reopened.observations()).toEqual([appended]);
     code(() => reopened.observations(1001), "invalid");
+  });
+});
+
+describe("versioned task and review coordination", () => {
+  const artifact = { commit: "a".repeat(40), summary: "Implemented the requested artifact and checked it." };
+  function setup(limits: Partial<CreateRunInput> = {}) {
+    const f = fixture(limits);
+    const { claude, codex } = f.pair();
+    const task = f.store.createTask({
+      runId: f.run.id,
+      title: "Implement and review",
+      brief: "Produce an artifact; the reviewer must accept it.",
+      implementerRuntimeId: claude.runtime.id,
+      reviewerRuntimeId: codex.runtime.id,
+    });
+    const claim = () => f.store.claimTask(claude.token, { taskId: task.id, expectedVersion: 1 });
+    const submit = () => f.store.submitTask(claude.token, { taskId: task.id, expectedVersion: 2, artifact });
+    return { ...f, claude, codex, task, claim, submit };
+  }
+
+  test("creates one task before native binding without fabricating an agent notification", () => {
+    const f = fixture();
+    const claude = f.allocate("implementer", "claude");
+    const codex = f.allocate("reviewer", "codex");
+    const input = {
+      runId: f.run.id,
+      title: "Artifact",
+      brief: "Implement and review it.",
+      implementerRuntimeId: claude.runtime.id,
+      reviewerRuntimeId: codex.runtime.id,
+    };
+    code(() => f.store.createTask({ ...input, reviewerRuntimeId: claude.runtime.id }), "forbidden");
+    const task = f.store.createTask(input);
+    expect(task).toMatchObject({ ...input, state: "ready", version: 1, artifact: null, reviewSummary: null });
+    expect(f.store.task()).toEqual(task);
+    expect(f.store.messages()).toEqual([]);
+    code(() => f.store.createTask(input), "conflict");
+    code(() => f.store.readTask(claude.token), "unauthorized");
+    code(() => f.store.claimTask(claude.token, { taskId: task.id, expectedVersion: 1 }), "unauthorized");
+    f.bind(claude);
+    f.bind(codex);
+    expect(f.store.readTask(claude.token)).toEqual(task);
+    expect(f.store.readTask(codex.token, task.id)).toEqual(task);
+    const stranger = f.bind(f.allocate("other", "claude"));
+    code(() => f.store.readTask(stranger.token), "forbidden");
+    expect(JSON.stringify(task)).not.toContain(claude.token);
+    expect(JSON.stringify(task)).not.toContain("credential");
+  });
+
+  test("only assigned roles progress work, request changes, and accept the submitted artifact", () => {
+    const f = setup();
+    const input = { taskId: f.task.id, expectedVersion: 1 };
+    code(() => f.store.claimTask(f.codex.token, input), "forbidden");
+    code(() => f.store.submitTask(f.claude.token, { ...input, artifact }), "conflict");
+    expect(f.claim()).toMatchObject({ state: "working", version: 2, artifact: null });
+    expect(f.store.messages()).toHaveLength(0);
+    f.advance(5);
+    const submitted = f.submit();
+    expect(submitted.task).toMatchObject({ state: "review", version: 3, artifact, updatedAt: 1005 });
+    expect(submitted.notification.message).toMatchObject({
+      senderRuntimeId: f.claude.runtime.id,
+      recipientRuntimeId: f.codex.runtime.id,
+      recipientSessionId: f.codex.runtime.sessionId,
+      idempotencyKey: `task:${f.task.id}:v3`,
+    });
+    expect(JSON.parse(submitted.notification.message.body)).toEqual({
+      type: "task_transition", taskId: f.task.id, state: "review", version: 3, artifact, reviewSummary: null,
+    });
+    f.store.acknowledge(f.codex.token, submitted.notification.message.id);
+    expect(f.store.task()).toEqual(submitted.task);
+    const review = { taskId: f.task.id, expectedVersion: 3, decision: "changes_requested" as const, summary: "Add the missing check." };
+    code(() => f.store.reviewTask(f.claude.token, review), "forbidden");
+    const changes = f.store.reviewTask(f.codex.token, review);
+    expect(changes.task).toMatchObject({ state: "changes_requested", version: 4, reviewSummary: review.summary });
+    expect(changes.notification.message.recipientRuntimeId).toBe(f.claude.runtime.id);
+    expect(f.store.claimTask(f.claude.token, { taskId: f.task.id, expectedVersion: 4 })).toMatchObject({
+      state: "working", version: 5, reviewSummary: review.summary,
+    });
+    const revised = { commit: "b".repeat(40), summary: "Added the missing check." };
+    expect(f.store.submitTask(f.claude.token, { taskId: f.task.id, expectedVersion: 5, artifact: revised }).task)
+      .toMatchObject({ state: "review", version: 6, artifact: revised, reviewSummary: null });
+    const accepted = f.store.reviewTask(f.codex.token, {
+      taskId: f.task.id, expectedVersion: 6, decision: "accept", summary: "Verified the revised commit.",
+    });
+    expect(accepted.task).toMatchObject({ state: "accepted", version: 7, artifact: revised });
+    expect(accepted.notification.receipt).toMatchObject({ state: "prepared", application: "unread" });
+    code(() => f.store.claimTask(f.claude.token, { taskId: f.task.id, expectedVersion: 7 }), "conflict");
+    f.store.exitRuntime(f.claude.runtime.id);
+    f.store.exitRuntime(f.codex.runtime.id);
+    expect(f.store.task()).toEqual(accepted.task);
+    expect(f.store.messages()).toHaveLength(4);
+  });
+
+  test("independent store connections reject stale versions without duplicate transitions or notices", () => {
+    const f = setup();
+    const another = f.open();
+    f.claim();
+    code(() => another.claimTask(f.claude.token, { taskId: f.task.id, expectedVersion: 1 }), "conflict");
+    const submitted = another.submitTask(f.claude.token, { taskId: f.task.id, expectedVersion: 2, artifact });
+    code(() => f.submit(), "conflict");
+    const review = { taskId: f.task.id, expectedVersion: 3, decision: "accept" as const, summary: "Reviewed." };
+    const accepted = f.store.reviewTask(f.codex.token, review);
+    code(() => another.reviewTask(f.codex.token, review), "conflict");
+    expect(another.readTask(f.claude.token)).toEqual(accepted.task);
+    expect(another.messages()).toHaveLength(2);
+    expect(another.messages()[0]!.message.id).toBe(submitted.notification.message.id);
+  });
+
+  test("recovery preserves task state and never treats notification delivery as acceptance", () => {
+    const f = setup();
+    f.claim();
+    const submitted = f.submit();
+    f.store.claimDelivery(f.codex.runtime.id, "codex");
+    const reopened = f.open();
+    expect(reopened.task()).toEqual(submitted.task);
+    reopened.recover();
+    expect(reopened.task()).toEqual(submitted.task);
+    expect(reopened.messages()[0]!.receipt).toMatchObject({ state: "ambiguous", policy: "held" });
+    reopened.acknowledge(f.codex.token, submitted.notification.message.id);
+    reopened.exitRuntime(f.claude.runtime.id);
+    expect(reopened.task()).toEqual(submitted.task);
+    code(() => reopened.reviewTask(f.codex.token, {
+      taskId: f.task.id, expectedVersion: 3, decision: "accept", summary: "Reviewed.",
+    }), "unauthorized");
+    expect(reopened.task()).toEqual(submitted.task);
+  });
+
+  test("notification budgets roll back both submission and reviewer acceptance", () => {
+    const f = setup({ maxMessages: 1 });
+    const working = f.claim();
+    f.store.send(f.claude.token, { to: "reviewer", body: "Existing message", idempotencyKey: "existing" });
+    code(() => f.submit(), "limit");
+    expect(f.store.task()).toEqual(working);
+    expect(f.store.messages()).toHaveLength(1);
+
+    const g = setup({ maxMessages: 1 });
+    g.claim();
+    const submitted = g.submit();
+    code(() => g.store.reviewTask(g.codex.token, {
+      taskId: g.task.id, expectedVersion: 3, decision: "accept", summary: "Reviewed.",
+    }), "limit");
+    expect(g.store.task()).toEqual(submitted.task);
+    expect(g.store.messages()).toEqual([submitted.notification]);
+  });
+
+  test("task notices form exact reply chains and roll back when the follow-up limit is reached", () => {
+    const f = setup({ maxHops: 1 });
+    f.claim();
+    const submitted = f.submit();
+    const changes = f.store.reviewTask(f.codex.token, {
+      taskId: f.task.id, expectedVersion: 3, decision: "changes_requested", summary: "Revise it.",
+    });
+    expect(submitted.notification.message).toMatchObject({ replyTo: null, hops: 0 });
+    expect(changes.notification.message).toMatchObject({ replyTo: submitted.notification.message.id, hops: 1 });
+    const working = f.store.claimTask(f.claude.token, { taskId: f.task.id, expectedVersion: 4 });
+    code(() => f.store.submitTask(f.claude.token, {
+      taskId: f.task.id, expectedVersion: 5, artifact: { ...artifact, commit: "b".repeat(40) },
+    }), "limit");
+    expect(f.store.task()).toEqual(working);
+    expect(f.store.messages()).toHaveLength(2);
+    expect(f.store.receipt(f.codex.token, changes.notification.message.id).application).toBe("unread");
+    const reopened = f.open();
+    code(() => reopened.submitTask(f.claude.token, {
+      taskId: f.task.id, expectedVersion: 5, artifact,
+    }), "limit");
+    expect(reopened.task()).toEqual(working);
+  });
+
+  test("submission requires the assigned reviewer binding and leaves work intact while unavailable", () => {
+    const f = fixture();
+    const claude = f.bind(f.allocate("implementer", "claude"));
+    const codex = f.allocate("reviewer", "codex");
+    const task = f.store.createTask({
+      runId: f.run.id, title: "Artifact", brief: "Implement and review it.",
+      implementerRuntimeId: claude.runtime.id, reviewerRuntimeId: codex.runtime.id,
+    });
+    const working = f.store.claimTask(claude.token, { taskId: task.id, expectedVersion: 1 });
+    code(() => f.store.submitTask(claude.token, { taskId: task.id, expectedVersion: 2, artifact }), "unavailable");
+    expect(f.store.task()).toEqual(working);
+    expect(f.store.messages()).toHaveLength(0);
+    f.bind(codex);
+    expect(f.store.submitTask(claude.token, { taskId: task.id, expectedVersion: 2, artifact }).task.state).toBe("review");
+  });
+
+  test("adds the private notice pointer to an earlier task table without changing its task", () => {
+    const f = setup();
+    const working = f.claim();
+    const raw = new Database(f.path);
+    raw.exec("ALTER TABLE coordination_task DROP COLUMN last_notice_id");
+    raw.close();
+    const reopened = f.open();
+    expect(reopened.task()).toEqual(working);
+    expect(reopened.submitTask(f.claude.token, { taskId: f.task.id, expectedVersion: 2, artifact }).task.state).toBe("review");
+    expect(f.open().task()).toMatchObject({ state: "review", version: 3 });
+  });
+
+  test("a delivery-row failure rolls back the task and its already-inserted message", () => {
+    const f = setup();
+    const working = f.claim();
+    const raw = new Database(f.path);
+    raw.exec("CREATE TRIGGER reject_task_notice BEFORE INSERT ON delivery_attempt BEGIN SELECT RAISE(ABORT, 'fixture delivery failure'); END");
+    raw.close();
+    expect(() => f.submit()).toThrow("fixture delivery failure");
+    const reopened = f.open();
+    expect(reopened.task()).toEqual(working);
+    expect(reopened.messages()).toHaveLength(0);
+    expect(reopened.readTask(f.codex.token)).toEqual(working);
+  });
+
+  test("task participants never follow replacements with the same AgentId", () => {
+    const f = setup();
+    const working = f.claim();
+    f.store.revokeRuntime(f.codex.runtime.id);
+    const replacement = f.bind(f.allocate("reviewer", "codex"));
+    code(() => f.store.readTask(replacement.token), "forbidden");
+    code(() => f.store.reviewTask(replacement.token, {
+      taskId: f.task.id, expectedVersion: 2, decision: "accept", summary: "Pretend review.",
+    }), "forbidden");
+    code(() => f.submit(), "unauthorized");
+    expect(f.store.task()).toEqual(working);
+    expect(f.store.messages()).toHaveLength(0);
+  });
+
+  test("pause holds task notifications while expiry blocks mutations without erasing review state", () => {
+    const f = setup();
+    f.store.pauseRun(f.run.id, true);
+    f.claim();
+    const submitted = f.submit();
+    expect(submitted.notification.receipt.policy).toBe("held");
+    expect(f.store.claimDelivery(f.codex.runtime.id, "codex")).toBeNull();
+    f.advance(20_000);
+    code(() => f.store.reviewTask(f.codex.token, {
+      taskId: f.task.id, expectedVersion: 3, decision: "accept", summary: "Reviewed too late.",
+    }), "unavailable");
+    expect(f.store.readTask(f.codex.token)).toEqual(submitted.task);
+    expect(f.store.messages()[0]!.receipt.policy).toBe("expired");
+  });
+
+  test("rejects malformed versions, artifacts, extra authority, and preoccupied notice keys", () => {
+    const f = setup();
+    for (const expectedVersion of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1])
+      code(() => f.store.claimTask(f.claude.token, { taskId: f.task.id, expectedVersion }), "invalid");
+    code(() => f.store.claimTask(f.claude.token, { taskId: "x".repeat(257), expectedVersion: 1 }), "invalid");
+    f.claim();
+    const input = { taskId: f.task.id, expectedVersion: 2, artifact };
+    for (const commit of ["HEAD", "a".repeat(39), "a".repeat(64), "A".repeat(40)])
+      code(() => f.store.submitTask(f.claude.token, { ...input, artifact: { ...artifact, commit } }), "invalid");
+    for (const summary of [" ", "é".repeat(2049)])
+      code(() => f.store.submitTask(f.claude.token, { ...input, artifact: { ...artifact, summary } }), "invalid");
+    code(() => f.store.submitTask(f.claude.token, { ...input, reviewerRuntimeId: f.claude.runtime.id } as SubmitTaskInput), "invalid");
+    code(() => f.store.submitTask(f.claude.token, { ...input, artifact: null } as unknown as SubmitTaskInput), "invalid");
+    f.store.send(f.claude.token, {
+      to: "reviewer", body: "Preoccupied task key", idempotencyKey: `task:${f.task.id}:v3`,
+    });
+    code(() => f.submit(), "conflict");
+    expect(f.store.task()).toMatchObject({ state: "working", version: 2, artifact: null });
+    expect(f.store.messages()).toHaveLength(1);
   });
 });

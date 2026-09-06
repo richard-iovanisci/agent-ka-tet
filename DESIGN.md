@@ -18,6 +18,13 @@ scope, and limits. Peer work proceeds within that policy. Trust prompts, unavail
 ambiguity, and exhausted limits surface as Needs you. Completion requires an artifact and
 reviewer acceptance; idle turns and process exits never complete tasks.
 
+The first prototype fixes the roster to a Claude implementer and read-only Codex reviewer.
+Preparation clones a clean committed source into a private run directory outside that checkout,
+with independent Git objects and separate worktrees. Accepted linear commits export as a patch;
+the bridge never applies, merges, or pushes the result into the source project.
+Discard inherited Git environment overrides for both source inspection and native launches.
+Tracked Codex hook conflicts are refused before preparation until configuration reconciliation is implemented.
+
 ## Native runtime and identity
 
 - Each agent is an unmodified native TUI in a real tmux pane. Supported control endpoints address
@@ -41,7 +48,7 @@ reviewer acceptance; idle turns and process exits never complete tasks.
 ## Routes and delivery authority
 
 Source investigation used Claude Code **2.1.261** and Codex **0.153.4 (`3d2ee51`)**.
-The installed versions passed one authenticated nonce round trip; see `PROGRESS.md` for its limits.
+The installed versions passed an authenticated nonce round trip and task/review loop; see `PROGRESS.md`.
 This Codex build required experimental `historyMode: legacy` at startup and a native thread name
 to persist the empty thread before TUI resume. Peer ingress itself remains `turn/start` + `toolOutput`.
 
@@ -108,6 +115,11 @@ Keep implementer results separate from reviewer acceptance. Enforce one Bridge-a
 per canonical checkout from the first concurrent writers, including 1+1. Separate worktrees,
 harness-enforced read-only access, or serial assignment suffice; a reviewer label does not.
 
+Task states are `ready → working → review → accepted`, with `changes_requested → working` for
+revisions. Roles and brief are immutable. Submit and review atomically persist their notification;
+reply chains enforce the same message and hop limits. Submission verifies a clean implementer
+HEAD descended from the recorded base. The reviewer inspects that exact commit, not its own base checkout.
+
 Bridge enforces ownership among its assignments; harness sandbox/permissions enforce filesystem
 boundaries. Record those launch settings. Credential revocation ends Bridge access, not the native
 process. Expired ownership means unknown ownership. Reassignment requires verified exit of the old
@@ -143,6 +155,11 @@ Prepare secret-free Codex hook definitions before launch. Establish native proje
 trust in a setup TUI, then exit before creating the private host: an already-loaded untrusted
 project layer may keep its hooks disabled. Pilot Claude settings allow the five Bridge MCP tools
 explicitly; other native permissions remain unchanged.
+
+Task runs add four role-gated task tools. The private Codex host enables and pre-approves only
+those nine Bridge tools; Claude uses the same explicit allowlist with native default permissions.
+The console shows persisted start/task/receipt state, pauses on native entry, and requires explicit
+resume after detach or recovery. Closing the console leaves native sessions running.
 
 ## Proof gates
 

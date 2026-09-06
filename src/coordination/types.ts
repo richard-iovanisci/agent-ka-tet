@@ -114,6 +114,55 @@ export interface RuntimeObservation {
   createdAt: number;
 }
 
+export type TaskState = "ready" | "working" | "review" | "changes_requested" | "accepted";
+
+export interface TaskArtifact {
+  commit: string;
+  summary: string;
+}
+
+export interface Task {
+  id: string;
+  runId: string;
+  title: string;
+  brief: string;
+  implementerRuntimeId: string;
+  reviewerRuntimeId: string;
+  state: TaskState;
+  version: number;
+  artifact: TaskArtifact | null;
+  reviewSummary: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateTaskInput {
+  runId: string;
+  title: string;
+  brief: string;
+  implementerRuntimeId: string;
+  reviewerRuntimeId: string;
+}
+
+export interface TaskTransitionInput {
+  taskId: string;
+  expectedVersion: number;
+}
+
+export interface SubmitTaskInput extends TaskTransitionInput {
+  artifact: TaskArtifact;
+}
+
+export interface ReviewTaskInput extends TaskTransitionInput {
+  decision: "accept" | "changes_requested";
+  summary: string;
+}
+
+export interface TaskTransitionResult {
+  task: Task;
+  notification: MessageRecord;
+}
+
 export interface CoordinationStore {
   createRun(input: CreateRunInput): Run;
   run(id?: string): Run | null;
@@ -143,6 +192,12 @@ export interface CoordinationStore {
     observation: Omit<RuntimeObservation, "id" | "runtimeId" | "createdAt">,
   ): RuntimeObservation;
   observations(limit?: number): RuntimeObservation[];
+  createTask(input: CreateTaskInput): Task;
+  task(id?: string): Task | null;
+  readTask(token: string, taskId?: string): Task | null;
+  claimTask(token: string, input: TaskTransitionInput): Task;
+  submitTask(token: string, input: SubmitTaskInput): TaskTransitionResult;
+  reviewTask(token: string, input: ReviewTaskInput): TaskTransitionResult;
   recover(): void;
   close(): void;
 }

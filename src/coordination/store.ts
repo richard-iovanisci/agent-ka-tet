@@ -7,6 +7,7 @@ import type {
   CoordinationStore,
   CreateRunInput,
   CreateRuntimeInput,
+  CreateTaskInput,
   DeliveryOutcome,
   DeliveryReceipt,
   DeliveryRoute,
@@ -14,7 +15,13 @@ import type {
   Run,
   RuntimeAttempt,
   RuntimeObservation,
+  ReviewTaskInput,
   SendMessageInput,
+  SubmitTaskInput,
+  Task,
+  TaskState,
+  TaskTransitionInput,
+  TaskTransitionResult,
 } from "./types.ts";
 
 export class CoordinationError extends Error {
@@ -46,6 +53,16 @@ function requireText(value: string, field: string, maxBytes = 64 * 1024): void {
 function requireSession(value: string): void {
   if (typeof value !== "string" || !UUID.test(value))
     throw new CoordinationError("invalid", "native session must be an exact UUID");
+}
+
+function requireFields(value: unknown, allowed: string[]): void {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).some((key) => !allowed.includes(key))
+  )
+    throw new CoordinationError("invalid", "unsupported task fields");
 }
 
 function canonicalCheckout(path: string): string {
@@ -103,6 +120,13 @@ export function openCoordinationStore(path: string, options: { now?: () => numbe
     CREATE TABLE IF NOT EXISTS runtime_observation (
       id INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL REFERENCES runtime_attempt(id), value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS coordination_task (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES coordination_run(id),
+      implementer_id TEXT NOT NULL REFERENCES runtime_attempt(id),
+      reviewer_id TEXT NOT NULL REFERENCES runtime_attempt(id), version INTEGER NOT NULL, value TEXT NOT NULL,
+      last_notice_id TEXT REFERENCES bridge_message(id),
+      CHECK (implementer_id != reviewer_id)
+    );
   `);
   const now = options.now ?? Date.now;
   const get = <T>(sql: string, ...args: SQLQueryBindings[]): T | null =>
@@ -111,6 +135,10 @@ export function openCoordinationStore(path: string, options: { now?: () => numbe
     db.query<T, SQLQueryBindings[]>(sql).all(...args);
   const write = (sql: string, ...args: SQLQueryBindings[]) => db.query(sql).run(...args);
   const atomic = <T>(fn: () => T): T => db.transaction(fn).immediate();
+  atomic(() => {
+    if (!all<{ name: string }>("PRAGMA table_info(coordination_task)").some((column) => column.name === "last_notice_id"))
+      db.exec("ALTER TABLE coordination_task ADD COLUMN last_notice_id TEXT REFERENCES bridge_message(id)");
+  });
 
   function run(id?: string): Run | null {
     const row =
@@ -457,6 +485,175 @@ export function openCoordinationStore(path: string, options: { now?: () => numbe
     return found;
   }
 
+  function task(id?: string): Task | null {
+    if (id !== undefined) requireText(id, "taskId", 256);
+    const row =
+      id === undefined
+        ? get<{ value: string }>("SELECT value FROM coordination_task LIMIT 1")
+        : get<{ value: string }>("SELECT value FROM coordination_task WHERE id = ?", id);
+    return row === null ? null : (JSON.parse(row.value) as Task);
+  }
+
+  function createTask(input: CreateTaskInput): Task {
+    requireFields(input, ["runId", "title", "brief", "implementerRuntimeId", "reviewerRuntimeId"]);
+    requireText(input.title, "title", 256);
+    requireText(input.brief, "brief");
+    return atomic(() => {
+      const current = requireRun(input.runId);
+      if (current.expiresAt <= now()) throw new CoordinationError("unavailable", "run has expired");
+      const implementer = active(input.implementerRuntimeId);
+      const reviewer = active(input.reviewerRuntimeId);
+      if (implementer.id === reviewer.id || [implementer, reviewer].some((r) => r.runId !== current.id))
+        throw new CoordinationError("forbidden", "task roles require distinct runtimes in the same run");
+      if (get("SELECT id FROM coordination_task WHERE run_id = ?", current.id))
+        throw new CoordinationError("conflict", "pilot run already has a task");
+      const createdAt = now();
+      const value: Task = {
+        id: randomUUID(),
+        runId: current.id,
+        title: input.title,
+        brief: input.brief,
+        implementerRuntimeId: implementer.id,
+        reviewerRuntimeId: reviewer.id,
+        state: "ready",
+        version: 1,
+        artifact: null,
+        reviewSummary: null,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      write(
+        "INSERT INTO coordination_task (id, run_id, implementer_id, reviewer_id, version, value) VALUES (?, ?, ?, ?, ?, ?)",
+        value.id,
+        value.runId,
+        implementer.id,
+        reviewer.id,
+        value.version,
+        JSON.stringify(value),
+      );
+      return value;
+    });
+  }
+
+  function readTask(token: string, taskId?: string): Task | null {
+    const caller = authenticate(token);
+    const found = task(taskId);
+    if (
+      found &&
+      (caller.runId !== found.runId ||
+        ![found.implementerRuntimeId, found.reviewerRuntimeId].includes(caller.id))
+    )
+      throw new CoordinationError("forbidden", "task belongs to other runtime attempts");
+    return found;
+  }
+
+  function changingTask(
+    token: string,
+    input: TaskTransitionInput,
+    role: "implementerRuntimeId" | "reviewerRuntimeId",
+    states: TaskState[],
+  ): Task {
+    requireText(input.taskId, "taskId", 256);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1)
+      throw new CoordinationError("invalid", "expectedVersion must be a positive safe integer");
+    const caller = authenticate(token);
+    const current = task(input.taskId);
+    if (!current) throw new CoordinationError("not_found", "task not found");
+    if (current[role] !== caller.id || current.runId !== caller.runId)
+      throw new CoordinationError("forbidden", "task transition belongs to the assigned runtime");
+    if (current.version !== input.expectedVersion || !states.includes(current.state))
+      throw new CoordinationError("conflict", "task version or state changed");
+    if (requireRun(current.runId).expiresAt <= now())
+      throw new CoordinationError("unavailable", "run has expired");
+    return current;
+  }
+
+  function advanceTask(
+    current: Task,
+    changes: Partial<Pick<Task, "state" | "artifact" | "reviewSummary">>,
+  ): Task {
+    const next = { ...current, ...changes, version: current.version + 1, updatedAt: now() };
+    if (!Number.isSafeInteger(next.version)) throw new CoordinationError("limit", "task version limit reached");
+    const updated = write(
+      "UPDATE coordination_task SET version = ?, value = ? WHERE id = ? AND version = ?",
+      next.version,
+      JSON.stringify(next),
+      current.id,
+      current.version,
+    );
+    if (updated.changes !== 1) throw new CoordinationError("conflict", "task version changed");
+    return next;
+  }
+
+  function notifyTask(token: string, current: Task, recipientId: string): TaskTransitionResult {
+    const target = active(recipientId);
+    const sender = authenticate(token);
+    const idempotencyKey = `task:${current.id}:v${current.version}`;
+    if (
+      get("SELECT id FROM bridge_message WHERE sender_id = ? AND idempotency_key = ?", sender.id, idempotencyKey)
+    )
+      throw new CoordinationError("conflict", "task notification key is already in use");
+    const previous = get<{ last_notice_id: string | null }>(
+      "SELECT last_notice_id FROM coordination_task WHERE id = ?", current.id,
+    )!.last_notice_id;
+    const notification = send(token, {
+      to: target.agentId,
+      idempotencyKey,
+      ...(previous ? { replyTo: previous } : {}),
+      body: JSON.stringify({
+        type: "task_transition",
+        taskId: current.id,
+        state: current.state,
+        version: current.version,
+        artifact: current.artifact,
+        reviewSummary: current.reviewSummary,
+      }),
+    });
+    if (notification.message.recipientRuntimeId !== recipientId)
+      throw new CoordinationError("conflict", "task notification recipient changed");
+    write("UPDATE coordination_task SET last_notice_id = ? WHERE id = ?", notification.message.id, current.id);
+    return { task: current, notification };
+  }
+
+  function claimTask(token: string, input: TaskTransitionInput): Task {
+    requireFields(input, ["taskId", "expectedVersion"]);
+    return atomic(() =>
+      advanceTask(changingTask(token, input, "implementerRuntimeId", ["ready", "changes_requested"]), {
+        state: "working",
+      }),
+    );
+  }
+
+  function submitTask(token: string, input: SubmitTaskInput): TaskTransitionResult {
+    requireFields(input, ["taskId", "expectedVersion", "artifact"]);
+    requireFields(input.artifact, ["commit", "summary"]);
+    if (typeof input.artifact.commit !== "string" || !/^[a-f0-9]{40}$/.test(input.artifact.commit))
+      throw new CoordinationError("invalid", "artifact commit must be a full lowercase SHA-1");
+    requireText(input.artifact.summary, "artifact summary", 4096);
+    return atomic(() => {
+      const current = changingTask(token, input, "implementerRuntimeId", ["working"]);
+      const next = advanceTask(current, {
+        state: "review", artifact: { ...input.artifact }, reviewSummary: null,
+      });
+      return notifyTask(token, next, current.reviewerRuntimeId);
+    });
+  }
+
+  function reviewTask(token: string, input: ReviewTaskInput): TaskTransitionResult {
+    requireFields(input, ["taskId", "expectedVersion", "decision", "summary"]);
+    if (!["accept", "changes_requested"].includes(input.decision))
+      throw new CoordinationError("invalid", "unsupported review decision");
+    requireText(input.summary, "review summary", 4096);
+    return atomic(() => {
+      const current = changingTask(token, input, "reviewerRuntimeId", ["review"]);
+      const next = advanceTask(current, {
+        state: input.decision === "accept" ? "accepted" : "changes_requested",
+        reviewSummary: input.summary,
+      });
+      return notifyTask(token, next, current.implementerRuntimeId);
+    });
+  }
+
   function observeApplication(token: string, messageId: string, acknowledge: boolean): MessageRecord {
     return atomic(() => {
       recipientRecord(token, messageId);
@@ -599,6 +796,12 @@ export function openCoordinationStore(path: string, options: { now?: () => numbe
     claimDelivery,
     observeDelivery,
     finishDelivery,
+    createTask,
+    task,
+    readTask,
+    claimTask,
+    submitTask,
+    reviewTask,
     runtimes: () =>
       all<{ id: string }>("SELECT id FROM runtime_attempt ORDER BY created_at, rowid").map((row) =>
         runtime(row.id),

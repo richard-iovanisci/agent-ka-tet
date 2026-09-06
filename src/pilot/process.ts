@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   agentFile,
+  bridgeToolNames,
   loadPilot,
   pilotFile,
   readPrivateJson,
@@ -10,6 +11,7 @@ import {
 } from "./config.ts";
 import { recordProcess } from "./processState.ts";
 import { startPilotServer } from "./server.ts";
+import { implementerPrompt } from "../run/prompts.ts";
 
 export async function runProcess(role: string, root: string, agentId?: string): Promise<number> {
   const cfg = loadPilot(root);
@@ -40,7 +42,7 @@ export async function runProcess(role: string, root: string, agentId?: string): 
   if (!agent || !["codex-host", "agent"].includes(role)) throw new Error("invalid pilot process role");
   const processRole = role === "agent" ? agent.id : role;
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_"))),
     AGENT_BRIDGE_URL: `http://127.0.0.1:${endpoint.port}`,
     AGENT_BRIDGE_TOKEN: agent.token,
   };
@@ -54,6 +56,16 @@ export async function runProcess(role: string, root: string, agentId?: string): 
       `mcp_servers.agent_bridge.args=${JSON.stringify([sourceFile("../native/mcp.ts")])}`,
       "-c",
       `mcp_servers.agent_bridge.env_vars=${JSON.stringify(["AGENT_BRIDGE_URL", "AGENT_BRIDGE_TOKEN"])}`,
+      ...(cfg.task
+        ? [
+            "-c",
+            `mcp_servers.agent_bridge.enabled_tools=${JSON.stringify(bridgeToolNames(cfg))}`,
+            ...bridgeToolNames(cfg).flatMap((name) => [
+              "-c",
+              `mcp_servers.agent_bridge.tools.${name}.approval_mode="approve"`,
+            ]),
+          ]
+        : []),
       "app-server",
       "--listen",
       `unix://${cfg.socketPath}`,
@@ -75,10 +87,13 @@ export async function runProcess(role: string, root: string, agentId?: string): 
       "--mcp-config",
       pilotFile(root, "claude.mcp.json"),
       "--strict-mcp-config",
+      ...(cfg.task ? ["--permission-mode", "default"] : []),
       "--dangerously-load-development-channels",
       "server:agent-bridge",
       "--append-system-prompt",
-      `The operator approved the Agent Bridge nonce pilot ${cfg.id}. For a Bridge Channel notification, read the message with bridge_read_message and acknowledge it with bridge_ack_message. If the peer body is exactly PING ${cfg.id}, reply to codex with exactly PONG ${cfg.id}, idempotencyKey ${cfg.id}:pong, and replyTo the incoming message ID. Use only Bridge MCP tools; do not edit files, run commands, or send further replies. Keep the native permission controls.`,
+      cfg.task
+        ? implementerPrompt(cfg)
+        : `The operator approved the Agent Bridge nonce pilot ${cfg.id}. For a Bridge Channel notification, read the message with bridge_read_message and acknowledge it with bridge_ack_message. If the peer body is exactly PING ${cfg.id}, reply to codex with exactly PONG ${cfg.id}, idempotencyKey ${cfg.id}:pong, and replyTo the incoming message ID. Use only Bridge MCP tools; do not edit files, run commands, or send further replies. Keep the native permission controls.`,
     ];
   }
   recordProcess(root, processRole);

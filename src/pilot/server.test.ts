@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { MessageRecord, Run, RuntimeAttempt, RuntimeObservation } from "../coordination/types.ts";
 import {
   CodexRequestError,
@@ -94,8 +95,11 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function fixture(options: Omit<PilotServerOptions, "connect"> = {}) {
-  const cfg = preparePilot();
+function fixture(options: Omit<PilotServerOptions, "connect"> = {}, task = false) {
+  const source = task ? preparePilot() : null;
+  const cfg = task
+    ? preparePilot(undefined, { project: source!.repo, brief: "Add a checked artifact." })
+    : preparePilot();
   const native = new FakeCodex();
   let server = startPilotServer(cfg, {
     nativeAlive: () => true,
@@ -108,6 +112,10 @@ function fixture(options: Omit<PilotServerOptions, "connect"> = {}) {
     await server.stop();
     rmSync(cfg.socketDir, { recursive: true, force: true });
     rmSync(cfg.root, { recursive: true, force: true });
+    if (source) {
+      rmSync(source.socketDir, { recursive: true, force: true });
+      rmSync(source.root, { recursive: true, force: true });
+    }
   });
   async function request(path: string, body?: unknown, credential = cfg.operatorToken) {
     const response = await fetch(`http://127.0.0.1:${server.endpoint.port}${path}`, {
@@ -179,6 +187,85 @@ async function until(predicate: () => Promise<boolean>, timeout = 2_000) {
 }
 
 describe("native pilot coordinator", () => {
+  test("runs versioned implementation and review through authenticated tools with a real Git artifact", async () => {
+    const f = fixture({}, true);
+    await f.ready();
+    expect((await f.request("/operator/start", {})).status).toBe(200);
+    expect(f.native.operators[0]!.text).toContain("read-only worktree");
+    expect(f.native.operators[0]!.text).not.toContain("PING");
+    const initial = (await f.tool("claude", "bridge_task_read")).data;
+    expect(initial.role).toBe("implementer");
+    expect(initial.baseCommit).toBe(f.cfg.task!.baseCommit);
+    expect(
+      (await f.tool("codex", "bridge_task_claim", { taskId: initial.id, expectedVersion: 1 })).status,
+    ).toBe(400);
+    expect(
+      (await f.tool("claude", "bridge_task_claim", { taskId: initial.id, expectedVersion: 1 })).status,
+    ).toBe(200);
+    const workspace = f.agent("claude").workspace;
+    writeFileSync(join(workspace, "artifact.txt"), "checked result\n");
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args],
+        { cwd: workspace, stdout: "pipe", stderr: "pipe" },
+      );
+      if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+      return result.stdout.toString().trim();
+    };
+    git("add", "artifact.txt");
+    git(
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@localhost",
+      "commit",
+      "-m",
+      "Add checked artifact",
+    );
+    const commit = git("rev-parse", "HEAD");
+    expect(
+      (
+        await f.tool("codex", "bridge_task_submit", {
+          taskId: initial.id,
+          expectedVersion: 2,
+          commit,
+          summary: "forged",
+        })
+      ).status,
+    ).toBe(400);
+    const submitted = await f.tool("claude", "bridge_task_submit", {
+      taskId: initial.id,
+      expectedVersion: 2,
+      commit,
+      summary: "Tests passed.",
+    });
+    expect(submitted.status).toBe(200);
+    expect(submitted.data.task.state).toBe("review");
+    expect(submitted.data.notification.message.recipientAgentId).toBe("codex");
+    expect(
+      (
+        await f.tool("claude", "bridge_task_review", {
+          taskId: initial.id,
+          expectedVersion: 3,
+          decision: "accept",
+          summary: "self review",
+        })
+      ).status,
+    ).toBe(400);
+    const reviewed = await f.tool("codex", "bridge_task_review", {
+      taskId: initial.id,
+      expectedVersion: 3,
+      decision: "accept",
+      summary: "Inspected exact commit.",
+    });
+    expect(reviewed.status).toBe(200);
+    expect(reviewed.data.task.state).toBe("accepted");
+    expect(reviewed.data.notification.message.replyTo).toBe(submitted.data.notification.message.id);
+    await f.restart();
+    expect((await f.request("/operator/status")).data.tasks[0].artifact.commit).toBe(commit);
+    expect((await f.request("/operator/status")).data.tasks[0].state).toBe("accepted");
+  });
+
   test("keeps operator and unbound runtime credentials separate", async () => {
     const f = fixture();
     expect((await f.request("/operator/status", undefined, "wrong")).status).toBe(401);

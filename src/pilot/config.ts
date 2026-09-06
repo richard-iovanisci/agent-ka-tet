@@ -41,6 +41,7 @@ export interface PilotConfig {
   operatorToken: string;
   runId: string;
   codexHistoryMode?: "legacy";
+  task?: { sourceRepo: string; baseCommit: string };
   agents: PilotAgent[];
 }
 
@@ -108,6 +109,13 @@ function validatePilot(cfg: PilotConfig, canonical: string): void {
   if (cfg.codexHistoryMode !== undefined && cfg.codexHistoryMode !== "legacy")
     throw new Error("unsupported pilot Codex history mode");
   if (
+    cfg.task &&
+    (typeof cfg.task.sourceRepo !== "string" ||
+      !cfg.task.sourceRepo.startsWith("/") ||
+      !/^[a-f0-9]{40}$/.test(cfg.task.baseCommit))
+  )
+    throw new Error("invalid task source");
+  if (
     !Array.isArray(cfg.agents) ||
     cfg.agents.length !== 2 ||
     cfg.agents.some(
@@ -163,13 +171,14 @@ function validatePilot(cfg: PilotConfig, canonical: string): void {
             agent_id: string;
             kind: string;
             workspace: string;
+            access: string;
             credential_hash: string;
             expected_session_id: string | null;
             session_id: string | null;
           },
           [string]
         >(
-          "SELECT run_id, agent_id, kind, workspace, credential_hash, expected_session_id, session_id FROM runtime_attempt WHERE id = ?",
+          "SELECT run_id, agent_id, kind, workspace, access, credential_hash, expected_session_id, session_id FROM runtime_attempt WHERE id = ?",
         )
         .get(agent.runtimeId);
       if (
@@ -178,11 +187,27 @@ function validatePilot(cfg: PilotConfig, canonical: string): void {
         runtime.agent_id !== agent.id ||
         runtime.kind !== agent.kind ||
         runtime.workspace !== agent.workspace ||
+        runtime.access !== (cfg.task && agent.kind === "codex" ? "read" : "write") ||
         runtime.credential_hash !== createHash("sha256").update(agent.token).digest("hex") ||
         (agent.kind === "claude" && runtime.expected_session_id !== agent.sessionId) ||
         (runtime.session_id !== null && runtime.session_id !== runtime.expected_session_id)
       )
         throw new Error("pilot runtime does not match persisted state");
+    }
+    if (cfg.task) {
+      const task = db
+        .query<
+          { implementer_id: string; reviewer_id: string },
+          [string]
+        >("SELECT implementer_id, reviewer_id FROM coordination_task WHERE run_id = ?")
+        .get(cfg.runId);
+      if (
+        !task ||
+        task.implementer_id !== cfg.agents[0]!.runtimeId ||
+        task.reviewer_id !== cfg.agents[1]!.runtimeId ||
+        git(cfg.repo, ["rev-parse", "HEAD"]) !== cfg.task.baseCommit
+      )
+        throw new Error("task configuration does not match persisted state");
     }
   } finally {
     db.close();
@@ -200,57 +225,123 @@ export function loadPilot(root: string): PilotConfig {
   return cfg;
 }
 
-function git(cwd: string, args: string[]): void {
+function git(cwd: string, args: string[]): string {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")));
   const result = Bun.spawnSync(
-    ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args],
-    { cwd, stdout: "pipe", stderr: "pipe" },
+    [
+      "git",
+      "--no-replace-objects",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "commit.gpgSign=false",
+      ...args,
+    ],
+    {
+      cwd,
+      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
   );
   if (result.exitCode !== 0) throw new Error(result.stderr.toString().trim());
+  return result.stdout.toString().trim();
 }
 
-export function preparePilot(directory?: string): PilotConfig {
-  const proposed =
-    directory === undefined ? mkdtempSync(join(tmpdir(), "bridge-pilot-")) : resolve(directory);
-  if (directory !== undefined) {
-    if (existsSync(proposed)) throw new Error("pilot directory already exists");
-    mkdirSync(proposed, { recursive: true, mode: 0o700 });
+export function preparePilot(directory?: string, task?: { project: string; brief: string }): PilotConfig {
+  let source: { sourceRepo: string; baseCommit: string } | undefined;
+  if (task) {
+    if (!task.brief.trim() || Buffer.byteLength(task.brief) > 64 * 1024)
+      throw new Error("task brief must contain 1–65536 bytes");
+    const sourceRepo = realpathSync(git(realpathSync(task.project), ["rev-parse", "--show-toplevel"]));
+    if (git(sourceRepo, ["status", "--porcelain"]))
+      throw new Error("source checkout has uncommitted changes; commit or stash them before preparing a run");
+    const baseCommit = git(sourceRepo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("the prototype requires a SHA-1 Git repository");
+    const trackedPaths = git(sourceRepo, ["ls-tree", "-r", "-z", "--name-only", baseCommit, "--"])
+      .split("\0")
+      .map((path) => path.toLowerCase());
+    if (
+      trackedPaths.some(
+        (path) => path === ".codex" || path === ".codex/hooks.json" || path.startsWith(".codex/hooks.json/"),
+      )
+    )
+      throw new Error(
+        "the prototype cannot reconcile tracked .codex/hooks.json or a non-directory .codex path",
+      );
+    source = { sourceRepo, baseCommit };
   }
+  const proposed = resolve(directory ?? join(tmpdir(), `bridge-pilot-${randomUUID()}`));
+  if (existsSync(proposed)) throw new Error("pilot directory already exists");
+  if (source) {
+    let ancestor = proposed;
+    const tail: string[] = [];
+    while (!existsSync(ancestor)) {
+      tail.unshift(basename(ancestor));
+      ancestor = dirname(ancestor);
+    }
+    const canonical = join(realpathSync(ancestor), ...tail);
+    if (canonical === source.sourceRepo || canonical.startsWith(`${source.sourceRepo}/`))
+      throw new Error("run directory must be outside the source checkout");
+  }
+  mkdirSync(proposed, { recursive: true, mode: 0o700 });
   chmodSync(proposed, 0o700);
   const root = realpathSync(proposed);
   const id = randomBytes(6).toString("hex");
   const repo = join(root, "repo");
-  mkdirSync(repo);
-  git(repo, ["init", "--quiet", "--template=", "--initial-branch=main"]);
-  writeFileSync(
-    join(repo, "README.md"),
-    "# Agent Bridge native messaging pilot\n\nThis disposable repository contains no production work.\n",
-  );
-  writeFileSync(join(repo, ".gitignore"), ".claude/\n.codex/\n");
-  git(repo, ["add", "README.md", ".gitignore"]);
-  git(repo, [
-    "-c",
-    "user.name=Agent Bridge",
-    "-c",
-    "user.email=bridge@localhost",
-    "commit",
-    "--quiet",
-    "-m",
-    "Initialize isolated native pilot",
-  ]);
+  if (source) {
+    git(root, ["clone", "--quiet", "--no-hardlinks", "--template=", "--", source.sourceRepo, repo]);
+    git(repo, ["checkout", "--quiet", "--detach", source.baseCommit]);
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    writeFileSync(join(repo, ".git", "info", "exclude"), ".claude/\n.codex/\n");
+  } else {
+    mkdirSync(repo);
+    git(repo, ["init", "--quiet", "--template=", "--initial-branch=main"]);
+    writeFileSync(
+      join(repo, "README.md"),
+      "# Agent Bridge native messaging pilot\n\nThis disposable repository contains no production work.\n",
+    );
+    writeFileSync(join(repo, ".gitignore"), ".claude/\n.codex/\n");
+    git(repo, ["add", "README.md", ".gitignore"]);
+    git(repo, [
+      "-c",
+      "user.name=Agent Bridge",
+      "-c",
+      "user.email=bridge@localhost",
+      "commit",
+      "--quiet",
+      "-m",
+      "Initialize isolated native pilot",
+    ]);
+  }
   const store = openCoordinationStore(join(root, "pilot.sqlite"));
   let cfg: PilotConfig;
   try {
-    const run = store.createRun({ brief: "S9/S13 native peer round trip", maxMessages: 8, maxHops: 4 });
+    const run = store.createRun({
+      brief: task?.brief.trim() ?? "S9/S13 native peer round trip",
+      maxMessages: task ? 32 : 8,
+      maxHops: task ? 8 : 4,
+      ...(task ? { expiresAt: Date.now() + 4 * 60 * 60 * 1000 } : {}),
+    });
     const agents = (["claude", "codex"] as const).map((kind) => {
       const workspace = join(root, kind);
-      git(repo, ["worktree", "add", "--quiet", "-b", `pilot/${kind}`, workspace]);
+      git(repo, [
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        task ? `bridge/${id}/${kind}` : `pilot/${kind}`,
+        workspace,
+      ]);
       const sessionId = kind === "claude" ? randomUUID() : undefined;
       const { runtime, token } = store.createRuntime({
         runId: run.id,
         agentId: kind,
         kind,
         workspace,
-        access: "write",
+        access: task && kind === "codex" ? "read" : "write",
         ...(sessionId ? { expectedSessionId: sessionId } : {}),
       });
       return { id: kind, kind, workspace, runtimeId: runtime.id, token, ...(sessionId ? { sessionId } : {}) };
@@ -271,8 +362,17 @@ export function preparePilot(directory?: string): PilotConfig {
       operatorToken: randomBytes(32).toString("hex"),
       runId: run.id,
       codexHistoryMode: "legacy",
+      ...(source ? { task: source } : {}),
       agents,
     };
+    if (task)
+      store.createTask({
+        runId: run.id,
+        title: task.brief.trim().split("\n")[0]!.slice(0, 80),
+        brief: task.brief.trim(),
+        implementerRuntimeId: agents[0]!.runtimeId,
+        reviewerRuntimeId: agents[1]!.runtimeId,
+      });
     writePrivateJson(pilotFile(root, "pilot.json"), cfg);
     const bridge = `${shellQuote(process.execPath)} ${shellQuote(sourceFile("../../bin/bridge"))} pilot`;
     const target = shellQuote(root);
@@ -351,7 +451,62 @@ export function preparePilot(directory?: string): PilotConfig {
   }
   chmodSync(cfg.db, 0o600);
   writeCodexHooks(cfg);
+  if (task) writeTaskPlan(cfg);
   return cfg;
+}
+
+function writeTaskPlan(cfg: PilotConfig): void {
+  const bridge = `${shellQuote(process.execPath)} ${shellQuote(sourceFile("../../bin/bridge"))} run`;
+  const root = shellQuote(cfg.root);
+  writeFileSync(
+    pilotFile(cfg.root, "PLAN.md"),
+    [
+      "# Native agent pair",
+      "",
+      "Claude implements in its own worktree. Codex reviews the committed artifact with read-only access.",
+      "The source checkout is untouched. A task finishes only after reviewer acceptance.",
+      "",
+      "## Setup",
+      "",
+      "Review the prepared project and seven hooks in this setup Codex TUI, then exit without a prompt:",
+      "",
+      "```sh",
+      `env -u AGENT_BRIDGE_URL -u AGENT_BRIDGE_TOKEN codex -c 'model_reasoning_effort="ultra"' --model gpt-6-astra --cd ${shellQuote(cfg.repo)}`,
+      "```",
+      "",
+      "Launch the native pair, review Claude's project/Channel prompts and both native sessions, then detach:",
+      "",
+      "```sh",
+      `${bridge} launch ${root} --live`,
+      `${bridge} attach ${root}`,
+      "```",
+      "",
+      "The nine Bridge tools are pre-approved for this run. Shell and filesystem permissions remain native.",
+      "Codex uses experimental legacy history on its private host. The budget is 32 messages and four hours.",
+      "",
+      "```sh",
+      `${bridge} console ${root}`,
+      "```",
+      "",
+      "Select each agent and press r after checking its native TUI. Press s to start the task.",
+      "Enter opens the selected native session; Ctrl-b d returns. Entry pauses delivery until r resumes it.",
+      "q closes only the console. Use the native TUI for permission prompts; peer messages cannot approve them.",
+      "",
+      "## Finish",
+      "",
+      "Inspect the accepted commit in the console. Export it without changing the source checkout:",
+      "",
+      "```sh",
+      `${bridge} export ${root}`,
+      `${bridge} stop ${root}`,
+      "```",
+      "",
+      "If the coordinator fails, use run recover; unconfirmed sends remain held and are never replayed.",
+      "Native agents retain their sessions. Trust changes after host startup require a fresh run.",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
 }
 
 function writeCodexHooks(cfg: PilotConfig): void {
@@ -410,14 +565,23 @@ export function writeNativeConfig(cfg: PilotConfig, endpoint: PilotEndpoint): vo
   ]) {
     hooks[event] = [{ hooks: [http] }];
   }
-  const allow = ["send_message", "read_message", "ack_message", "list_agents", "inbox"].map(
-    (name) => `mcp__agent-bridge__bridge_${name}`,
-  );
+  const allow = bridgeToolNames(cfg).map((name) => `mcp__agent-bridge__${name}`);
   writeNativeJson(pilotFile(cfg.root, "claude.settings.json"), { hooks, permissions: { allow } });
   writeNativeJson(pilotFile(cfg.root, "claude.mcp.json"), {
     mcpServers: { "agent-bridge": { command: process.execPath, args: [mcp, "--channel"] } },
   });
   writeCodexHooks(cfg);
+}
+
+export function bridgeToolNames(cfg: PilotConfig): string[] {
+  return [
+    "send_message",
+    "read_message",
+    "ack_message",
+    "list_agents",
+    "inbox",
+    ...(cfg.task ? ["task_read", "task_claim", "task_submit", "task_review"] : []),
+  ].map((name) => `bridge_${name}`);
 }
 
 export function shellQuote(value: string): string {

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -30,6 +32,7 @@ import {
   type PilotEndpoint,
 } from "./config.ts";
 import { openCoordinationStore } from "../coordination/store.ts";
+import type { Run, Task } from "../coordination/types.ts";
 
 const cleanup: string[] = [];
 const endpoint: PilotEndpoint = {
@@ -56,9 +59,45 @@ function pilot(): PilotConfig {
 }
 
 function git(cwd: string, ...args: string[]): string {
-  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  const result = Bun.spawnSync(
+    ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args],
+    {
+      cwd,
+      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   return result.stdout.toString().trim();
+}
+
+function sourceRepository() {
+  const source = directory();
+  git(source, "init", "--quiet", "--template=", "--initial-branch=main");
+  writeFileSync(join(source, "artifact.txt"), "committed source\n");
+  git(source, "add", "artifact.txt");
+  git(
+    source,
+    "-c",
+    "user.name=Bridge fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "--quiet",
+    "-m",
+    "Committed source",
+  );
+  return { source, baseCommit: git(source, "rev-parse", "HEAD") };
+}
+
+function taskPilot() {
+  const source = sourceRepository();
+  const brief = "Implement the requested change.\nReview the committed artifact.";
+  const cfg = preparePilot(join(directory(), "task run with spaces"), { project: source.source, brief });
+  cleanup.push(cfg.socketDir);
+  return { ...source, brief, cfg };
 }
 
 describe("disposable pilot configuration", () => {
@@ -257,6 +296,266 @@ describe("private JSON state", () => {
       expect(() => readPrivateJson(path)).toThrow(/owned private file/);
     } finally {
       uid.mockRestore();
+    }
+  });
+});
+
+describe("task run preparation", () => {
+  test("refuses nested destinations directly or through a symlink before touching the source", () => {
+    const { source, baseCommit } = sourceRepository();
+    const alias = join(directory(), "source alias");
+    symlinkSync(source, alias);
+    const entries = readdirSync(source).sort();
+    const config = readFileSync(join(source, ".git", "config"));
+    for (const parent of [source, alias]) {
+      const destination = join(parent, "new runs", "nested run");
+      expect(() => preparePilot(destination, { project: source, brief: "Make a change." })).toThrow(
+        /outside the source checkout/,
+      );
+      expect(existsSync(destination)).toBe(false);
+      expect(existsSync(join(source, "new runs"))).toBe(false);
+      expect(readdirSync(source).sort()).toEqual(entries);
+      expect(readFileSync(join(source, ".git", "config"))).toEqual(config);
+      expect(readFileSync(join(source, "artifact.txt"), "utf8")).toBe("committed source\n");
+      expect(git(source, "status", "--porcelain")).toBe("");
+      expect(git(source, "rev-parse", "HEAD")).toBe(baseCommit);
+    }
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(realpathSync(alias)).toBe(source);
+  });
+
+  test("clones committed source without sharing object files or changing source worktrees", () => {
+    const { source, baseCommit } = sourceRepository();
+    const before = {
+      status: git(source, "status", "--porcelain"),
+      branches: git(source, "for-each-ref", "--format=%(refname) %(objectname)"),
+      config: readFileSync(join(source, ".git", "config")),
+    };
+    const cfg = preparePilot(join(directory(), "isolated task"), {
+      project: source,
+      brief: "Make a change.",
+    });
+    cleanup.push(cfg.socketDir);
+    expect(cfg.task).toEqual({ sourceRepo: source, baseCommit });
+    expect(loadPilot(cfg.root)).toEqual(cfg);
+    expect(git(cfg.repo, "rev-parse", "HEAD")).toBe(baseCommit);
+    expect(git(cfg.repo, "branch", "--show-current")).toBe("");
+    const object = join("objects", baseCommit.slice(0, 2), baseCommit.slice(2));
+    const sourceObject = join(source, ".git", object);
+    const cloneObject = join(cfg.repo, ".git", object);
+    expect(readFileSync(cloneObject)).toEqual(readFileSync(sourceObject));
+    expect(statSync(cloneObject).ino).not.toBe(statSync(sourceObject).ino);
+    expect(existsSync(join(cfg.repo, ".git", "objects", "info", "alternates"))).toBe(false);
+    for (const agent of cfg.agents) {
+      expect(git(agent.workspace, "rev-parse", "HEAD")).toBe(baseCommit);
+      expect(git(agent.workspace, "branch", "--show-current")).toBe(`bridge/${cfg.id}/${agent.kind}`);
+      expect(realpathSync(git(agent.workspace, "rev-parse", "--git-common-dir"))).toBe(
+        join(cfg.repo, ".git"),
+      );
+    }
+    writeFileSync(join(cfg.agents[0]!.workspace, "artifact.txt"), "isolated edit\n");
+    expect(readFileSync(join(source, "artifact.txt"), "utf8")).toBe("committed source\n");
+    expect(readFileSync(join(cfg.agents[1]!.workspace, "artifact.txt"), "utf8")).toBe("committed source\n");
+    expect(git(source, "rev-parse", "HEAD")).toBe(baseCommit);
+    expect(git(source, "status", "--porcelain")).toBe(before.status);
+    expect(git(source, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(before.branches);
+    expect(readFileSync(join(source, ".git", "config"))).toEqual(before.config);
+    expect(existsSync(join(source, ".git", "worktrees"))).toBe(false);
+    expect(existsSync(join(source, ".codex"))).toBe(false);
+  });
+
+  test("persists immutable task roles and nine explicit Bridge permissions with separate checkout access", () => {
+    const { cfg, brief } = taskPilot();
+    const db = new Database(cfg.db, { readonly: true });
+    try {
+      const runtimes = db
+        .query<
+          { id: string; agent_id: string; access: string; workspace: string },
+          []
+        >("SELECT id, agent_id, access, workspace FROM runtime_attempt ORDER BY agent_id")
+        .all();
+      expect(runtimes).toEqual([
+        {
+          id: cfg.agents[0]!.runtimeId,
+          agent_id: "claude",
+          access: "write",
+          workspace: cfg.agents[0]!.workspace,
+        },
+        {
+          id: cfg.agents[1]!.runtimeId,
+          agent_id: "codex",
+          access: "read",
+          workspace: cfg.agents[1]!.workspace,
+        },
+      ]);
+      const tasks = db.query<{ value: string }, []>("SELECT value FROM coordination_task").all();
+      expect(tasks).toHaveLength(1);
+      expect(JSON.parse(tasks[0]!.value) as Task).toMatchObject({
+        runId: cfg.runId,
+        brief,
+        implementerRuntimeId: cfg.agents[0]!.runtimeId,
+        reviewerRuntimeId: cfg.agents[1]!.runtimeId,
+        state: "ready",
+        version: 1,
+        artifact: null,
+        reviewSummary: null,
+      });
+      const run = JSON.parse(
+        db.query<{ value: string }, []>("SELECT value FROM coordination_run").get()!.value,
+      ) as Run;
+      expect(run).toMatchObject({ brief, maxMessages: 32, maxHops: 8 });
+      expect(run.expiresAt - run.createdAt).toBeGreaterThan(4 * 60 * 60 * 1000 - 1000);
+      expect(
+        db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM bridge_message").get()!.count,
+      ).toBe(0);
+    } finally {
+      db.close();
+    }
+    writeNativeConfig(cfg, endpoint);
+    const settings = readPrivateJson<{ permissions: { allow: string[] } }>(
+      join(cfg.root, "claude.settings.json"),
+    );
+    expect(settings.permissions.allow).toEqual([
+      "mcp__agent-bridge__bridge_send_message",
+      "mcp__agent-bridge__bridge_read_message",
+      "mcp__agent-bridge__bridge_ack_message",
+      "mcp__agent-bridge__bridge_list_agents",
+      "mcp__agent-bridge__bridge_inbox",
+      "mcp__agent-bridge__bridge_task_read",
+      "mcp__agent-bridge__bridge_task_claim",
+      "mcp__agent-bridge__bridge_task_submit",
+      "mcp__agent-bridge__bridge_task_review",
+    ]);
+    expect(Object.keys(settings.permissions)).toEqual(["allow"]);
+  });
+
+  test.each(["tracked", "staged", "untracked"] as const)(
+    "refuses %s source changes before creating the destination",
+    (kind) => {
+      const { source, baseCommit } = sourceRepository();
+      const changed = join(source, kind === "untracked" ? "new.txt" : "artifact.txt");
+      writeFileSync(changed, "uncommitted work\n");
+      if (kind === "staged") git(source, "add", "artifact.txt");
+      const status = git(source, "status", "--porcelain");
+      const destination = join(directory(), "must not exist");
+      expect(() => preparePilot(destination, { project: source, brief: "Make a change." })).toThrow(
+        /uncommitted/,
+      );
+      expect(existsSync(destination)).toBe(false);
+      expect(readFileSync(changed, "utf8")).toBe("uncommitted work\n");
+      expect(git(source, "status", "--porcelain")).toBe(status);
+      expect(git(source, "rev-parse", "HEAD")).toBe(baseCommit);
+    },
+  );
+
+  test.each(["hooks", "symlink", "file"] as const)(
+    "refuses a tracked Codex %s conflict before creating the run",
+    (kind) => {
+      const { source } = sourceRepository();
+      const path = join(source, ".codex");
+      if (kind === "hooks") {
+        mkdirSync(path);
+        writeFileSync(join(path, "hooks.json"), '{"hooks":{}}\n');
+      } else if (kind === "symlink") symlinkSync("missing-config", path);
+      else writeFileSync(path, "tracked config placeholder\n");
+      git(source, "add", ".codex");
+      git(
+        source,
+        "-c",
+        "user.name=Bridge fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "Track existing config",
+      );
+      const base = git(source, "rev-parse", "HEAD");
+      const destination = join(directory(), "must not exist");
+      expect(() => preparePilot(destination, { project: source, brief: "Make a change." })).toThrow(
+        /cannot reconcile tracked/,
+      );
+      expect(existsSync(destination)).toBe(false);
+      expect(git(source, "rev-parse", "HEAD")).toBe(base);
+      expect(git(source, "status", "--porcelain")).toBe("");
+    },
+  );
+
+  test("ignores inherited Git directory and worktree overrides during source probes, clone, and setup", () => {
+    const { source, baseCommit } = sourceRepository();
+    const foreign = sourceRepository();
+    writeFileSync(join(foreign.source, "foreign.txt"), "foreign sentinel\n");
+    const before = git(foreign.source, "status", "--porcelain");
+    const inherited = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+    try {
+      process.env.GIT_DIR = join(foreign.source, ".git");
+      process.env.GIT_WORK_TREE = foreign.source;
+      const cfg = preparePilot(join(directory(), "clean clone"), {
+        project: source,
+        brief: "Make a change.",
+      });
+      cleanup.push(cfg.socketDir);
+      expect(cfg.task).toEqual({ sourceRepo: source, baseCommit });
+      expect(loadPilot(cfg.root)).toEqual(cfg);
+      writeNativeConfig(cfg, endpoint);
+      expect(git(cfg.repo, "rev-parse", "--show-toplevel")).toBe(cfg.repo);
+      expect(existsSync(join(cfg.repo, ".codex", "hooks.json"))).toBe(true);
+      expect(existsSync(join(foreign.source, ".codex"))).toBe(false);
+      expect(existsSync(join(foreign.source, ".git", "worktrees"))).toBe(false);
+      expect(git(foreign.source, "status", "--porcelain")).toBe(before);
+      expect(git(foreign.source, "rev-parse", "HEAD")).toBe(foreign.baseCommit);
+      expect(readFileSync(join(foreign.source, "foreign.txt"), "utf8")).toBe("foreign sentinel\n");
+      expect(git(source, "status", "--porcelain")).toBe("");
+    } finally {
+      for (const key of ["GIT_DIR", "GIT_WORK_TREE"] as const) {
+        if (inherited[key] === undefined) delete process.env[key];
+        else process.env[key] = inherited[key];
+      }
+    }
+  });
+
+  test("source inspection never executes a repository fsmonitor callback", () => {
+    const { source } = sourceRepository();
+    const sentinel = join(directory(), "fsmonitor-ran");
+    const callback = join(directory(), "fsmonitor.sh");
+    writeFileSync(callback, `#!/bin/sh\ntouch ${shellQuote(sentinel)}\n`, { mode: 0o700 });
+    git(source, "config", "core.fsmonitor", callback);
+    const config = readFileSync(join(source, ".git", "config"));
+    const cfg = preparePilot(join(directory(), "isolated task"), {
+      project: source,
+      brief: "Make a change.",
+    });
+    cleanup.push(cfg.socketDir);
+    expect(existsSync(sentinel)).toBe(false);
+    expect(readFileSync(join(source, ".git", "config"))).toEqual(config);
+    expect(loadPilot(cfg.root)).toEqual(cfg);
+  });
+
+  test("rejects task mode removal, a changed base, and persisted role or access mismatches", () => {
+    const { cfg } = taskPilot();
+    const path = join(cfg.root, "pilot.json");
+    writePrivateJson(path, { ...cfg, task: undefined });
+    expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
+    writePrivateJson(path, { ...cfg, task: { ...cfg.task, baseCommit: "0".repeat(40) } });
+    expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
+    writePrivateJson(path, cfg);
+    const db = new Database(cfg.db);
+    try {
+      db.query("UPDATE coordination_task SET implementer_id = ?, reviewer_id = ?").run(
+        cfg.agents[1]!.runtimeId,
+        cfg.agents[0]!.runtimeId,
+      );
+      expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
+      db.query("UPDATE coordination_task SET implementer_id = ?, reviewer_id = ?").run(
+        cfg.agents[0]!.runtimeId,
+        cfg.agents[1]!.runtimeId,
+      );
+      db.query("UPDATE runtime_attempt SET access = 'write' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
+      expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
+      db.query("UPDATE runtime_attempt SET access = 'read' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
+      expect(loadPilot(cfg.root)).toEqual(cfg);
+    } finally {
+      db.close();
     }
   });
 });

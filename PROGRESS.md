@@ -1,52 +1,55 @@
-# Implementation status
+# Status
 
-Updated: 2026-09-05. Active platform: **macOS only**.
+Updated: 2026-09-05. **The macOS 1+1 prototype is ready for manual validation.**
 
-## Implemented
+## Working
 
-Reconciled `main` at `a2482b1`; history is tagged `archive/pre-native-rework-2026-09-05`.
-Old proposals and inactive worktrees are archived outside the source tree.
-[DESIGN.md](DESIGN.md) is the contract.
+- Claude implements; read-only Codex reviews the exact committed artifact in a separate worktree.
+- Versioned task claim, submit, and review operations persist with their peer notifications.
+- Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
+- The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
+- Coordinator recovery preserves native sessions; uncertain sends remain held.
+- Accepted linear commits export as a patch. The source checkout stays unchanged.
 
-- Disposable 1+1 worktrees, private Codex host, and native tmux TUIs.
-- Authenticated MCP send/read/ACK, Claude Channel, exact-thread Codex tool output.
-- Durable messages, immutable destinations, writer exclusion, pause, expiry, and limits.
-- Separate delivery/application receipts, native observations, held ambiguity, explicit recovery.
+## Live validation
 
-The earlier manual-handoff CLI remains. Obsolete migration and global teardown paths are removed.
+Claude Code **2.1.261**, Codex **0.153.4**, Bun **1.3.14**, macOS.
 
-## Native evidence
+Run `d215cc7c163f` completed **implement → review → accept** with exactly three acknowledged
+messages and no manual relay. Codex's idle review turn received one correlated tool-output item;
+its transcript retained exactly one operator user message. Claude read and acknowledged the final
+acceptance. Both native composers retained distinct unsent drafts, absent from submitted records.
 
-Claude Code **2.1.261** and Codex **0.153.4** completed one live nonce round trip on macOS.
-Run `8b3fa7aa256f` produced exactly two messages: PING was Channel-written, read, acknowledged,
-and replied to; PONG was accepted into Codex's active turn, read, and acknowledged. Its immutable
-message ID matched the native `functionCallOutput` item. An optional inbox poll was cancelled;
-Codex consumed the pushed output. Both native TUIs remained usable and shutdown completed.
+The coordinator was stopped with the review notice prepared and held. Recovery preserved both
+TUI processes, the private host, exact session identities, and the pending notice. Reconfirmation
+released it once. Console attach/detach and quit preserved the native sessions.
 
-Claude's peer turn emitted `UserPromptSubmit`, tool hooks, and `Stop`. Codex emitted its operator
-`UserPromptSubmit`, permission/tool hooks, and `Stop`; peer ingress did not add a user prompt.
-Native tool approvals were answered in Codex's TUI. This was not an unattended task loop.
+Claude's eight tests passed. Codex independently ran the eight committed test callbacks in memory;
+its normal runner attempt failed without diagnostics. Exported patch validation then ran the normal
+Bun runner in a separate checkout: **8 passed, 0 failed**. The source remained clean at its original commit.
 
-The installed Codex build rejected paginated-history resume (`list_turns is not supported yet`).
-The successful attempt used experimental legacy history plus native thread naming. An earlier
-attempt also exposed trust-before-host ordering and Claude's inherited `dontAsk` tool gate.
-Preparation now exposes Codex hooks for native trust review; private Claude settings allow the
-five Bridge tools. Failed attempts are preserved and were not replayed.
+Native shell/file approvals were answered in the TUIs. The nine Bridge tools required no per-call
+approval. This proves automatic peer delivery, not operation without native permission prompts.
+The earlier nonce pilot also passed active-turn Codex delivery and owned shutdown.
 
-Private evidence: `.bridge/pilots/2026-09-05-native-round-trip.json` and final native pane captures.
+Private evidence: `.bridge/pilots/2026-09-05-task-native-evidence.json`, draft captures, recovery
+snapshots, and `2026-09-05-task-export-verification.json`. The completed pair is paused for inspection.
 
-## Next
+## Limits and next steps
 
-1. Validate idle wake, composer drafts, interruption/reconnect, and uncertain native outcomes.
-2. Add versioned task/review operations and console receipts; prove an implement → review → accept
-   loop with 1+1, then a configurable 2+2 fleet in separate worktrees.
-
-The complete pair/fleet gates remain open. Windows and Linux, including WSL2, follow the working
-macOS prototype.
+- Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
+- Native project/hook trust must precede the private Codex host. Tracked Codex hook conflicts are
+  refused before preparation; automatic configuration merging remains open.
+- The run has 32 messages, an eight-hop limit, and four hours. It supports one task and a fixed pair.
+- Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
+- Manual validation comes next, then revision-loop qualification and a configurable 2+2 fleet.
+  Windows and Linux/WSL2 remain later work.
 
 ## Checks
 
-`bun test`: **304 passed, 0 failed**, 2,027 assertions across 25 files (72.92 s).
-Typecheck and whitespace checks pass. Tests include protocol, durable-state, isolated-process,
-and real-tmux fixtures. The extended recovery suite also passes: 18 tests, 152 assertions.
-`scripts/check.sh` runs tests and typecheck.
+`scripts/check.sh`: **360 passed, 0 failed**, 2,635 assertions across 28 files (87.76 s);
+typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
+Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
+
+Repository history is retained at `archive/pre-native-rework-2026-09-05`; obsolete proposals and
+inactive worktrees are archived outside the source tree. [DESIGN.md](DESIGN.md) is the contract.

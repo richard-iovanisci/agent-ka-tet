@@ -7,6 +7,7 @@ import { runInit } from "./init.ts";
 import { top } from "./top.ts";
 import { handoff, type HandoffArgs } from "./handoff.ts";
 import { pilotMain } from "../pilot/cli.ts";
+import { runMain } from "../run/cli.ts";
 
 const COMMAND_FLAGS = {
   up: new Set(["--existing-session-only"]),
@@ -51,6 +52,7 @@ export async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
 
   if (cmd === "pilot") return pilotMain(argv.slice(1));
+  if (cmd === "run") return runMain(argv.slice(1));
 
   if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") {
     printHelp();
@@ -140,6 +142,7 @@ function printHelp(): void {
 usage: bridge <command>
 
 commands:
+  run              native Claude implementer + Codex reviewer; see run --help
   pilot            prepare, inspect, and run a named native-messaging pilot; see pilot --help
   up [--existing-session-only]
                    launch the session + daemon; recovery flag refuses to create panes
