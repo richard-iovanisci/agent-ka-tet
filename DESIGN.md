@@ -137,8 +137,9 @@ native entry and completed results remain available for inspection.
 ## Observation and configuration
 
 Track process availability, activity and age, route readiness, attention, task state, and ownership
-separately. Use authenticated semantic hooks and supported runtime events. Pane capture is only
-for previews, shell readiness, and approved terminal verification. Unordered overlapping activity
+separately. Use authenticated semantic hooks and supported runtime events. Pane capture supports
+previews, shell readiness, observational telemetry, and approved terminal verification, never
+lifecycle or authority. Unordered overlapping activity
 stays unknown; missing completion may leave it stale indefinitely. Time never creates idle, transfers
 ownership, or changes session binding. Reconcile with exact runtime/session evidence and persist
 the evidence and decision first. Keep the `SessionStart`-while-working guard.
@@ -164,6 +165,24 @@ Task runs add four role-gated task tools. The private Codex host enables and pre
 those nine Bridge tools; Claude uses the same explicit allowlist with native default permissions.
 The console shows persisted start/task/receipt state, pauses on native entry, and requires explicit
 resume after detach or recovery. Closing the console leaves native sessions running.
+
+## Next iteration: operator controls
+
+These are required follow-ups to manual validation; the current launch settings above remain implemented behavior.
+
+- Configure each agent's model and supported reasoning/thinking level before the task starts.
+  Show requested and observed settings separately when they differ or cannot be confirmed.
+- Default new runs to Claude's permission bypass and Codex's YOLO mode, with an explicit override.
+  Apply settings to the actual native runtime/host and display the effective mode. Reviewer roles
+  remain task restrictions; bypass mode provides no sandbox-enforced read-only boundary.
+  Separate checkouts, Bridge writer exclusion, scoped credentials, and delivery limits still apply.
+- Show shared quota/usage by provider and account, including reset time when available. Preserve
+  model-specific limits when the provider separates them; do not multiply shared quota per agent.
+- Show context usage for each exact live session. Prefer native APIs/events; observational TUI
+  scraping is an acceptable fallback. Label source, freshness, estimates, and unavailable values.
+- Improve the console around these controls, task progress, held-message reasons, and native entry.
+  Hidden admin sessions for quota commands remain a research option. Do not run telemetry commands
+  in an active agent's composer or infer lifecycle from scraped output.
 
 ## Proof gates
 

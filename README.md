@@ -6,6 +6,7 @@ A terminal console tracks the task and peer messages; Enter opens either session
 **macOS prototype.** The pair works in separate worktrees cloned from a committed project.
 Your source checkout stays unchanged. A task finishes when Codex accepts Claude's exact commit.
 Configurable fleets, Windows, and Linux/WSL2 follow the validated pair.
+Next: model/reasoning controls, default permission bypass/YOLO, and quota/context visibility.
 
 ## Start a task
 

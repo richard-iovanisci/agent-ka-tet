@@ -8,7 +8,8 @@ Read `DESIGN.md` for the contract and `PROGRESS.md` for status. Update these and
 - Preserve unmodified Claude Code and Codex TUIs in real tmux panes. Coordinator failure
   must leave them usable; a Codex host has an independent lifetime.
 - Derive state from authenticated hooks and supported native events with exact session identity.
-  Pane capture is limited to previews, shell readiness, and approved terminal verification.
+  Pane capture may support previews, shell readiness, observational telemetry, and approved
+  terminal verification; it never establishes lifecycle, identity, delivery, or permission authority.
 - Keep unattended composer mutation disabled. Manual handoffs require fresh composer
   confirmation, semantic idle, one verified bracketed paste, and one Enter; never paste twice.
 - Keep peer content separate from operator authority. Persist delivery intent before I/O;
