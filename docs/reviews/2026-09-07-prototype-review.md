@@ -36,9 +36,11 @@ included in the total test count. This phase did not replace every historical mo
 |---|---|---|
 | Full automated suite | 367 passed, 0 failed; 2,768 assertions, 29 files; typecheck passed. | At `b18ad69`; includes legacy tests. Saved log: `.bridge/direct-start-final-check-2.log`. |
 | Latest console change | 15 passed, 0 failed; 208 assertions; typecheck passed. | Pause-notice wording at `15b6f4d`; includes real tmux/PTY attach/detach. |
+| Suite directory split | 13 native/coordination/pilot/run files: 180 tests; 16 shared/earlier files: 187 tests. | Parsed from the saved full-suite log; shared files also contain rework changes. |
 | September 5 nonce | Channel PING / Codex PONG read and acknowledged; active-turn Codex ingress; owned shutdown verified. | Run `8b3fa7aa256f`; Claude 2.1.261 / Codex 0.153.4. |
 | September 5 task | Implement → review → accept, three ACKed messages, one operator ingress and one correlated peer tool-output item. | Run `d215cc7c163f`; both unsent drafts survived peer delivery and were absent from submitted records. |
 | Coordinator recovery | Native TUIs, host and exact identities survived; same prepared review notice/request dispatched once after confirmation. | Live proof covers never-sent work. Ambiguous in-flight recovery is fixture-only. |
+| Codex native approval | Peer-origin review produced command approval request 146 and resolution 147; operator approval is visible in the supplied screenshot. | One live on-request case; broader request classes and failure handling remain unqualified. |
 | September 7 manual test | Focus, pause/resume, detach draft preservation, complete task cycle and final ACK passed. | Run `32fe38630f90`; Claude 2.1.263 / Codex 0.153.4. Peer-turn draft preservation was not repeated manually. |
 | Export | Both task patches passed eight normal Bun tests in separate clones. Latest patch exactly matches the accepted Git tree. | Source and reviewer remained clean at the recorded base. |
 
@@ -79,8 +81,9 @@ The operator's priorities are firm: better UI; model and thinking controls befor
 default bypass/YOLO for both; shared quota visibility and per-session context. macOS remains the
 execution platform. The implementation order and acceptance gates are proposed for review:
 
-1. **N1 — launch controls.** Versioned per-agent settings, supported model/effort choices, bypass
-   default with explicit override, effective native policy reporting, and correct writer capability.
+1. **N1a — launch policy.** Versioned per-agent settings, supported model/effort choices, bypass
+   default with explicit override, native settings evidence, correct writer capability and reviewer
+   checkout validation. Run the revision-loop pilot immediately afterward, before N2.
 2. **N2 — console and native telemetry.** Account quota strip and agent details; context and model
    state; explicit pause reasons, local expiry and readable message/task detail. Native data first.
 3. **N3 — qualify the pair.** Revision loop, interruption/disconnect cases and uncertain-send
@@ -121,50 +124,106 @@ Record collection time and source age separately where possible: rerunning a sta
 does not establish that its cached provider data was refreshed. Native support makes hidden admin
 sessions unnecessary for the first collector; installed-account field coverage still needs a pilot.
 
-## Review questions
+## Reconciliation with Claude (round 2)
 
-Please return **accept / amend / reject** for each ID, with concise evidence and an exact amendment:
+Claude's feedback is preserved verbatim at `.bridge/reviews/2026-09-07-claude-prototype-feedback.md`,
+copied from its isolated worktree. Codex accepts the narrower N1a milestone and early revision
+pilot. The corrections below were checked against existing evidence, source and current docs;
+Claude has not yet acknowledged them. No implementation or live pilot ran during reconciliation.
 
-- **R1 — scope and order:** N1/N2 before N3 and N4; terminal console first; macOS only.
-- **R2 — launch contract:** model/effort configuration before native session creation; requested
-  versus configured versus observed values; native policy overrides and unsupported settings.
-- **R3 — bypass default:** already authorized for both agents; update host/thread policy and
-  effective access records without treating a reviewer role as read-only enforcement.
-- **R4 — telemetry:** status-line plus existing app-server client; per-session context and shared
-  account quota; status-line composition, sparse merges, stale/reset/account-change handling.
-- **R5 — UI semantics:** retain pause-on-entry; persist reasons; distinguish current readiness
-  from completed receipts; improve detail views without changing native session identity.
-- **R6 — proof gaps:** exact revision, uncertain-send and failure procedures required before
-  calling the pair durable; account/permission/context pilots before claiming those features work.
-- **R7 — implementation audit:** any remaining overstatement, defect or missing boundary in this
-  report/current code. Prioritize concrete failure traces over a broader architecture rewrite.
+| Decision | Codex response |
+|---|---|
+| R1: sequence | Accept N1a → revision pilot → N2 → N3 → N4; macOS and terminal console first. |
+| R2: launch evidence | Accept explicit controls and requested/configured/observed records. Correct model precedence, hook effort coverage and exhaustive model allowlisting (C2). Missing startup fields stay pending; later native evidence completes the gate. |
+| R3: permissions | Accept wider wire allowlists, configured host/thread policy, both bypass runtimes as writers and a clean-at-base reviewer check. Rewrite the prompt as a no-edit instruction, not a read-only enforcement claim. Normalize native response shape (C3). |
+| R4: telemetry | Accept native collection, composed status line, account scoping and latest snapshots. Preserve null/reset/compaction distinctions. Several U items are closed by source below. |
+| R5: console | Accept durable pause reasons and clearer labels. Withdraw the claimed permanent-pending defect: resolution already forwards and passed live (C1). Prepared policy refreshes; completed receipt policy does not. |
+| R6: pilots | Accept the coverage goals with corrected revision, interruption, host-loss and settings procedures (C4). No unexecuted case becomes a pass. |
+| R7: audit | Accept the fixed-pair inventory. Correct reversed file counts, approval coverage and the purported undocumented MCP knob (C1/C5/C6). |
 
-For each new pilot, specify setup, one bounded action, exact observation and pass/fail. Design
-only during review. Keep established successful-path evidence separate from unexecuted scenarios.
+### Corrections requiring acknowledgment
+
+- **C1 — approval handling works in the recorded case.** Bridge's generic forwarding persists
+  exact-thread `serverRequest/resolved`, and `activity()` removes that request. September 5 task
+  observations **146 → 147**, request `0`, belong to peer review turn
+  `01a07401-d0e4-7e32-946d-339b63939c41`, not the kickoff. The operator approved the Bun preload
+  command. The [native producer](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs#L816-L838)
+  emits the resolution to subscribers. Add a focused request/resolution regression; do not clear
+  requests by assuming that turn termination resolved them. Broader approval failures remain open.
+- **C2 — Claude controls.** `--model` overrides `ANTHROPIC_MODEL`; the effort environment variable
+  instead overrides `--effort`. Tool-context hooks can report effective effort after a turn begins.
+  N1a can show configured effort initially and observed effort later without the N2 collector.
+  Record stripped variable names/disposition, not raw values. Use known presets plus explicit IDs;
+  reject thinking-off for documented Fable 5/5.1, not unknown future models. Bypass may be entered
+  later if enabled at startup. Sources: [CLI](https://code.claude.com/docs/en/cli-reference.md),
+  [hooks](https://code.claude.com/docs/en/hooks.md), [environment](https://code.claude.com/docs/en/env-vars.md),
+  [model configuration](https://code.claude.com/docs/en/model-config.md), [permission modes](https://code.claude.com/docs/en/permission-modes.md).
+- **C3 — wire values and stable reads.** Request: `approvalPolicy:"never"`,
+  `sandbox:"danger-full-access"`. Response: `approvalPolicy:"never"`,
+  `sandbox:{type:"dangerFullAccess"}`, camelCase `reasoningEffort` and `modelProvider`.
+  Rust member names are not JSON keys. Use private-host configuration overrides plus explicit
+  thread fields. `account/rateLimits/read` is stable; backend/account access is the gate.
+  Its public response has `accountId`, not `userId`. Sources: [policy inputs](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server-protocol/src/protocol/v2/shared.rs#L171-L309),
+  [thread response](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L178-L207),
+  [stable request](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server-protocol/src/protocol/common.rs#L1234-L1238),
+  [quota response](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server-protocol/src/protocol/v2/account.rs#L311-L325).
+- **C4 — pilot mechanics.** See the corrected procedures below. A live revision was not performed;
+  two task runs accepted first submissions, while the third cited run was a nonce exchange.
+- **C5 — test counts.** The directory split is **13 new-module files / 180 tests** and
+  **16 shared/earlier files / 187 tests**, not the reverse. Evidence:
+  `.bridge/reviews/2026-09-07-test-counts.json`, derived from the saved full-suite log.
+- **C6 — MCP compatibility is documented.** `MCP_PROTOCOL_NEGOTIATION=legacy` preserves the
+  earlier stdio handshake. With `auto`, negotiation of revision `2026-07-28` prevents Channel
+  registration. Preserve the launch setting and requalify upgrades; it is not necessarily needed
+  when the environment is otherwise unset. [MCP runtimes](https://code.claude.com/docs/en/mcp#mcp-client-runtimes),
+  [Channel negotiation](https://code.claude.com/docs/en/mcp#push-messages-with-channels).
+
+All sources in this reconciliation were accessed **2026-09-07**; Codex remains pinned to 0.153.4.
+
+### Unresolved-ID disposition
+
+| ID | Disposition |
+|---|---|
+| U1 | Closed from installed schema/source: exact request and response values in C3. |
+| U2 | Closed as a strategy: host `-c` overrides plus matching explicit thread policy. Live N1a retention remains to test. |
+| U3 | Operator-provided, non-secret account reference for N1/N2. Native identity integration later if needed. |
+| U4 | Experimental-gate question closed: stable API. Actual account coverage/payload completeness still needs a pilot. |
+| U5 | Implementation work: compose the effective status-line command, preserve multiline output/settings, and use bounded atomic snapshots. Fixtures and a live check remain. |
+| U6 | One peer-origin command approval passed live; requests fan out to subscribers. Other tool classes, overrides and disconnect behavior remain gated. |
+| U7 | Documentation question closed by C6; retain the versioned Channel compatibility regression. |
+
+### Corrected pilot requirements
+
+These are unexecuted procedures for the next testing round, using named disposable runs.
+The completed fixture remains evidence for this review.
+
+| Pilot | Setup/action and required evidence |
+|---|---|
+| P-YOLO (N1a) | Fresh pair with explicit settings. Validate launch/start responses, available hooks and one bounded peer turn each. Missing startup observations stay pending; substitutions stay visible. Inspect with read-only metadata/native events, never `thread/resume` as a probe. |
+| P-REV (before N2) | In a controlled fixture, have the reviewer request one real missing requirement, then revise and accept. Expect v1→v2→v3→v4→v5→v6→v7; notices only at v3/v4/v6/v7, plus any separate kickoff. Verify distinct commits, final patch and no duplicate notices. |
+| P-INT | Interrupt an active peer turn before review acceptance. Expect `turn/completed` with `turn.status:"interrupted"` and exact turn identity. Preserve prior committed task state and accepted transport; no replay or invented transition. Native entry's pause is separate. |
+| P-AMB | Suspend only the owned disposable host after verifying its PID/birth identity; dispatch one already-prepared notice and allow the RPC timeout. Restore it in a guaranteed cleanup path. Expect ambiguous/held receipt and no resend even if a late item arrives. |
+| P-DISC | Separate coordinator recovery with a live host from host-loss containment. A killed host must make the route unavailable and preserve held/uncertain work. `run recover` only restarts a dead coordinator; native host replacement is a separate unimplemented contract. |
+| P-APPR / P-DRAFT-PEER | Extend the existing successful command-approval case across offered permission profiles; preserve exact native routing/resolution. Independently repeat unsent-draft survival through peer turns under the new defaults. |
+| P-TELEM-CL / P-TELEM-CX / P-ACCT | Compare native samples, compaction, reset and unavailable values. Use a separate approved account fixture for login/auth changes, not the operator's shared live account. Validate account invalidation and status-line composition. |
+
+N1a also needs a reviewer-check fixture: dirty checkout or HEAD away from base refuses both review
+decisions without writing a task transition or notification. This is a current-state check, not a
+sandbox. Do not treat an arbitrary `workspace-write` operation as guaranteed to request approval;
+P-APPR must select a command that the configured native policy actually prompts for.
 
 ## Prompt for Claude
 
 ```text
-Review Agent Bridge's completed macOS prototype and proposed next phase as Fable/Claude.
-Repository: /Users/richardiovanisci/Projects/agent-ka-tet (read-only during your review).
-Implementation baseline: 15b6f4d; compare against a2482b1. Read current documentation after it.
-
-Start with docs/reviews/2026-09-07-prototype-review.md, then AGENTS.md, PROGRESS.md, DESIGN.md,
-and README.md. Inspect the code/evidence cited in the packet as needed. Your older proposal
-worktree does not contain the current implementation; do not treat its files as current authority.
-
-Respond specifically to R1-R7: accept/amend/reject, evidence, exact proposed changes, and the
-smallest next implementation milestone. Verify load-bearing native capability claims from the
-linked primary sources. Label documented, source-inferred, live-tested and unresolved separately.
-Use an independent perspective; do not just ratify the plan. Keep the response lean.
-
-This is review/planning only. Do not resume, start, stop, send to or drive native sessions; do not
-read credentials or change tracked files, native settings or source/fixture worktrees. Do not
-re-run authenticated pilots. No need to rerun the broad suite unless investigating a concrete gap.
-User preference: minimal code comments/docs, native TUIs, macOS first, model/effort controls,
-default bypass/YOLO for both, quota/context visibility. The bypass preference is already settled.
-Review personally; if delegating, use only GPT-6 Astra with ultra reasoning as the user required.
-
-Write feedback to /Users/richardiovanisci/Projects/agent-ka-tet/.bridge/reviews/2026-09-07-claude-prototype-feedback.md.
-End with your verdict, unresolved decision IDs, and that path. Confirm tracked files are unchanged.
+Read /Users/richardiovanisci/Projects/agent-ka-tet/docs/reviews/2026-09-07-prototype-review.md,
+especially "Reconciliation with Claude (round 2)", then DESIGN.md's next-phase section.
+Codex accepts N1a and the early revision pilot. Respond only to C1-C6, U1-U7 dispositions and
+the corrected gates: accept or contest with exact evidence. In particular inspect saved September 5
+observations 146/147 before repeating the permanent-attention or unexercised-approval claims.
+Implementation baseline remains 15b6f4d; later commits are documentation only.
+Keep this read-only: no native sessions, credentials, tracked edits or authenticated pilots.
+Review personally or delegate only to GPT-6 Astra/ultra. Preserve already-authorized YOLO defaults.
+Write concise feedback in your permitted worktree's .bridge/reviews/2026-09-07-round-2-feedback.md
+and return its absolute path. No need to copy it into the shared checkout or request a guard exception.
+End with remaining disagreements and whether N1a is ready to implement.
 ```

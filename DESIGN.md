@@ -172,14 +172,16 @@ resume after detach or recovery. Closing the console leaves native sessions runn
 
 ## Next phase: operator controls
 
-Proposed sequence for Claude review. These features are not implemented; the bypass default is
-already operator-authorized. Extend the tested pair in place before generalizing the fleet.
+Claude accepts the direction; the [round-2 reconciliation](docs/reviews/2026-09-07-prototype-review.md#reconciliation-with-claude-round-2)
+records Codex's factual corrections for acknowledgment. These features are not implemented;
+the bypass default is already operator-authorized. Extend the tested pair in place.
 
 | Step | Deliverable | Acceptance gate |
 |---|---|---|
-| N1: launch controls | Per-agent model, supported effort/thinking, and permission profile; bypass/YOLO default; explicit overrides; requested/effective display. | Fresh pair reports the selected settings before task dispatch and retains them through a peer-triggered turn. Both possible writers have distinct worktrees. |
+| N1a: launch policy | Per-agent model, supported effort/thinking and permission profile; bypass/YOLO default; explicit overrides; requested/configured/observed status; reviewer checkout check. | Before dispatch: validate configured controls and available startup observations. After bounded peer turns: verify effective settings where supported; missing evidence stays pending. Both possible writers have distinct worktrees. |
+| P-REV: early revision pilot | Request changes once, reclaim, revise and resubmit on N1a code before N2. | `ready v1 → working v2 → review v3 → changes_requested v4 → working v5 → review v6 → accepted v7`; four transition notices, no duplicates, final patch verified. |
 | N2: console and telemetry | Provider/account quota strip; per-agent model, effort, permission, context and activity; clear pause reason, expiry and message details. | Compare native readings, missing/reset/stale samples and account grouping; collection preserves native status lines and drafts. |
-| N3: pair reliability | Revision loop; bounded interruption, disconnect and uncertain-send recovery pilots. | Request changes → new commit → resubmit → accept; preserve identities/artifacts and never replay an uncertain send. |
+| N3: pair reliability | Requalify revisions plus bounded interruption, disconnect and uncertain-send pilots. | Preserve committed state/artifacts, expose unavailable runtimes and never replay an uncertain send. Host replacement is separate from coordinator recovery. |
 | N4: macOS fleet | Configurable 2 Claude + 2 Codex, instance IDs independent of kind/role, per-runtime hosts and worktrees. | Repeated-kind launch, exact targeting, writer exclusion, and native Claude peer observations pass live. |
 
 ### Launch configuration
@@ -189,15 +191,36 @@ thinking setting where supported, permission profile, workspace and non-secret a
 Keep defaults human-editable in one configuration surface; generated private state is separate.
 Resolve selections before creating native sessions. Unsupported or policy-blocked selections surface
 explicitly. Record requested settings, configured native settings and observed changes separately.
+Keep existing version-1 runs readable/exportable; apply the new policy only to new run specifications.
 
-Claude receives explicit model/effort/bypass launch controls with inherited overrides handled
-deliberately. Codex receives model/effort and approval/sandbox policy at private-host/thread creation;
-adding a YOLO flag to an already-attached remote TUI is insufficient. Peer delivery never changes
-these settings. Catalog and telemetry readers never resume a thread merely to inspect it.
+Claude receives explicit model/effort/bypass controls. `--model` outranks `ANTHROPIC_MODEL`, while
+`CLAUDE_CODE_EFFORT_LEVEL` outranks `--effort`. Normalize controls covered by explicit settings,
+preserve deliberate inheritance and unrelated provider/auth/network configuration, and test settings
+reinjection. Record ignored variable names and disposition, never raw inherited values. Offer known
+versioned presets plus explicit model IDs; reject known incompatible thinking settings (Fable 5/5.1
+cannot disable thinking). Unsupported capabilities remain unverified rather than guessed.
+
+Codex host configuration uses `approval_policy="never"` and `sandbox_mode="danger-full-access"`;
+thread creation sends `approvalPolicy:"never"`, `sandbox:"danger-full-access"`. The response uses
+camelCase fields and `sandbox:{type:"dangerFullAccess"}`. Preserve that configured response in the
+client API and run record. Attached-TUI flags are insufficient for an already subscribed thread.
+Peer delivery never changes these settings; metadata readers never resume a thread merely to inspect it.
+
+Claude effort starts as configured until a supported hook or status-line sample reports it. Optional
+SessionStart model data and later hook permission/effort data supplement the launch record; N1a
+does not require the N2 collector. Native substitutions must remain visible, not normalized into agreement.
 
 Separate reviewer role from effective filesystem capability. With bypass enabled, both agents
 must be treated as potential writers even when the reviewer is instructed not to edit. Preserve
 separate checkouts, Bridge assignment exclusion, scoped credentials and run/message limits.
+Before a review transition, verify the assigned reviewer checkout is clean and its HEAD equals
+the recorded base; reject without a task/notice write on failure. This checks current Git state,
+not filesystem immutability. Describe the review-only instruction without claiming sandbox enforcement.
+
+N1a changes `pilot/config.ts`, `pilot/process.ts`, `native/codex.ts`, `pilot/server.ts` and the
+artifact/reviewer checks. Validate wire allowlists, argv/environment precedence, effective-response
+retention, new/old run loading, writer conflicts and review rejection. The existing transaction
+core stays the task authority. Full quota/context collection and console redesign start in N2.
 
 ### Telemetry and presentation
 
@@ -222,8 +245,12 @@ Hidden admin TUIs remain deferred; they cannot measure another session's context
 types a usage command into a working agent's composer.
 
 The console keeps Enter as pause-and-take-control. Show which agent was paused and why; persist
-operator/automatic pause causes and timestamps. Distinguish current route readiness from historical
-message receipts, show expiry in local time, and provide readable task/message detail views.
+operator/automatic pause causes with the state change. Existing observations may suffice if queries
+retrieve the latest cause independently of the activity window. Native `serverRequest/resolved`
+already clears pending approval attention; turn completion is not a substitute resolution receipt.
+Show current route readiness separately: prepared-message policy refreshes, while completed
+receipts retain history. Show expiry in local time and readable task/message details.
+Channel `written` may display as `emitted`.
 Retain the terminal console first; a later browser can use the same authenticated project API.
 
 ## Proof gates

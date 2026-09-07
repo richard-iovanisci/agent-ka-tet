@@ -33,6 +33,8 @@ Bun runner in a separate checkout: **8 passed, 0 failed**. The source remained c
 
 Native shell/file approvals were answered in the TUIs. The nine Bridge tools required no per-call
 approval. This proves automatic peer delivery, not operation without native permission prompts.
+Codex's peer-triggered review also exercised command approval: saved request 146 and resolution 147
+correlate to the review turn. This is one live approval case, not coverage of every request class.
 The earlier nonce pilot also passed active-turn Codex delivery and owned shutdown.
 
 Private evidence: `.bridge/pilots/2026-09-05-task-native-evidence.json`, draft captures, recovery
@@ -66,7 +68,8 @@ Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
   These are operator requirements, not implemented features. Research found documented Claude
   status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
   Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
-- Qualify the revision loop before a configurable 2+2 fleet. Windows and Linux/WSL2 remain later work.
+- Next: N1a launch-policy plumbing, then the first live revision loop before N2 telemetry/UI.
+  General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
 
 Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).
 Phase evidence, capability sources and Claude review prompt: [review packet](docs/reviews/2026-09-07-prototype-review.md).
@@ -79,6 +82,8 @@ Full suite for `b18ad69`, before the pause-notice wording change: `scripts/check
 **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
 typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
+Directory split: **13 native/coordination/pilot/run files, 180 tests**; **16 shared/earlier files,
+187 tests**, including shared modules changed during the rework. This is not a new-versus-old test count.
 
 Repository history is retained at `archive/pre-native-rework-2026-09-05`; obsolete proposals and
 inactive worktrees are archived outside the source tree. [DESIGN.md](DESIGN.md) is the contract.
