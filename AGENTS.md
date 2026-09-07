@@ -2,8 +2,8 @@
 
 Read `DESIGN.md` for the contract and `PROGRESS.md` for status. Update these and README; do not add parallel proposals.
 
-- Develop and execute exclusively on macOS until the working prototype passes.
-  Windows and Linux, including WSL2, are later work.
+- Develop and execute exclusively on macOS for the next phase.
+  Windows and Linux, including WSL2, follow the usable macOS pair.
 - Use GPT-6 Astra (`gpt-6-astra`) with `ultra` reasoning for all agents doing this rework.
 - Preserve unmodified Claude Code and Codex TUIs in real tmux panes. Coordinator failure
   must leave them usable; a Codex host has an independent lifetime.

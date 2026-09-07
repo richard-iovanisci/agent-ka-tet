@@ -1,6 +1,7 @@
 # Agent Bridge design
 
-This is the implementation contract. `PROGRESS.md` separates implemented behavior from outstanding work and pilots.
+This is the implementation contract and proposed next-phase plan. `PROGRESS.md` records what has passed.
+The current prototype is a fixed pair; fleet, shared configuration reconciliation, and telemetry remain planned.
 
 ## Product and scope
 
@@ -9,8 +10,8 @@ interactive sessions in tmux. Prove an implementer/reviewer loop with **1 Claude
 then a configurable **2 Claude + 2 Codex** fleet with separate worktrees and exact addressing.
 The existing terminal console is first; actions use one authenticated project API. A later
 browser uses that API and enters the existing session rather than creating another chat.
-All development and execution are **macOS-only until the working prototype passes**.
-Windows and Linux, including WSL2, follow. Other harnesses, general runtime adoption, shared
+Development and execution remain **macOS-only for the next phase**.
+Windows and Linux, including WSL2, follow the usable macOS pair. Other harnesses, general runtime adoption, shared
 Codex hosts, dependency scheduling, and multi-project orchestration are outside this slice.
 
 The operator sets the brief, required/optional roster, workspaces, permissions, collaboration
@@ -32,10 +33,11 @@ Tracked Codex hook conflicts are refused before preparation until configuration 
   Coordinator failure leaves the TUIs usable.
 - Launch wrappers directly through tmux argv. Publish pane ownership before native startup, verify
   both wrapper and child processes, and retain exited panes for diagnosis without automatic relaunch.
-- An immutable `RuntimeAttempt` records run, AgentId, kind, host mode, owned host/pane, exact native
-  session, credential reference/revocation, canonical checkout, and access mode. Each launch/resume
-  creates a new attempt; same-process conversation changes require an explicit validated binding
-  transition. Pending messages never follow a replacement silently.
+- `RuntimeAttempt` records run, AgentId, kind, exact native session, canonical checkout, access,
+  credential hash, and mutable readiness/pause/revocation flags. Private process/pane records hold
+  host ownership separately. Delivery resume and coordinator recovery retain the same attempt.
+  The prototype refuses root-session replacement; general replacement/adoption is not implemented.
+  Pending messages never follow a replacement silently.
 - Mint a scoped credential before launch, initially permitting binding only. Enable agent tools
   after validating the exact root session on the owned host; revoke on replacement. Derive identity
   and authority server-side. Process ancestry or cwd alone is insufficient.
@@ -56,8 +58,8 @@ to persist the empty thread before TUI resume. Peer ingress itself remains `turn
 
 | Traffic | Contract |
 |---|---|
-| Claude → Claude | Native `SendMessage`/`ListAgents`; observe sender `PostToolUse`, never intercept. |
-| Agents → Bridge | Authenticated MCP send/read/ACK, handoff, and minimal task tools. |
+| Claude → Claude (fleet target) | Native `SendMessage`/`ListAgents`; observe sender `PostToolUse`, never intercept. |
+| Agents → Bridge | Nine authenticated task-run MCP tools for messages, receipts, and task transitions. |
 | Bridge → Claude | Per-session stdio Channel prototype under its development flag; no permission relay. Persist before notification; read/ACK provides application evidence. |
 | Bridge → Codex | `turn/start` with `input: []` and `toolOutput` on the exact owned thread attached to the native TUI. Omit optional model/cwd/sandbox/settings overrides. |
 | Operator → composer | Manual handoff with frozen packet, digest, reservation, and receipt. |
@@ -114,8 +116,10 @@ Prepared work dispatches only after binding, policy, and pause checks.
 
 Use minimal task create/claim/update/review operations with expected-version transitions.
 Keep implementer results separate from reviewer acceptance. Enforce one Bridge-assigned writer
-per canonical checkout from the first concurrent writers, including 1+1. Separate worktrees,
+per canonical checkout within a coordination database, including 1+1. Separate worktrees,
 harness-enforced read-only access, or serial assignment suffice; a reviewer label does not.
+Private run clones prevent cross-run checkout sharing today. A global lease is not implemented;
+shared checkouts across runs require a shared ownership authority before they can be enabled.
 
 Task states are `ready → working → review → accepted`, with `changes_requested → working` for
 revisions. Roles and brief are immutable. Submit and review atomically persist their notification;
@@ -129,8 +133,8 @@ runtime or explicit operator reconciliation; revocation and logical rebinding do
 
 Enter/pause blocks new Bridge dispatch to the target and preserves visibility of in-flight work;
 it does not interrupt tools or native peer traffic. Explicit resume revalidates binding and policy.
-Apply message/task/run budgets, expiry, throttles, and a follow-up limit. Missing required roster
-members fail launch; only explicitly optional members may be skipped with a warning.
+The pair enforces message count, hop count, and run expiry; both agents are required at launch.
+Optional rosters and additional throttles belong to the fleet phase.
 Show the run expiry independently of agent pause. Expiry blocks resume/start and peer delivery;
 native entry and completed results remain available for inspection.
 
@@ -145,16 +149,16 @@ ownership, or changes session binding. Reconcile with exact runtime/session evid
 the evidence and decision first. Keep the `SessionStart`-while-working guard.
 
 Network services bind loopback only; Unix sockets use private paths and permissions. Authenticate
-operator and agent actions separately. Config writes lock the effective destination, print diffs,
-back up originals, preserve unrelated settings, and publish atomically with stale-original rejection.
-Stable instance-neutral hooks and `/events` definitions contain no AgentIds or secrets.
+operator and agent actions separately. Generated config is private and published atomically;
+identical regeneration succeeds and conflicting edits are refused. General config reconciliation
+must lock destinations, show diffs, preserve/back up originals, and reject stale writes before
+it is enabled. Native hook definitions contain no AgentIds or secrets.
 
-Claude uses worktree-local `.claude/settings.json`; **`SessionStart` is command-only**. Other active
-lifecycle handlers use HTTP hooks with allowlisted environment authentication headers and empty 2xx
-responses. Codex linked-worktree hooks redirect each discovered project layer to the corresponding
-main-checkout `.codex` destination, preserving nested paths. Ordinary worktree MCP/model config
-remains local. Honor native project/hook trust; install `SessionEnd` and `Interrupt` within their
-timeout budgets.
+The pilot passes run-local Claude settings through `--settings`; **`SessionStart` is command-only**.
+Other active lifecycle handlers use HTTP hooks with allowlisted authentication headers and empty
+2xx responses. Codex hooks live in the private clone's root `.codex` directory, where native
+linked-worktree discovery resolves them. General nested-project hook reconciliation remains open.
+Honor native project/hook trust; installed `SessionEnd` and `Interrupt` handlers keep their timeout budgets.
 
 Prepare secret-free Codex hook definitions before launch. Establish native project and definition
 trust in a setup TUI, then exit before creating the private host: an already-loaded untrusted
@@ -166,24 +170,61 @@ those nine Bridge tools; Claude uses the same explicit allowlist with native def
 The console shows persisted start/task/receipt state, pauses on native entry, and requires explicit
 resume after detach or recovery. Closing the console leaves native sessions running.
 
-## Next iteration: operator controls
+## Next phase: operator controls
 
-These are required follow-ups to manual validation; the current launch settings above remain implemented behavior.
+Proposed sequence for Claude review. These features are not implemented; the bypass default is
+already operator-authorized. Extend the tested pair in place before generalizing the fleet.
 
-- Configure each agent's model and supported reasoning/thinking level before the task starts.
-  Show requested and observed settings separately when they differ or cannot be confirmed.
-- Default new runs to Claude's permission bypass and Codex's YOLO mode, with an explicit override.
-  Apply settings to the actual native runtime/host and display the effective mode. Reviewer roles
-  remain task restrictions; bypass mode provides no sandbox-enforced read-only boundary.
-  Separate checkouts, Bridge writer exclusion, scoped credentials, and delivery limits still apply.
-- Show shared quota/usage by provider and account, including reset time when available. Preserve
-  model-specific limits when the provider separates them; do not multiply shared quota per agent.
-- Show context usage for each exact live session. Prefer native APIs/events; observational TUI
-  scraping is an acceptable fallback. Label source, freshness, estimates, and unavailable values.
-- Improve the console around these controls, task progress, held-message reasons, and native entry.
-  Persist pause reasons and timestamps so operator actions and automatic holds are distinguishable.
-  Hidden admin sessions for quota commands remain a research option. Do not run telemetry commands
-  in an active agent's composer or infer lifecycle from scraped output.
+| Step | Deliverable | Acceptance gate |
+|---|---|---|
+| N1: launch controls | Per-agent model, supported effort/thinking, and permission profile; bypass/YOLO default; explicit overrides; requested/effective display. | Fresh pair reports the selected settings before task dispatch and retains them through a peer-triggered turn. Both possible writers have distinct worktrees. |
+| N2: console and telemetry | Provider/account quota strip; per-agent model, effort, permission, context and activity; clear pause reason, expiry and message details. | Compare native readings, missing/reset/stale samples and account grouping; collection preserves native status lines and drafts. |
+| N3: pair reliability | Revision loop; bounded interruption, disconnect and uncertain-send recovery pilots. | Request changes → new commit → resubmit → accept; preserve identities/artifacts and never replay an uncertain send. |
+| N4: macOS fleet | Configurable 2 Claude + 2 Codex, instance IDs independent of kind/role, per-runtime hosts and worktrees. | Repeated-kind launch, exact targeting, writer exclusion, and native Claude peer observations pass live. |
+
+### Launch configuration
+
+Persist a versioned run specification containing each agent's ID, kind, role, model, effort,
+thinking setting where supported, permission profile, workspace and non-secret account reference.
+Keep defaults human-editable in one configuration surface; generated private state is separate.
+Resolve selections before creating native sessions. Unsupported or policy-blocked selections surface
+explicitly. Record requested settings, configured native settings and observed changes separately.
+
+Claude receives explicit model/effort/bypass launch controls with inherited overrides handled
+deliberately. Codex receives model/effort and approval/sandbox policy at private-host/thread creation;
+adding a YOLO flag to an already-attached remote TUI is insufficient. Peer delivery never changes
+these settings. Catalog and telemetry readers never resume a thread merely to inspect it.
+
+Separate reviewer role from effective filesystem capability. With bypass enabled, both agents
+must be treated as potential writers even when the reviewer is instructed not to edit. Preserve
+separate checkouts, Bridge assignment exclusion, scoped credentials and run/message limits.
+
+### Telemetry and presentation
+
+Use Claude's documented status-line JSON and Codex's owned app-server reads/notifications first.
+The researched surfaces and version/account caveats are in the [review packet](docs/reviews/2026-09-07-prototype-review.md#native-capability-research).
+Collect bounded latest snapshots, not full transcripts. Credential and exact-session validation
+associate agent samples; telemetry never grants readiness, identity, delivery or permission authority.
+
+Context belongs to the exact runtime/session. Quota belongs to provider/account and limit bucket;
+merge sparse updates and deduplicate shared observations. Claude needs an explicit account reference
+until a supported identity source is integrated and validated. Never fabricate account identity or sum quota percentages.
+Keep cumulative token consumption separate from active context and estimated cost separate from quota.
+
+Show source and collection time, provider sample time when known, and stale/unavailable states.
+Receiving cached data again does not make provider data fresh. Handle compaction, resets, account
+changes and reconnects explicitly. Missing telemetry does not stop an otherwise valid task.
+
+Compose any existing Claude status-line command without replacing its output or unrelated settings.
+Native hooks report permission mode when an event fires; use filtered OpenTelemetry if immediate
+mode-change events are required. Scraping is a fallback for demonstrated gaps.
+Hidden admin TUIs remain deferred; they cannot measure another session's context. Collection never
+types a usage command into a working agent's composer.
+
+The console keeps Enter as pause-and-take-control. Show which agent was paused and why; persist
+operator/automatic pause causes and timestamps. Distinguish current route readiness from historical
+message receipts, show expiry in local time, and provide readable task/message detail views.
+Retain the terminal console first; a later browser can use the same authenticated project API.
 
 ## Proof gates
 

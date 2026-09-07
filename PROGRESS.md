@@ -11,7 +11,7 @@ cycle, final acknowledgment, and exported-patch validation.**
 - The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
 - Run expiry is shown separately from agent pause; expired runs retain native entry and inspection.
 - Native startup uses direct tmux argv with a pane ownership barrier, avoiding interactive shell prompts.
-- Coordinator recovery preserves native sessions; uncertain sends remain held.
+- Live recovery preserves native sessions and prepared messages; fixtures verify uncertain sends stay held.
 - Accepted linear commits export as a patch. The source checkout stays unchanged.
 
 ## Live validation
@@ -51,6 +51,9 @@ the normal Bun runner: **8 passed, 0 failed**. Source and reviewer remained clea
 Draft preservation during peer-triggered turns is not yet manually checked in this run.
 Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-export-verification.json`.
 
+The operator closed this round. Both agents' Bridge delivery is paused, with native sessions retained.
+Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
+
 ## Limits and next steps
 
 - Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
@@ -60,15 +63,20 @@ Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-
 - Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
 - Improve the console and add launch-time model/reasoning controls,
   default permission bypass/YOLO, shared provider/account quota visibility, and per-session context.
-  These are operator requirements, not implemented features. Native telemetry support needs
-  investigation; observational scraping is allowed and hidden admin sessions remain an option.
+  These are operator requirements, not implemented features. Research found documented Claude
+  status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
+  Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
 - Qualify the revision loop before a configurable 2+2 fleet. Windows and Linux/WSL2 remain later work.
+
+Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).
+Phase evidence, capability sources and Claude review prompt: [review packet](docs/reviews/2026-09-07-prototype-review.md).
 
 ## Checks
 
 Pause-notice clarification: **15 console tests passed**, 208 assertions; typecheck passed.
 
-`scripts/check.sh`: **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
+Full suite for `b18ad69`, before the pause-notice wording change: `scripts/check.sh` reported
+**367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
 typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
 

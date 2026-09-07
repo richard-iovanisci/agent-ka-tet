@@ -65,4 +65,4 @@ manual-handoff commands remain available through `bun bin/bridge --help`.
 ./scripts/check.sh
 ```
 
-[Design](DESIGN.md) · [Contributor instructions](AGENTS.md)
+[Design](DESIGN.md) · [Prototype review](docs/reviews/2026-09-07-prototype-review.md) · [Contributor instructions](AGENTS.md)
