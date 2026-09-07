@@ -13,7 +13,13 @@ import { recordProcess } from "./processState.ts";
 import { startPilotServer } from "./server.ts";
 import { implementerPrompt } from "../run/prompts.ts";
 
-export async function runProcess(role: string, root: string, agentId?: string): Promise<number> {
+export async function runProcess(
+  role: string,
+  root: string,
+  agentId?: string,
+  waitForPane = false,
+): Promise<number> {
+  if (waitForPane && role !== "agent") throw new Error("pane startup barrier requires an agent");
   const cfg = loadPilot(root);
   if (role === "coordinator") {
     const endpointFile = pilotFile(root, "endpoint.json");
@@ -96,6 +102,18 @@ export async function runProcess(role: string, root: string, agentId?: string): 
         : `The operator approved the Agent Bridge nonce pilot ${cfg.id}. For a Bridge Channel notification, read the message with bridge_read_message and acknowledge it with bridge_ack_message. If the peer body is exactly PING ${cfg.id}, reply to codex with exactly PONG ${cfg.id}, idempotencyKey ${cfg.id}:pong, and replyTo the incoming message ID. Use only Bridge MCP tools; do not edit files, run commands, or send further replies. Keep the native permission controls.`,
     ];
   }
+  if (waitForPane) {
+    const path = agentFile(root, agent.id, "pane");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(path)) {
+      if (Date.now() >= deadline)
+        throw new Error("pane ownership was not published; native process not started");
+      await Bun.sleep(25);
+    }
+    const pane = readPrivateJson<{ paneId: string; wrapperPid: number }>(path);
+    if (!/^%\d+$/.test(pane.paneId) || pane.wrapperPid !== process.pid)
+      throw new Error("pane ownership does not match this wrapper; native process not started");
+  }
   recordProcess(root, processRole);
   const child = spawn(command, args, { cwd: agent.workspace, env, stdio: "inherit" });
   if (child.pid !== undefined) recordProcess(root, processRole, child.pid);
@@ -117,10 +135,12 @@ export async function runProcess(role: string, root: string, agentId?: string): 
 }
 
 if (import.meta.main) {
-  const [role, root, agentId] = process.argv.slice(2);
+  const [role, root, agentId, option, ...extra] = process.argv.slice(2);
   try {
     if (!role || !root) throw new Error("pilot process requires role and directory");
-    process.exitCode = await runProcess(role, root, agentId);
+    if (extra.length || (option !== undefined && option !== "--wait-for-pane"))
+      throw new Error("unexpected pilot process argument");
+    process.exitCode = await runProcess(role, root, agentId, option === "--wait-for-pane");
   } catch (error) {
     console.error(error instanceof Error ? error.message : "pilot process failed");
     process.exitCode = 1;

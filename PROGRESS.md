@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-09-06. **The macOS 1+1 prototype is ready for manual validation.**
+Updated: 2026-09-07. **The macOS 1+1 prototype is ready for manual validation.**
 
 ## Working
 
@@ -9,6 +9,7 @@ Updated: 2026-09-06. **The macOS 1+1 prototype is ready for manual validation.**
 - Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
 - The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
 - Run expiry is shown separately from agent pause; expired runs retain native entry and inspection.
+- Native startup uses direct tmux argv with a pane ownership barrier, avoiding interactive shell prompts.
 - Coordinator recovery preserves native sessions; uncertain sends remain held.
 - Accepted linear commits export as a patch. The source checkout stays unchanged.
 
@@ -36,6 +37,12 @@ The earlier nonce pilot also passed active-turn Codex delivery and owned shutdow
 Private evidence: `.bridge/pilots/2026-09-05-task-native-evidence.json`, draft captures, recovery
 snapshots, and `2026-09-05-task-export-verification.json`. The completed pair is paused for inspection.
 
+The September 7 refresh exposed an Oh My Zsh startup prompt intercepting the launcher paste.
+That attempt was stopped without an agent or task start. Direct startup then launched Claude **2.1.263**
+and Codex **0.153.4**, with both native routes confirmed ready before returning them to paused state.
+Run `32fe38630f90` is ready v1 for operator testing; no task start or peer messages were submitted at setup.
+Evidence: `.bridge/pilots/2026-09-07-manual-run-ready.json` and the retained startup-failure capture.
+
 ## Limits and next steps
 
 - Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
@@ -48,7 +55,7 @@ snapshots, and `2026-09-05-task-export-verification.json`. The completed pair is
 
 ## Checks
 
-`scripts/check.sh`: **364 passed, 0 failed**, 2,680 assertions across 28 files (86.27 s);
+`scripts/check.sh`: **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
 typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
 

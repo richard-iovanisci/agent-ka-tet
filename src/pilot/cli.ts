@@ -7,7 +7,6 @@ import {
   pilotFile,
   preparePilot,
   readPrivateJson,
-  shellQuote,
   sourceFile,
   writeNativeConfig,
   writePrivateJson,
@@ -15,6 +14,7 @@ import {
   type PilotEndpoint,
 } from "./config.ts";
 import { pilotRequest } from "./server.ts";
+import { launchNativePanes } from "./panes.ts";
 import {
   acquireRecoveryLock,
   coordinatorPublished,
@@ -82,29 +82,7 @@ export async function launchPilot(cfg: PilotConfig): Promise<void> {
     "private Codex host did not start; inspect its log",
   );
   await pilotRequest(cfg, "/operator/connect", {});
-  const first = cfg.agents[0]!;
-  const panes = [
-    {
-      agent: first,
-      paneId: await mux.createSession(cfg.tmuxSession, { cwd: first.workspace, width: 220, height: 60 }),
-    },
-  ];
-  await mux.setSessionMarker(cfg.tmuxSession, `native-pilot:${cfg.id}`);
-  for (const agent of cfg.agents.slice(1))
-    panes.push({ agent, paneId: await mux.splitPane(cfg.tmuxSession, { cwd: agent.workspace }) });
-  await mux.selectLayout(cfg.tmuxSession, "even-horizontal");
-  for (const { agent, paneId } of panes) {
-    await mux.setPaneAgentId(paneId, agent.id);
-    await mux.setPaneTitle(paneId, agent.id);
-    writePrivateJson(agentFile(cfg.root, agent.id, "pane"), { paneId });
-    if (!(await mux.waitForShellReady(paneId))) throw new Error(`${agent.id} pane shell is not ready`);
-    const command = [process.execPath, sourceFile("process.ts"), "agent", cfg.root, agent.id]
-      .map(shellQuote)
-      .join(" ");
-    const result = await mux.sendText(paneId, command, { submit: true });
-    if (!result.ok)
-      throw new Error(`${agent.id} launcher outcome is uncertain; inspect the pane without replaying it`);
-  }
+  await launchNativePanes(cfg, mux);
 }
 
 async function ownedMux(cfg: PilotConfig): Promise<TmuxAdapter> {

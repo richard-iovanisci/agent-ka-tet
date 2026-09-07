@@ -57,6 +57,15 @@ const PANE_AGENT_ID_OPTION = "@agent-bridge-agent-id";
 
 let bufferSeq = 0;
 
+function paneCommand(command: readonly string[] | undefined): string[] {
+  if (command === undefined) return [];
+  if (command.length === 0 || command[0] === "" || command.some((arg) => arg.includes("\0"))) {
+    throw new Error("tmux command requires a nonempty executable and NUL-free arguments");
+  }
+  // One tmux argument invokes a shell; nice with zero adjustment execs directly.
+  return ["--", ...(command.length === 1 ? ["/usr/bin/nice", "-n", "0", "--", ...command] : command)];
+}
+
 interface ObservableCounts {
   literal: number;
   expectedPlaceholder: number;
@@ -261,7 +270,8 @@ export class TmuxAdapter implements MuxAdapter {
   /** Run tmux, never throwing on a non-zero exit. */
   private async run(args: string[], stdin?: string): Promise<RunResult> {
     const proc = Bun.spawn({
-      cmd: [...this.baseArgv, ...args],
+      // tmux consumes one escape before a trailing literal semicolon.
+      cmd: [...this.baseArgv, ...args.map((arg) => arg.replace(/;$/u, "\\;"))],
       env: this.environment,
       stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
       stdout: "pipe",
@@ -378,7 +388,7 @@ export class TmuxAdapter implements MuxAdapter {
 
   async createSession(
     session: string,
-    opts: { cwd: string; width?: number; height?: number },
+    opts: { cwd: string; width?: number; height?: number; command?: readonly string[] },
   ): Promise<string> {
     // tmux silently rewrites '.' and ':' in session names; accepting that
     // would create a session that exact-match targets can never address.
@@ -387,14 +397,15 @@ export class TmuxAdapter implements MuxAdapter {
         `tmux session names must not contain '.', ':' or whitespace: ${JSON.stringify(session)}`,
       );
     }
-    // No command argument: the pane runs the user's default shell, so it
-    // outlives whatever agent is later launched by typing into it.
     const args = ["new-session", "-d", "-s", session, "-c", opts.cwd];
     if (opts.width !== undefined) args.push("-x", String(opts.width));
     if (opts.height !== undefined) args.push("-y", String(opts.height));
-    args.push("-P", "-F", "#{pane_id}");
+    args.push("-P", "-F", "#{pane_id}", ...paneCommand(opts.command));
     const paneId = (await this.exec(args)).trim();
     try {
+      if (opts.command !== undefined) {
+        await this.exec(["set-option", "-p", "-t", paneId, "remain-on-exit", "on"]);
+      }
       const windowId = (
         await this.exec([
           "display-message",
@@ -433,7 +444,8 @@ export class TmuxAdapter implements MuxAdapter {
     }
   }
 
-  async splitPane(session: string, opts: { cwd: string }): Promise<string> {
+  async splitPane(session: string, opts: { cwd: string; command?: readonly string[] }): Promise<string> {
+    const command = paneCommand(opts.command);
     const window = await this.managedWindowTarget(session);
     const out = await this.exec([
       "split-window",
@@ -444,8 +456,13 @@ export class TmuxAdapter implements MuxAdapter {
       "-P",
       "-F",
       "#{pane_id}",
+      ...command,
     ]);
-    return out.trim();
+    const paneId = out.trim();
+    if (opts.command !== undefined) {
+      await this.exec(["set-option", "-p", "-t", paneId, "remain-on-exit", "on"]);
+    }
+    return paneId;
   }
 
   async selectLayout(

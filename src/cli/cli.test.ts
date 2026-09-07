@@ -26,8 +26,13 @@ import { formatAge, renderBoard, top } from "./top.ts";
 
 const SOCKET = `bridge-test-cli-${process.pid}`;
 const SESSION = `bridge-cli-${process.pid}`;
+const SHELL_ROOT = mkdtempSync(join(tmpdir(), "bridge-cli-shell-"));
+const SHELL_ENV = { SHELL: "/bin/zsh", ZDOTDIR: SHELL_ROOT };
+writeFileSync(join(SHELL_ROOT, ".zshenv"), "unsetopt GLOBAL_RCS\n");
+writeFileSync(join(SHELL_ROOT, ".zshrc"), "PROMPT='bridge-fixture> '\nRPROMPT=''\n");
 afterAll(() => {
   Bun.spawnSync(["tmux", "-L", SOCKET, "kill-server"]);
+  rmSync(SHELL_ROOT, { recursive: true, force: true });
 });
 
 /** Poll an async predicate every 50ms until true or timeout. */
@@ -198,7 +203,7 @@ describe("bridge ownership guards", () => {
   test("existing-session-only recovery never creates a missing session", async () => {
     const cfg = defaultConfig(mkdtempSync(join(tmpdir(), "bridge-recovery-only-")));
     cfg.session = `bridge-recovery-only-${process.pid}`;
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
     const lines: string[] = [];
     expect(
       await up(cfg, {
@@ -216,7 +221,7 @@ describe("bridge ownership guards", () => {
     const cfg = defaultConfig(mkdtempSync(join(tmpdir(), "bridge-disabled-")));
     cfg.session = `bridge-disabled-${process.pid}`;
     for (const agent of cfg.agents) agent.enabled = false;
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
     const lines: string[] = [];
     expect(await up(cfg, { mux, print: (line) => lines.push(line) })).toBe(1);
     expect(await mux.hasSession(cfg.session)).toBe(false);
@@ -230,7 +235,7 @@ describe("bridge ownership guards", () => {
       fetch: () => Response.json({ daemon: { pid: process.pid }, agents: [] }),
     });
     cfg.daemonPort = fixture.port!;
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
     await mux.createSession(cfg.session, { cwd: cfg.repo });
     try {
       const lines: string[] = [];
@@ -278,7 +283,7 @@ describe("bridge up/down against real tmux + real daemon", () => {
         }),
       );
       const cfg = loadConfig(repo);
-      const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+      const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
       const lines: string[] = [];
       const daemonScript = fileURLToPath(new URL("../daemon/index.ts", import.meta.url));
 

@@ -11,7 +11,7 @@ import type { AgentKind } from "../types.ts";
 export interface PaneInfo {
   /** Backend-global pane id (tmux: "%3"). Stable for the pane's lifetime. */
   id: string;
-  /** PID of the pane's long-lived login shell. */
+  /** PID of the pane's initial process. */
   pid: number;
   /** Position within the window. */
   index: number;
@@ -71,17 +71,13 @@ export interface MuxAdapter {
   /** Store/read a backend-native session marker used to prevent cross-repo reuse. */
   setSessionMarker(session: string, value: string): Promise<void>;
   getSessionMarker(session: string): Promise<string | null>;
-  /**
-   * Create a detached session whose first pane runs the user's default shell
-   * (agents are launched later by typing into that shell — the pane must
-   * outlive whatever runs inside it). Returns the first pane's id.
-   */
+  /** Create a detached session; omitted command starts the user's shell. */
   createSession(
     session: string,
-    opts: { cwd: string; width?: number; height?: number },
+    opts: { cwd: string; width?: number; height?: number; command?: readonly string[] },
   ): Promise<string>;
   /** Split a new pane into the bridge-managed window; returns its id. */
-  splitPane(session: string, opts: { cwd: string }): Promise<string>;
+  splitPane(session: string, opts: { cwd: string; command?: readonly string[] }): Promise<string>;
   selectLayout(
     session: string,
     layout: "tiled" | "even-horizontal" | "even-vertical",

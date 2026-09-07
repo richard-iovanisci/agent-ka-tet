@@ -30,6 +30,8 @@ Tracked Codex hook conflicts are refused before preparation until configuration 
 - Each agent is an unmodified native TUI in a real tmux pane. Supported control endpoints address
   that same session; headless, print/resume, or API conversations are not substitutes.
   Coordinator failure leaves the TUIs usable.
+- Launch wrappers directly through tmux argv. Publish pane ownership before native startup, verify
+  both wrapper and child processes, and retain exited panes for diagnosis without automatic relaunch.
 - An immutable `RuntimeAttempt` records run, AgentId, kind, host mode, owned host/pane, exact native
   session, credential reference/revocation, canonical checkout, and access mode. Each launch/resume
   creates a new attempt; same-process conversation changes require an explicit validated binding
