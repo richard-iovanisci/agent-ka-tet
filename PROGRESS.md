@@ -1,7 +1,7 @@
 # Status
 
-Updated: 2026-09-07. **The macOS 1+1 prototype passed the operator's implement/review loop;
-final notification delivery and export verification remain for this run.**
+Updated: 2026-09-07. **The macOS 1+1 prototype passed the operator's implement/review/accept
+cycle, final acknowledgment, and exported-patch validation.**
 
 ## Working
 
@@ -44,10 +44,12 @@ and Codex **0.153.4**, with both native routes confirmed ready before returning 
 The operator confirmed pause/resume, correct native focus, and unsent draft preservation across
 detach for both agents. Run `32fe38630f90` then reached **accepted v4**, artifact
 `32f8c1c76381a305880c0fbbaf67a5b271a0f94e`. Claude reported eight passing tests; Codex reported
-eight committed test callbacks plus four additional assertions passing in memory. The final
-acceptance notification is prepared and unread while Claude is paused; delivery awaits operator
-resume. Draft preservation during peer-triggered turns is not yet manually checked in this run.
-Evidence: `.bridge/pilots/2026-09-07-operator-checks.json`, the ready snapshot, and retained startup-failure capture.
+eight committed test callbacks plus four additional assertions passing in memory. Operator resume
+released the final acceptance once; all three messages were read and acknowledged. The exported
+patch applied cleanly in a separate clone, exactly reproduced the accepted Git tree, and passed
+the normal Bun runner: **8 passed, 0 failed**. Source and reviewer remained clean at the recorded base.
+Draft preservation during peer-triggered turns is not yet manually checked in this run.
+Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-export-verification.json`.
 
 ## Limits and next steps
 
@@ -56,13 +58,15 @@ Evidence: `.bridge/pilots/2026-09-07-operator-checks.json`, the ready snapshot, 
   refused before preparation; automatic configuration merging remains open.
 - The run has 32 messages, an eight-hop limit, and four hours. It supports one task and a fixed pair.
 - Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
-- Finish manual validation, then improve the console and add launch-time model/reasoning controls,
+- Improve the console and add launch-time model/reasoning controls,
   default permission bypass/YOLO, shared provider/account quota visibility, and per-session context.
   These are operator requirements, not implemented features. Native telemetry support needs
   investigation; observational scraping is allowed and hidden admin sessions remain an option.
 - Qualify the revision loop before a configurable 2+2 fleet. Windows and Linux/WSL2 remain later work.
 
 ## Checks
+
+Pause-notice clarification: **15 console tests passed**, 208 assertions; typecheck passed.
 
 `scripts/check.sh`: **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
 typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,

@@ -451,9 +451,9 @@ describe("native run console", () => {
       detached.resolve(0);
       await until(() => f.input.isRaw && f.calls.length > count);
       expect(attached).toEqual(["codex"]);
-      expect(f.writes.some((text) => text.includes("codex remains paused; r resumes peer input."))).toBe(
-        true,
-      );
+      expect(
+        f.writes.some((text) => text.includes("codex paused on native entry; r resumes peer input.")),
+      ).toBe(true);
       expect(f.calls.some((call) => call.path === "/operator/ready")).toBe(false);
     } finally {
       detached.resolve(0);
@@ -642,7 +642,7 @@ describe("native run console", () => {
       child.terminal!.write("\r");
       await until(() => output.includes("NATIVE_CONSOLE_FIXTURE"), 5000);
       child.terminal!.write("\x02d");
-      await until(() => output.includes("claude remains paused; r resumes peer input."), 5000);
+      await until(() => output.includes("claude paused on native entry; r resumes peer input."), 5000);
       child.terminal!.write("q");
       await until(() => output.includes("CONSOLE_RETURNED_0"), 2000);
       await until(() => child!.exitCode !== null, 2000);

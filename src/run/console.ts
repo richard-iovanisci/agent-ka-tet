@@ -374,7 +374,7 @@ export async function runConsoleSession(cfg: PilotConfig, options: ConsoleOption
         const code = await options.attach(agentId);
         notice =
           code === 0
-            ? `${agentId} remains paused; r resumes peer input.`
+            ? `${agentId} paused on native entry; r resumes peer input.`
             : "Native attach failed; delivery remains paused if the pause succeeded.";
       } else {
         notice =

@@ -181,6 +181,7 @@ These are required follow-ups to manual validation; the current launch settings 
 - Show context usage for each exact live session. Prefer native APIs/events; observational TUI
   scraping is an acceptable fallback. Label source, freshness, estimates, and unavailable values.
 - Improve the console around these controls, task progress, held-message reasons, and native entry.
+  Persist pause reasons and timestamps so operator actions and automatic holds are distinguishable.
   Hidden admin sessions for quota commands remain a research option. Do not run telemetry commands
   in an active agent's composer or infer lifecycle from scraped output.
 
