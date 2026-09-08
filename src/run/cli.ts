@@ -1,12 +1,15 @@
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadPilot, preparePilot } from "../pilot/config.ts";
 import { pilotMain } from "../pilot/cli.ts";
 import type { Task } from "../coordination/types.ts";
 import { exportArtifact } from "./artifact.ts";
 import { runConsole } from "./console.ts";
+import { resolveLaunchSettings } from "./settings.ts";
 
-const HELP = `bridge run prepare <project> --task <brief> [--directory <new-directory>]
+const HELP = `bridge run defaults
+bridge run prepare <project> --task <brief> [--directory <new-directory>] [--config <settings.json>]
 bridge run launch <directory> --live
 bridge run console <directory>
 bridge run attach <directory> [claude|codex]
@@ -18,21 +21,33 @@ bridge run recover <directory>
 bridge run export <directory>
 bridge run stop <directory>`;
 
-export function parsePrepare(args: string[]): { project: string; brief: string; directory?: string } {
+export function parsePrepare(args: string[]): {
+  project: string;
+  brief: string;
+  directory?: string;
+  config?: string;
+} {
   const project = args[0];
   if (!project || project.startsWith("--")) throw new Error("a source project is required");
   let brief: string | undefined;
   let directory: string | undefined;
+  let config: string | undefined;
   for (let i = 1; i < args.length; i += 2) {
     const flag = args[i],
       value = args[i + 1];
     if (!value?.trim()) throw new Error(`${flag} requires a value`);
     if (flag === "--task" && brief === undefined) brief = value;
     else if (flag === "--directory" && directory === undefined) directory = resolve(value);
+    else if (flag === "--config" && config === undefined) config = resolve(value);
     else throw new Error(`unknown or repeated option ${flag}`);
   }
   if (!brief?.trim()) throw new Error("--task is required");
-  return { project: resolve(project), brief, ...(directory ? { directory } : {}) };
+  return {
+    project: resolve(project),
+    brief,
+    ...(directory ? { directory } : {}),
+    ...(config ? { config } : {}),
+  };
 }
 
 export async function runMain(args: string[]): Promise<number> {
@@ -42,9 +57,17 @@ export async function runMain(args: string[]): Promise<number> {
   }
   try {
     const [command, directory, ...extra] = args;
+    if (command === "defaults") {
+      if (directory || extra.length) throw new Error("unexpected defaults argument");
+      console.log(JSON.stringify(resolveLaunchSettings(), null, 2));
+      return 0;
+    }
     if (command === "prepare") {
       const input = parsePrepare(args.slice(1));
-      const cfg = preparePilot(input.directory, input);
+      const settings = input.config
+        ? resolveLaunchSettings(JSON.parse(readFileSync(input.config, "utf8")))
+        : resolveLaunchSettings();
+      const cfg = preparePilot(input.directory, { ...input, settings });
       console.log(
         `Prepared ${cfg.root}\nFollow ${cfg.root}/PLAN.md for native setup.\nThe source checkout is unchanged.`,
       );

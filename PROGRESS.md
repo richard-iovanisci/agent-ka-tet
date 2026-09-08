@@ -5,7 +5,7 @@ cycle, final acknowledgment, and exported-patch validation.**
 
 ## Working
 
-- Claude implements; read-only Codex reviews the exact committed artifact in a separate worktree.
+- Claude implements; Codex reviews the exact committed artifact in a separate worktree.
 - Versioned task claim, submit, and review operations persist with their peer notifications.
 - Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
 - The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
@@ -56,6 +56,14 @@ Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-
 The operator closed this round. Both agents' Bridge delivery is paused, with native sessions retained.
 Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
 
+## N1a implementation
+
+Design reconciliation is complete. New task runs snapshot per-agent launch settings and default to
+bypass/YOLO. Host/thread settings, Claude argv/environment, version-1 compatibility, native settings
+status and a clean-at-base reviewer check are implemented on `codex/n1a-launch-policy`.
+Offline checks passed: **405 tests, 0 failures**, 3,051 assertions across 32 files; typecheck passed.
+No authenticated N1a run has launched; P-YOLO and then P-REV are next.
+
 ## Limits and next steps
 
 - Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
@@ -63,18 +71,22 @@ Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
   refused before preparation; automatic configuration merging remains open.
 - The run has 32 messages, an eight-hop limit, and four hours. It supports one task and a fixed pair.
 - Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
-- Improve the console and add launch-time model/reasoning controls,
-  default permission bypass/YOLO, shared provider/account quota visibility, and per-session context.
-  These are operator requirements, not implemented features. Research found documented Claude
+- Improve the console, shared provider/account quota visibility, and per-session context.
+  These telemetry features remain unimplemented. Research found documented Claude
   status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
   Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
-- Next: N1a launch-policy plumbing, then the first live revision loop before N2 telemetry/UI.
+- Next: qualify N1a settings, then the first live revision loop before N2 telemetry/UI.
   General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
 
 Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).
 Phase evidence, capability sources and Claude review prompt: [review packet](docs/reviews/2026-09-07-prototype-review.md).
 
 ## Checks
+
+N1a final `scripts/check.sh`: **405 passed, 0 failed**, 3,051 assertions across 32 files (44.97 s);
+typecheck and whitespace checks passed. The first run hit an existing tmux shell-fixture timeout.
+The fixture now disables user shell startup files while preserving real tmux/bracketed-paste checks.
+Evidence: `.bridge/reviews/2026-09-07-n1a-final-check.log`.
 
 Pause-notice clarification: **15 console tests passed**, 208 assertions; typecheck passed.
 

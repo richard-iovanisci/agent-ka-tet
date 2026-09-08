@@ -19,7 +19,8 @@ scope, and limits. Peer work proceeds within that policy. Trust prompts, unavail
 ambiguity, and exhausted limits surface as Needs you. Completion requires an artifact and
 reviewer acceptance; idle turns and process exits never complete tasks.
 
-The first prototype fixes the roster to a Claude implementer and read-only Codex reviewer.
+The prototype fixes the roster to a Claude implementer and Codex reviewer in separate worktrees.
+New bypass runs treat both as writers; the earlier validated runs used a read-only Codex sandbox.
 Preparation clones a clean committed source into a private run directory outside that checkout,
 with independent Git objects and separate worktrees. Accepted linear commits export as a patch;
 the bridge never applies, merges, or pushes the result into the source project.
@@ -126,8 +127,8 @@ revisions. Roles and brief are immutable. Submit and review atomically persist t
 reply chains enforce the same message and hop limits. Submission verifies a clean implementer
 HEAD descended from the recorded base. The reviewer inspects that exact commit, not its own base checkout.
 
-Bridge enforces ownership among its assignments; harness sandbox/permissions enforce filesystem
-boundaries. Record those launch settings. Credential revocation ends Bridge access, not the native
+Bridge enforces ownership among its assignments. Filesystem access follows native policy; bypass
+does not restrict writes to the assigned checkout. Record those launch settings. Credential revocation ends Bridge access, not the native
 process. Expired ownership means unknown ownership. Reassignment requires verified exit of the old
 runtime or explicit operator reconciliation; revocation and logical rebinding do not free a checkout.
 
@@ -162,19 +163,20 @@ Honor native project/hook trust; installed `SessionEnd` and `Interrupt` handlers
 
 Prepare secret-free Codex hook definitions before launch. Establish native project and definition
 trust in a setup TUI, then exit before creating the private host: an already-loaded untrusted
-project layer may keep its hooks disabled. Pilot Claude settings allow the five Bridge MCP tools
-explicitly; other native permissions remain unchanged.
+project layer may keep its hooks disabled. The nonce pilot allows five Bridge MCP tools
+and preserves native permissions.
 
 Task runs add four role-gated task tools. The private Codex host enables and pre-approves only
-those nine Bridge tools; Claude uses the same explicit allowlist with native default permissions.
+those nine Bridge tools; Claude uses the same explicit allowlist. New task runs apply their
+prepared native permission profile, defaulting to bypass/YOLO.
 The console shows persisted start/task/receipt state, pauses on native entry, and requires explicit
 resume after detach or recovery. Closing the console leaves native sessions running.
 
 ## Next phase: operator controls
 
-Claude accepts the direction; the [round-2 reconciliation](docs/reviews/2026-09-07-prototype-review.md#reconciliation-with-claude-round-2)
-records Codex's factual corrections for acknowledgment. These features are not implemented;
-the bypass default is already operator-authorized. Extend the tested pair in place.
+Both lanes accepted the [round-2 reconciliation](docs/reviews/2026-09-07-prototype-review.md#reconciliation-with-claude-round-2).
+N1a implements the operator-authorized bypass default and launch controls. Its native settings-retention
+and revision pilots remain unexecuted; N2–N4 follow those gates.
 
 | Step | Deliverable | Acceptance gate |
 |---|---|---|
@@ -188,17 +190,21 @@ the bypass default is already operator-authorized. Extend the tested pair in pla
 
 Persist a versioned run specification containing each agent's ID, kind, role, model, effort,
 thinking setting where supported, permission profile, workspace and non-secret account reference.
-Keep defaults human-editable in one configuration surface; generated private state is separate.
-Resolve selections before creating native sessions. Unsupported or policy-blocked selections surface
+Use `run defaults` to write one human-editable JSON file and `run prepare --config` to snapshot it.
+New task state is version 2; its launch-settings format is version 1. Generated private state is separate.
+Resolve selections before creating native sessions; a private policy digest rejects later edits.
+Changing launch settings requires a new run. Unsupported or policy-blocked selections surface
 explicitly. Record requested settings, configured native settings and observed changes separately.
 Keep existing version-1 runs readable/exportable; apply the new policy only to new run specifications.
 
 Claude receives explicit model/effort/bypass controls. `--model` outranks `ANTHROPIC_MODEL`, while
 `CLAUDE_CODE_EFFORT_LEVEL` outranks `--effort`. Normalize controls covered by explicit settings,
 preserve deliberate inheritance and unrelated provider/auth/network configuration, and test settings
-reinjection. Record ignored variable names and disposition, never raw inherited values. Offer known
-versioned presets plus explicit model IDs; reject known incompatible thinking settings (Fable 5/5.1
-cannot disable thinking). Unsupported capabilities remain unverified rather than guessed.
+reinjection. Record ignored variable names and disposition, never raw inherited values. Allow native model aliases or explicit IDs; `inherit` preserves Claude's native model selection.
+Default Claude effort is high and Codex is Astra/ultra. Reject known incompatible thinking settings (Fable 5/5.1
+cannot disable thinking). Explicit thinking-on uses a visible Bridge budget of 31,999 tokens
+for budget-based models; adaptive models may ignore it. Inherit adds no thinking controls.
+Unsupported capabilities remain unverified rather than guessed.
 
 Codex host configuration uses `approval_policy="never"` and `sandbox_mode="danger-full-access"`;
 thread creation sends `approvalPolicy:"never"`, `sandbox:"danger-full-access"`. The response uses
@@ -245,8 +251,8 @@ Hidden admin TUIs remain deferred; they cannot measure another session's context
 types a usage command into a working agent's composer.
 
 The console keeps Enter as pause-and-take-control. Show which agent was paused and why; persist
-operator/automatic pause causes with the state change. Existing observations may suffice if queries
-retrieve the latest cause independently of the activity window. Native `serverRequest/resolved`
+operator/automatic pause causes with the state change. N2 must add observations at operator pause/resume/native entry; these causes are not written yet.
+Queries must retrieve the latest cause independently of the activity window. Native `serverRequest/resolved`
 already clears pending approval attention; turn completion is not a substitute resolution receipt.
 Show current route readiness separately: prepared-message policy refreshes, while completed
 receipts retain history. Show expiry in local time and readable task/message details.

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   existsSync,
   mkdirSync,
@@ -17,10 +18,13 @@ import {
   readPrivateJson,
   shellQuote,
   sourceFile,
+  writeNativeConfig,
   writePrivateJson,
   type PilotEndpoint,
 } from "./config.ts";
 import { coordinatorPublished, processAlive, processRecord, processVerifiedGone } from "./processState.ts";
+import { resolveLaunchSettings, type RunLaunchSettings } from "../run/settings.ts";
+import type { NativeLaunchRecord } from "../run/launch.ts";
 
 const THREAD = "11111111-1111-4111-8111-111111111111";
 const TASK_TOOLS = [
@@ -43,6 +47,9 @@ type Capture = {
   negotiation?: string;
   gitEnvironment: string[];
   gitWorkspace: string | null;
+  launchRecorded: boolean;
+  controlsMatch?: boolean;
+  inheritedControlsMatch?: boolean;
 };
 
 async function until(predicate: () => boolean, message: string): Promise<void> {
@@ -53,7 +60,7 @@ async function until(predicate: () => boolean, message: string): Promise<void> {
   }
 }
 
-async function fixture(taskMode = false) {
+async function fixture(taskMode = false, launch?: RunLaunchSettings) {
   let source: string | undefined;
   if (taskMode) {
     source = realpathSync(mkdtempSync(join(tmpdir(), "bridge-process-source-")));
@@ -63,7 +70,11 @@ async function fixture(taskMode = false) {
         ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args],
         {
           cwd: source,
-          env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+          env: {
+            ...env,
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+          },
           stdout: "pipe",
           stderr: "pipe",
         },
@@ -88,8 +99,25 @@ async function fixture(taskMode = false) {
   try {
     cfg = preparePilot(
       undefined,
-      source ? { project: source, brief: "Implement and review the fixture task." } : undefined,
+      source
+        ? {
+            project: source,
+            brief: "Implement and review the fixture task.",
+            settings: launch,
+          }
+        : undefined,
     );
+    if (taskMode && launch === undefined) {
+      cfg.version = 1;
+      delete cfg.launch;
+      const db = new Database(cfg.db);
+      try {
+        db.run("UPDATE runtime_attempt SET access = 'read' WHERE id = ?", [cfg.agents[1]!.runtimeId]);
+      } finally {
+        db.close();
+      }
+      writePrivateJson(pilotFile(cfg.root, "pilot.json"), cfg);
+    }
   } catch (error) {
     if (source) rmSync(source, { recursive: true, force: true });
     throw error;
@@ -100,8 +128,19 @@ async function fixture(taskMode = false) {
   writeFileSync(
     fake,
     [
-      'import { writeFileSync } from "node:fs";',
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
       "const capture = process.env.FIXTURE_CAPTURE!;",
+      "const argv = process.argv.slice(2);",
+      "const value = (flag: string) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;",
+      "let controlsMatch: boolean | undefined;",
+      "if (process.env.FIXTURE_EXPECTED_CONTROLS) {",
+      "  const expected = JSON.parse(process.env.FIXTURE_EXPECTED_CONTROLS);",
+      "  const lower = JSON.parse(process.env.FIXTURE_LOWER_SETTINGS!);",
+      '  const generated = JSON.parse(readFileSync(value("--settings")!, "utf8"));',
+      "  const effective = { ...process.env, ...lower.env, ...generated.env };",
+      "  controlsMatch = Object.entries(expected.env).every(([name, value]) => effective[name] === value)",
+      "    && generated.alwaysThinkingEnabled === expected.thinking;",
+      "}",
       "const signals: string[] = [];",
       "const exitAfterSignals = Number(process.env.FIXTURE_EXIT_AFTER_SIGNALS);",
       'for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => {',
@@ -115,6 +154,8 @@ async function fixture(taskMode = false) {
       "  credentialMatches: process.env.AGENT_BRIDGE_TOKEN === process.env.FIXTURE_EXPECTED_TOKEN,",
       "  endpointMatches: process.env.AGENT_BRIDGE_URL === process.env.FIXTURE_EXPECTED_URL,",
       "  negotiation: process.env.MCP_PROTOCOL_NEGOTIATION,",
+      "  launchRecorded: existsSync(process.env.FIXTURE_LAUNCH_RECORD!), controlsMatch,",
+      "  inheritedControlsMatch: process.env.FIXTURE_EXPECTED_ENV ? Object.entries(JSON.parse(process.env.FIXTURE_EXPECTED_ENV)).every(([name, value]) => process.env[name] === value) : undefined,",
       '  gitEnvironment: Object.keys(process.env).filter((key) => key.startsWith("GIT_")),',
       "  gitWorkspace: git.exitCode === 0 ? git.stdout.toString().trim() : null,",
       "}), { mode: 0o600 });",
@@ -130,7 +171,10 @@ async function fixture(taskMode = false) {
     );
   }
   const children: Bun.Subprocess[] = [];
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}` };
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+  };
   const coordinator = Bun.spawn([process.execPath, sourceFile("process.ts"), "coordinator", cfg.root], {
     cwd: cfg.root,
     env,
@@ -150,7 +194,10 @@ async function fixture(taskMode = false) {
     throw error;
   }
   const endpoint = readPrivateJson<PilotEndpoint>(pilotFile(cfg.root, "endpoint.json"));
-  writePrivateJson(agentFile(cfg.root, "codex", "thread"), { threadId: THREAD });
+  if (cfg.version === 2) writeNativeConfig(cfg, endpoint);
+  writePrivateJson(agentFile(cfg.root, "codex", "thread"), {
+    threadId: THREAD,
+  });
   return {
     cfg,
     endpoint,
@@ -182,6 +229,7 @@ async function fixture(taskMode = false) {
           FIXTURE_EXIT_AFTER_SIGNALS: String(exitAfterSignals),
           FIXTURE_EXPECTED_TOKEN: agent.token,
           FIXTURE_EXPECTED_URL: `http://127.0.0.1:${endpoint.port}`,
+          FIXTURE_LAUNCH_RECORD: agentFile(cfg.root, agentId, "launch"),
         },
         stdin: "ignore",
         stdout: "pipe",
@@ -193,7 +241,12 @@ async function fixture(taskMode = false) {
         "fake native child did not publish ownership",
       );
       const capture = JSON.parse(readFileSync(capturePath, "utf8")) as Capture;
-      return { wrapper, capture, capturePath, record: processRecord(cfg.root, role)! };
+      return {
+        wrapper,
+        capture,
+        capturePath,
+        record: processRecord(cfg.root, role)!,
+      };
     },
     async close() {
       for (const child of children)
@@ -290,6 +343,7 @@ describe("pilot wrappers with isolated fake native executables", () => {
       ]);
       expect(native.capture.credentialMatches).toBe(true);
       expect(native.capture.endpointMatches).toBe(true);
+      expect(native.capture.launchRecorded).toBe(false);
       expect(native.record.pid).toBe(native.wrapper.pid);
       expect(native.record.childPid).toBe(native.capture.pid);
       expect(native.record.childBorn).toBeString();
@@ -427,6 +481,163 @@ describe("pilot wrappers with isolated fake native executables", () => {
       expect(native.capture.negotiation).toBe("legacy");
       expect(native.capture.credentialMatches).toBe(true);
       expect(native.capture.endpointMatches).toBe(true);
+      expect(host.cfg.version).toBe(1);
+      expect(native.capture.launchRecorded).toBe(false);
+    } finally {
+      await host.close();
+    }
+  }, 10_000);
+
+  test("v2 Claude publishes configured controls before spawn and defeats lower settings env reinjection", async () => {
+    const launch = resolveLaunchSettings({
+      version: 1,
+      claude: {
+        model: "claude-sonnet-4-6",
+        effort: "max",
+        thinking: "on",
+      },
+    });
+    const host = await fixture(true, launch);
+    try {
+      const startedAt = Date.now();
+      const preserved = {
+        ANTHROPIC_AUTH_TOKEN: "fixture-private-auth",
+        ANTHROPIC_BASE_URL: "https://fixture-provider.invalid",
+        HTTPS_PROXY: "http://fixture-proxy.invalid:8080",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "fixture-private-deployment",
+      };
+      const native = await host.start("claude", 1, {
+        ...preserved,
+        ANTHROPIC_MODEL: "fixture-private-parent-model",
+        CLAUDE_CODE_EFFORT_LEVEL: "low",
+        MAX_THINKING_TOKENS: "0",
+        CLAUDE_CODE_DISABLE_THINKING: "1",
+        CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1",
+        FIXTURE_EXPECTED_ENV: JSON.stringify(preserved),
+        FIXTURE_LOWER_SETTINGS: JSON.stringify({
+          env: {
+            ANTHROPIC_MODEL: "fixture-private-settings-model",
+            CLAUDE_CODE_EFFORT_LEVEL: "low",
+            MAX_THINKING_TOKENS: "0",
+            CLAUDE_CODE_DISABLE_THINKING: "1",
+            CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1",
+          },
+        }),
+        FIXTURE_EXPECTED_CONTROLS: JSON.stringify({
+          thinking: true,
+          env: {
+            ANTHROPIC_MODEL: "claude-sonnet-4-6",
+            CLAUDE_CODE_EFFORT_LEVEL: "max",
+            MAX_THINKING_TOKENS: "31999",
+            CLAUDE_CODE_DISABLE_THINKING: "0",
+            CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "0",
+          },
+        }),
+      });
+      const flag = (name: string) => native.capture.argv[native.capture.argv.indexOf(name) + 1];
+      expect(flag("--model")).toBe(launch.claude.model);
+      expect(flag("--effort")).toBe("max");
+      expect(flag("--permission-mode")).toBe("bypassPermissions");
+      expect(native.capture.negotiation).toBe("legacy");
+      expect(native.capture.launchRecorded).toBe(true);
+      expect(native.capture.controlsMatch).toBe(true);
+      expect(native.capture.inheritedControlsMatch).toBe(true);
+      const path = agentFile(host.cfg.root, "claude", "launch");
+      const record = readPrivateJson<NativeLaunchRecord>(path);
+      expect(record).toMatchObject({
+        version: 1,
+        runtimeId: host.cfg.agents[0]!.runtimeId,
+        role: "claude",
+        configured: { ...launch.claude, thinkingBudgetTokens: 31999 },
+      });
+      expect(record.recordedAt).toBeGreaterThanOrEqual(startedAt);
+      expect(record.recordedAt).toBeLessThanOrEqual(Date.now());
+      expect(record.environment).toContainEqual({
+        name: "CLAUDE_CODE_EFFORT_LEVEL",
+        disposition: "replaced",
+      });
+      expect(record.environment).toContainEqual({
+        name: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        disposition: "inherited",
+      });
+      const serialized = readFileSync(path, "utf8");
+      expect(serialized).not.toContain("fixture-private");
+      expect(serialized).not.toContain(host.cfg.agents[0]!.token);
+      expect(serialized).not.toContain("ANTHROPIC_AUTH_TOKEN");
+    } finally {
+      await host.close();
+    }
+  }, 10_000);
+
+  test("v2 inherit leaves native controls intact and records names without inherited values", async () => {
+    const launch = resolveLaunchSettings({
+      version: 1,
+      claude: {
+        model: "inherit",
+        effort: "inherit",
+        thinking: "inherit",
+        permissionMode: "plan",
+      },
+    });
+    const host = await fixture(true, launch);
+    try {
+      const inherited = {
+        ANTHROPIC_MODEL: "fixture-private-inherited-model",
+        CLAUDE_CODE_EFFORT_LEVEL: "high",
+        MAX_THINKING_TOKENS: "0",
+        CLAUDE_CODE_DISABLE_THINKING: "1",
+      };
+      const native = await host.start("claude", 1, {
+        ...inherited,
+        FIXTURE_EXPECTED_ENV: JSON.stringify(inherited),
+      });
+      expect(native.capture.argv).not.toContain("--model");
+      expect(native.capture.argv).not.toContain("--effort");
+      expect(native.capture.argv[native.capture.argv.indexOf("--permission-mode") + 1]).toBe("plan");
+      expect(native.capture.inheritedControlsMatch).toBe(true);
+      const record = readPrivateJson<NativeLaunchRecord>(agentFile(host.cfg.root, "claude", "launch"));
+      expect(record.configured).toEqual(launch.claude);
+      expect(record.environment.every((entry) => entry.disposition === "inherited")).toBe(true);
+      expect(JSON.stringify(record)).not.toContain("fixture-private-inherited-model");
+    } finally {
+      await host.close();
+    }
+  }, 10_000);
+
+  test("v2 Codex host owns configured policy and the exact-thread TUI cannot overwrite its launch record", async () => {
+    const launch = resolveLaunchSettings();
+    const host = await fixture(true, launch);
+    try {
+      const native = await host.start("codex-host");
+      for (const config of [
+        'model="gpt-6-astra"',
+        'model_reasoning_effort="ultra"',
+        'approval_policy="never"',
+        'sandbox_mode="danger-full-access"',
+      ])
+        expect(native.capture.argv).toContain(config);
+      expect(native.capture.argv.at(-3)).toBe("app-server");
+      expect(native.capture.launchRecorded).toBe(true);
+      const path = agentFile(host.cfg.root, "codex", "launch");
+      const before = readFileSync(path, "utf8");
+      expect(readPrivateJson<NativeLaunchRecord>(path)).toMatchObject({
+        version: 1,
+        role: "codex-host",
+        runtimeId: host.cfg.agents[1]!.runtimeId,
+        configured: launch.codex,
+        environment: [],
+      });
+      const tui = await host.start("codex");
+      expect(tui.capture.argv).toEqual([
+        "resume",
+        THREAD,
+        "--remote",
+        `unix://${host.cfg.socketPath}`,
+        "--cd",
+        host.cfg.agents[1]!.workspace,
+      ]);
+      expect(readFileSync(path, "utf8")).toBe(before);
+      expect(before).not.toContain(host.cfg.agents[1]!.token);
     } finally {
       await host.close();
     }

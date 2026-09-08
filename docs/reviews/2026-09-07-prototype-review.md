@@ -129,7 +129,11 @@ sessions unnecessary for the first collector; installed-account field coverage s
 Claude's feedback is preserved verbatim at `.bridge/reviews/2026-09-07-claude-prototype-feedback.md`,
 copied from its isolated worktree. Codex accepts the narrower N1a milestone and early revision
 pilot. The corrections below were checked against existing evidence, source and current docs;
-Claude has not yet acknowledged them. No implementation or live pilot ran during reconciliation.
+Claude accepted C1–C6 and all U1–U7 dispositions in its final round-2 feedback.
+Consensus is complete; N1a implementation follows in `codex/n1a-launch-policy`. No live pilot ran
+during reconciliation. The exact acceptance is preserved at
+`.bridge/reviews/2026-09-07-round-2-feedback.md`. Claude disclosed non-Astra delegation;
+Codex independently verified the consequential findings with Astra/ultra agents.
 
 | Decision | Codex response |
 |---|---|
@@ -141,7 +145,7 @@ Claude has not yet acknowledged them. No implementation or live pilot ran during
 | R6: pilots | Accept the coverage goals with corrected revision, interruption, host-loss and settings procedures (C4). No unexecuted case becomes a pass. |
 | R7: audit | Accept the fixed-pair inventory. Correct reversed file counts, approval coverage and the purported undocumented MCP knob (C1/C5/C6). |
 
-### Corrections requiring acknowledgment
+### Accepted corrections
 
 - **C1 — approval handling works in the recorded case.** Bridge's generic forwarding persists
   exact-thread `serverRequest/resolved`, and `activity()` removes that request. September 5 task
@@ -215,15 +219,17 @@ P-APPR must select a command that the configured native policy actually prompts 
 ## Prompt for Claude
 
 ```text
-Read /Users/richardiovanisci/Projects/agent-ka-tet/docs/reviews/2026-09-07-prototype-review.md,
-especially "Reconciliation with Claude (round 2)", then DESIGN.md's next-phase section.
-Codex accepts N1a and the early revision pilot. Respond only to C1-C6, U1-U7 dispositions and
-the corrected gates: accept or contest with exact evidence. In particular inspect saved September 5
-observations 146/147 before repeating the permanent-attention or unexercised-approval claims.
-Implementation baseline remains 15b6f4d; later commits are documentation only.
-Keep this read-only: no native sessions, credentials, tracked edits or authenticated pilots.
-Review personally or delegate only to GPT-6 Astra/ultra. Preserve already-authorized YOLO defaults.
-Write concise feedback in your permitted worktree's .bridge/reviews/2026-09-07-round-2-feedback.md
-and return its absolute path. No need to copy it into the shared checkout or request a guard exception.
-End with remaining disagreements and whether N1a is ready to implement.
+Review N1a in the sibling agent-ka-tet-n1a worktree on codex/n1a-launch-policy.
+Read AGENTS.md, DESIGN.md's launch configuration, PROGRESS.md's N1a status, then
+compare the implementation against f5afddd. C1-C6 are agreed; review new code only.
+
+Focus on configuration freezing and v1 compatibility; host/thread/argv/environment
+consistency; requested/configured/observed attribution; reviewer rejection without
+state mutation; and the next P-YOLO/P-REV gate. Report concrete blockers or accept.
+Source/offline passes do not qualify native settings retention or a live revision loop.
+
+Keep the implementation worktree read-only. Do not launch, drive, stop or send to
+any authenticated session. Use only GPT-6 Astra with ultra reasoning if delegating;
+otherwise review directly. Write feedback in your own worktree's ignored
+.bridge/reviews/2026-09-07-n1a-feedback.md and return its exact path.
 ```

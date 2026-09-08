@@ -22,7 +22,12 @@ function git(cwd: string, args: string[]): Buffer {
     ["git", "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args],
     {
       cwd,
-      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" },
+      env: {
+        ...env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
       stdout: "pipe",
       stderr: "pipe",
     },
@@ -58,6 +63,30 @@ export function validateArtifact(cfg: PilotConfig, commit: string): void {
       .length
   )
     throw new Error("assigned Claude worktree has uncommitted changes");
+}
+
+export function validateReviewer(cfg: PilotConfig, runtimeId: string): void {
+  if (!cfg.task) throw new Error("review requires a task run");
+  const reviewers = cfg.agents.filter((agent) => agent.id === "codex" && agent.kind === "codex");
+  if (reviewers.length !== 1 || reviewers[0]!.runtimeId !== runtimeId)
+    throw new Error("review requires the assigned Codex runtime");
+  const workspace = reviewers[0]!.workspace;
+  if (
+    workspace !== join(cfg.root, "codex") ||
+    realpathSync(workspace) !== workspace ||
+    git(workspace, ["rev-parse", "--show-toplevel"]).toString().trim() !== workspace
+  )
+    throw new Error("review requires the assigned Codex worktree");
+  if (
+    !SHA.test(cfg.task.baseCommit) ||
+    git(workspace, ["rev-parse", "--verify", "HEAD"]).toString().trim() !== cfg.task.baseCommit
+  )
+    throw new Error("assigned Codex worktree HEAD must remain at the recorded base");
+  if (
+    git(workspace, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none", "-z"])
+      .length
+  )
+    throw new Error("assigned Codex worktree has uncommitted changes");
 }
 
 function existingPatch(path: string, patch: Buffer): boolean {

@@ -18,6 +18,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { openCoordinationStore } from "../coordination/store.ts";
 import type { RuntimeKind } from "../coordination/types.ts";
+import { claudeNativeSettings } from "../run/launch.ts";
+import { resolveLaunchSettings, validateLaunchSettings, type RunLaunchSettings } from "../run/settings.ts";
 
 export interface PilotAgent {
   id: string;
@@ -29,7 +31,8 @@ export interface PilotAgent {
 }
 
 export interface PilotConfig {
-  version: 1;
+  version: 1 | 2;
+  launch?: RunLaunchSettings;
   id: string;
   root: string;
   repo: string;
@@ -58,7 +61,10 @@ export const sourceFile = (name: string) => fileURLToPath(new URL(name, import.m
 
 export function writePrivateJson(path: string, value: unknown): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+  writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", {
+    flag: "wx",
+    mode: 0o600,
+  });
   renameSync(temporary, path);
 }
 
@@ -104,8 +110,21 @@ function ownedDirectory(path: string, privateMode = false): void {
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
 function validatePilot(cfg: PilotConfig, canonical: string): void {
-  if (!cfg || cfg.version !== 1 || cfg.root !== canonical || !/^[a-f0-9]{12}$/.test(cfg.id))
+  if (!cfg || ![1, 2].includes(cfg.version) || cfg.root !== canonical || !/^[a-f0-9]{12}$/.test(cfg.id))
     throw new Error("invalid pilot identity");
+  if (cfg.version === 2) {
+    validateLaunchSettings(cfg.launch);
+    if (!cfg.task) throw new Error("task configuration does not match persisted state");
+  } else if (cfg.launch !== undefined) throw new Error("version-1 runs cannot change launch policy");
+  if (cfg.version === 2) {
+    const policy = readPrivateJson<{
+      version: number;
+      runId: string;
+      digest: string;
+    }>(pilotFile(canonical, "launch-policy.json"));
+    if (policy.version !== 1 || policy.runId !== cfg.runId || policy.digest !== launchDigest(cfg.launch!))
+      throw new Error("launch settings changed after preparation; prepare a new run");
+  }
   if (cfg.codexHistoryMode !== undefined && cfg.codexHistoryMode !== "legacy")
     throw new Error("unsupported pilot Codex history mode");
   if (
@@ -187,7 +206,7 @@ function validatePilot(cfg: PilotConfig, canonical: string): void {
         runtime.agent_id !== agent.id ||
         runtime.kind !== agent.kind ||
         runtime.workspace !== agent.workspace ||
-        runtime.access !== (cfg.task && agent.kind === "codex" ? "read" : "write") ||
+        runtime.access !== (cfg.version === 1 && cfg.task && agent.kind === "codex" ? "read" : "write") ||
         runtime.credential_hash !== createHash("sha256").update(agent.token).digest("hex") ||
         (agent.kind === "claude" && runtime.expected_session_id !== agent.sessionId) ||
         (runtime.session_id !== null && runtime.session_id !== runtime.expected_session_id)
@@ -241,7 +260,12 @@ function git(cwd: string, args: string[]): string {
     ],
     {
       cwd,
-      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" },
+      env: {
+        ...env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
       stdout: "pipe",
       stderr: "pipe",
     },
@@ -250,13 +274,25 @@ function git(cwd: string, args: string[]): string {
   return result.stdout.toString().trim();
 }
 
-export function preparePilot(directory?: string, task?: { project: string; brief: string }): PilotConfig {
+function launchDigest(settings: RunLaunchSettings): string {
+  return createHash("sha256")
+    .update(JSON.stringify(resolveLaunchSettings(settings)))
+    .digest("hex");
+}
+
+export function preparePilot(
+  directory?: string,
+  task?: { project: string; brief: string; settings?: RunLaunchSettings },
+): PilotConfig {
+  const launch = task ? resolveLaunchSettings(task.settings) : undefined;
   let source: { sourceRepo: string; baseCommit: string } | undefined;
   if (task) {
     if (!task.brief.trim() || Buffer.byteLength(task.brief) > 64 * 1024)
       throw new Error("task brief must contain 1–65536 bytes");
     const sourceRepo = realpathSync(git(realpathSync(task.project), ["rev-parse", "--show-toplevel"]));
-    if (git(sourceRepo, ["status", "--porcelain"]))
+    if (
+      git(sourceRepo, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none", "-z"])
+    )
       throw new Error("source checkout has uncommitted changes; commit or stash them before preparing a run");
     const baseCommit = git(sourceRepo, ["rev-parse", "--verify", "HEAD^{commit}"]);
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("the prototype requires a SHA-1 Git repository");
@@ -341,16 +377,24 @@ export function preparePilot(directory?: string, task?: { project: string; brief
         agentId: kind,
         kind,
         workspace,
-        access: task && kind === "codex" ? "read" : "write",
+        access: "write",
         ...(sessionId ? { expectedSessionId: sessionId } : {}),
       });
-      return { id: kind, kind, workspace, runtimeId: runtime.id, token, ...(sessionId ? { sessionId } : {}) };
+      return {
+        id: kind,
+        kind,
+        workspace,
+        runtimeId: runtime.id,
+        token,
+        ...(sessionId ? { sessionId } : {}),
+      };
     });
     const socketDir = realpathSync(mkdtempSync("/tmp/ab-"));
     chmodSync(socketDir, 0o700);
     writePrivateJson(join(socketDir, "pilot-owner.json"), { id, root });
     cfg = {
-      version: 1,
+      version: task ? 2 : 1,
+      ...(launch ? { launch } : {}),
       id,
       root,
       repo,
@@ -372,6 +416,12 @@ export function preparePilot(directory?: string, task?: { project: string; brief
         brief: task.brief.trim(),
         implementerRuntimeId: agents[0]!.runtimeId,
         reviewerRuntimeId: agents[1]!.runtimeId,
+      });
+    if (launch)
+      writeNativeJson(pilotFile(root, "launch-policy.json"), {
+        version: 1,
+        runId: run.id,
+        digest: launchDigest(launch),
       });
     writePrivateJson(pilotFile(root, "pilot.json"), cfg);
     const bridge = `${shellQuote(process.execPath)} ${shellQuote(sourceFile("../../bin/bridge"))} pilot`;
@@ -463,7 +513,8 @@ function writeTaskPlan(cfg: PilotConfig): void {
     [
       "# Native agent pair",
       "",
-      "Claude implements in its own worktree. Codex reviews the committed artifact with read-only access.",
+      "Claude implements and Codex reviews the committed artifact in separate worktrees.",
+      "Both runtimes can write. The reviewer must keep its checkout clean at the recorded base.",
       "The source checkout is untouched. A task finishes only after reviewer acceptance.",
       "",
       "## Setup",
@@ -471,7 +522,7 @@ function writeTaskPlan(cfg: PilotConfig): void {
       "Review the prepared project and seven hooks in this setup Codex TUI, then exit without a prompt:",
       "",
       "```sh",
-      `env -u AGENT_BRIDGE_URL -u AGENT_BRIDGE_TOKEN codex -c 'model_reasoning_effort="ultra"' --model gpt-6-astra --cd ${shellQuote(cfg.repo)}`,
+      `env -u AGENT_BRIDGE_URL -u AGENT_BRIDGE_TOKEN codex -c ${shellQuote(`model_reasoning_effort=${JSON.stringify(cfg.launch!.codex.effort)}`)} --model ${shellQuote(cfg.launch!.codex.model)} --cd ${shellQuote(cfg.repo)}`,
       "```",
       "",
       "Launch the native pair, review Claude's project/Channel prompts and both native sessions, then detach:",
@@ -481,7 +532,13 @@ function writeTaskPlan(cfg: PilotConfig): void {
       `${bridge} attach ${root}`,
       "```",
       "",
-      "The nine Bridge tools are pre-approved for this run. Shell and filesystem permissions remain native.",
+      "The nine Bridge tools are pre-approved. Native launch settings are fixed at preparation:",
+      "",
+      "```json",
+      JSON.stringify(cfg.launch, null, 2),
+      "```",
+      "",
+      "Bypass is the default for new runs; native managed policies may still restrict it.",
       "Codex uses experimental legacy history on its private host. The budget is 32 messages and four hours.",
       "",
       "```sh",
@@ -560,15 +617,22 @@ export function writeNativeConfig(cfg: PilotConfig, endpoint: PilotEndpoint): vo
     "SessionEnd",
     "PermissionRequest",
     "PermissionDenied",
+    ...(cfg.version === 2 ? ["PreToolUse"] : []),
     "PostToolUse",
     "Notification",
   ]) {
     hooks[event] = [{ hooks: [http] }];
   }
   const allow = bridgeToolNames(cfg).map((name) => `mcp__agent-bridge__${name}`);
-  writeNativeJson(pilotFile(cfg.root, "claude.settings.json"), { hooks, permissions: { allow } });
+  writeNativeJson(pilotFile(cfg.root, "claude.settings.json"), {
+    hooks,
+    permissions: { allow },
+    ...(cfg.launch ? claudeNativeSettings(cfg.launch.claude) : {}),
+  });
   writeNativeJson(pilotFile(cfg.root, "claude.mcp.json"), {
-    mcpServers: { "agent-bridge": { command: process.execPath, args: [mcp, "--channel"] } },
+    mcpServers: {
+      "agent-bridge": { command: process.execPath, args: [mcp, "--channel"] },
+    },
   });
   writeCodexHooks(cfg);
 }

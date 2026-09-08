@@ -19,10 +19,40 @@ export interface CodexConnectOptions {
 export interface CodexThreadOptions {
   cwd: string;
   model?: string;
-  approvalPolicy?: "on-request" | "untrusted";
-  sandbox?: "read-only" | "workspace-write";
+  approvalPolicy?: "on-request" | "untrusted" | "never";
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   historyMode?: "legacy";
   config?: Record<string, unknown>;
+}
+
+export type CodexSandboxPolicy =
+  | { type: "dangerFullAccess" }
+  | { type: "readOnly"; networkAccess: boolean }
+  | { type: "externalSandbox"; networkAccess: "restricted" | "enabled" }
+  | {
+      type: "workspaceWrite";
+      writableRoots: string[];
+      networkAccess: boolean;
+      excludeTmpdirEnvVar: boolean;
+      excludeSlashTmp: boolean;
+    };
+
+export interface CodexThreadSettings {
+  model?: string;
+  modelProvider?: string;
+  reasoningEffort?: string | null;
+  approvalPolicy?:
+    | NonNullable<CodexThreadOptions["approvalPolicy"]>
+    | {
+        granular: {
+          sandbox_approval: boolean;
+          rules: boolean;
+          skill_approval: boolean;
+          request_permissions: boolean;
+          mcp_elicitations: boolean;
+        };
+      };
+  sandbox?: CodexSandboxPolicy;
 }
 
 export interface CodexNotification {
@@ -70,6 +100,68 @@ function nativeThread(result: unknown): Record<string, unknown> & { id: string }
   }
   uuid(result.thread.id);
   return result.thread as Record<string, unknown> & { id: string };
+}
+
+function nativeSettings(result: unknown): CodexThreadSettings {
+  if (!object(result)) throw new Error("Invalid Codex settings response");
+  const settings: CodexThreadSettings = {};
+  for (const key of ["model", "modelProvider", "reasoningEffort"] as const) {
+    if (!(key in result)) continue;
+    const value = result[key];
+    if (key === "reasoningEffort" && value === null) settings[key] = null;
+    else if (typeof value === "string") settings[key] = value;
+    else throw new Error(`Invalid Codex ${key} response`);
+  }
+  if ("approvalPolicy" in result) {
+    const policy = result.approvalPolicy;
+    if (policy === "never" || policy === "on-request" || policy === "untrusted") {
+      settings.approvalPolicy = policy;
+    } else if (object(policy) && object(policy.granular)) {
+      const { sandbox_approval, rules, skill_approval, request_permissions, mcp_elicitations } =
+        policy.granular;
+      if (
+        typeof sandbox_approval !== "boolean" ||
+        typeof rules !== "boolean" ||
+        typeof skill_approval !== "boolean" ||
+        typeof request_permissions !== "boolean" ||
+        typeof mcp_elicitations !== "boolean"
+      )
+        throw new Error("Invalid Codex granular approval response");
+      settings.approvalPolicy = {
+        granular: { sandbox_approval, rules, skill_approval, request_permissions, mcp_elicitations },
+      };
+    } else throw new Error("Invalid Codex approval policy response");
+  }
+  if ("sandbox" in result) {
+    const sandbox = result.sandbox;
+    if (!object(sandbox)) throw new Error("Invalid Codex sandbox response");
+    if (sandbox.type === "dangerFullAccess") {
+      settings.sandbox = { type: sandbox.type };
+    } else if (sandbox.type === "readOnly" && typeof sandbox.networkAccess === "boolean") {
+      settings.sandbox = { type: sandbox.type, networkAccess: sandbox.networkAccess };
+    } else if (
+      sandbox.type === "externalSandbox" &&
+      (sandbox.networkAccess === "restricted" || sandbox.networkAccess === "enabled")
+    ) {
+      settings.sandbox = { type: sandbox.type, networkAccess: sandbox.networkAccess };
+    } else if (
+      sandbox.type === "workspaceWrite" &&
+      Array.isArray(sandbox.writableRoots) &&
+      sandbox.writableRoots.every((root: unknown) => typeof root === "string" && isAbsolute(root)) &&
+      typeof sandbox.networkAccess === "boolean" &&
+      typeof sandbox.excludeTmpdirEnvVar === "boolean" &&
+      typeof sandbox.excludeSlashTmp === "boolean"
+    ) {
+      settings.sandbox = {
+        type: sandbox.type,
+        writableRoots: [...sandbox.writableRoots],
+        networkAccess: sandbox.networkAccess,
+        excludeTmpdirEnvVar: sandbox.excludeTmpdirEnvVar,
+        excludeSlashTmp: sandbox.excludeSlashTmp,
+      };
+    } else throw new Error("Invalid Codex sandbox response");
+  }
+  return settings;
 }
 
 interface PendingRequest {
@@ -166,6 +258,7 @@ export class CodexClient {
     requestId: string;
     threadId: string;
     thread: Record<string, unknown> & { id: string };
+    settings: CodexThreadSettings;
   }> {
     if (this.boundThread || this.binding || this.threadStarted)
       throw new Error("This Codex client already started or bound a thread");
@@ -173,12 +266,15 @@ export class CodexClient {
     if (options.historyMode !== undefined && (options.historyMode !== "legacy" || !this.experimentalApi)) {
       throw new Error("Legacy thread history requires explicit experimental API opt-in");
     }
-    if (options.sandbox !== undefined && !["read-only", "workspace-write"].includes(options.sandbox)) {
+    if (
+      options.sandbox !== undefined &&
+      !["read-only", "workspace-write", "danger-full-access"].includes(options.sandbox)
+    ) {
       throw new Error("Unsupported pilot sandbox");
     }
     if (
       options.approvalPolicy !== undefined &&
-      !["on-request", "untrusted"].includes(options.approvalPolicy)
+      !["on-request", "untrusted", "never"].includes(options.approvalPolicy)
     ) {
       throw new Error("Unsupported pilot approval policy");
     }
@@ -195,7 +291,7 @@ export class CodexClient {
     const result = await this.request("thread/start", params, requestId);
     try {
       const thread = nativeThread(result);
-      return { requestId, threadId: thread.id, thread };
+      return { requestId, threadId: thread.id, thread, settings: nativeSettings(result) };
     } catch (error) {
       throw new CodexRequestError(requestId, "thread/start", "protocol", result);
     }

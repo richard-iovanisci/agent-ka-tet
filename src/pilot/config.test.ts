@@ -64,7 +64,12 @@ function git(cwd: string, ...args: string[]): string {
     ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args],
     {
       cwd,
-      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" },
+      env: {
+        ...env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
       stdout: "pipe",
       stderr: "pipe",
     },
@@ -95,7 +100,10 @@ function sourceRepository() {
 function taskPilot() {
   const source = sourceRepository();
   const brief = "Implement the requested change.\nReview the committed artifact.";
-  const cfg = preparePilot(join(directory(), "task run with spaces"), { project: source.source, brief });
+  const cfg = preparePilot(join(directory(), "task run with spaces"), {
+    project: source.source,
+    brief,
+  });
   cleanup.push(cfg.socketDir);
   return { ...source, brief, cfg };
 }
@@ -180,7 +188,7 @@ describe("disposable pilot configuration", () => {
     const cfg = pilot();
     const path = join(cfg.root, "pilot.json");
     for (const changed of [
-      { ...cfg, version: 2 },
+      { ...cfg, version: 3 },
       { ...cfg, id: "not-a-pilot-id" },
       { ...cfg, agents: cfg.agents.slice(0, 1) },
       { ...cfg, agents: cfg.agents.slice().reverse() },
@@ -204,7 +212,10 @@ describe("disposable pilot configuration", () => {
       { ...cfg, agents: [{ ...claude, kind: "codex" }, codex] },
       { ...cfg, agents: [{ ...claude, workspace: codex.workspace }, codex] },
       { ...cfg, agents: [{ ...claude, runtimeId: randomUUID() }, codex] },
-      { ...cfg, agents: [{ ...claude, token: randomBytes(32).toString("base64url") }, codex] },
+      {
+        ...cfg,
+        agents: [{ ...claude, token: randomBytes(32).toString("base64url") }, codex],
+      },
       { ...cfg, agents: [{ ...claude, sessionId: randomUUID() }, codex] },
       { ...cfg, runId: randomUUID() },
     ];
@@ -301,6 +312,48 @@ describe("private JSON state", () => {
 });
 
 describe("task run preparation", () => {
+  test("refuses a changed launch policy before generating native configuration", () => {
+    const { cfg } = taskPilot();
+    const altered = {
+      ...cfg,
+      launch: {
+        ...cfg.launch!,
+        codex: { ...cfg.launch!.codex, effort: "medium" as const },
+      },
+    };
+    writePrivateJson(join(cfg.root, "pilot.json"), altered);
+    expect(() => loadPilot(cfg.root)).toThrow(/changed after preparation/);
+    expect(() =>
+      writeNativeConfig(altered, {
+        pid: process.pid,
+        born: "fixture",
+        port: 43210,
+        instance: "fixture",
+      }),
+    ).toThrow(/changed after preparation/);
+    expect(existsSync(join(cfg.root, "claude.settings.json"))).toBe(false);
+  });
+
+  test("new task policies are versioned and old read-only runs remain loadable", () => {
+    const { cfg } = taskPilot();
+    expect(cfg.version).toBe(2);
+    expect(cfg.launch?.claude.permissionMode).toBe("bypassPermissions");
+    expect(cfg.launch?.codex).toMatchObject({
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+    expect(loadPilot(cfg.root)).toEqual(cfg);
+    const { launch, ...legacy } = cfg;
+    legacy.version = 1;
+    const db = new Database(cfg.db);
+    db.query("UPDATE runtime_attempt SET access = 'read' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
+    db.close();
+    writePrivateJson(join(cfg.root, "pilot.json"), legacy);
+    expect(loadPilot(cfg.root)).toEqual(legacy);
+    writePrivateJson(join(cfg.root, "pilot.json"), { ...legacy, launch });
+    expect(() => loadPilot(cfg.root)).toThrow(/version-1 runs/);
+  });
+
   test("refuses nested destinations directly or through a symlink before touching the source", () => {
     const { source, baseCommit } = sourceRepository();
     const alias = join(directory(), "source alias");
@@ -384,7 +437,7 @@ describe("task run preparation", () => {
         {
           id: cfg.agents[1]!.runtimeId,
           agent_id: "codex",
-          access: "read",
+          access: "write",
           workspace: cfg.agents[1]!.workspace,
         },
       ]);
@@ -486,7 +539,10 @@ describe("task run preparation", () => {
     const foreign = sourceRepository();
     writeFileSync(join(foreign.source, "foreign.txt"), "foreign sentinel\n");
     const before = git(foreign.source, "status", "--porcelain");
-    const inherited = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+    const inherited = {
+      GIT_DIR: process.env.GIT_DIR,
+      GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+    };
     try {
       process.env.GIT_DIR = join(foreign.source, ".git");
       process.env.GIT_WORK_TREE = foreign.source;
@@ -514,11 +570,24 @@ describe("task run preparation", () => {
     }
   });
 
+  test("source config cannot hide untracked files from the preparation check", () => {
+    const { source } = sourceRepository();
+    git(source, "config", "status.showUntrackedFiles", "no");
+    writeFileSync(join(source, "hidden-untracked.txt"), "preserve local work");
+    const destination = join(directory(), "refused-run");
+    expect(() => preparePilot(destination, { project: source, brief: "task" })).toThrow(
+      /uncommitted changes/,
+    );
+    expect(existsSync(destination)).toBe(false);
+  });
+
   test("source inspection never executes a repository fsmonitor callback", () => {
     const { source } = sourceRepository();
     const sentinel = join(directory(), "fsmonitor-ran");
     const callback = join(directory(), "fsmonitor.sh");
-    writeFileSync(callback, `#!/bin/sh\ntouch ${shellQuote(sentinel)}\n`, { mode: 0o700 });
+    writeFileSync(callback, `#!/bin/sh\ntouch ${shellQuote(sentinel)}\n`, {
+      mode: 0o700,
+    });
     git(source, "config", "core.fsmonitor", callback);
     const config = readFileSync(join(source, ".git", "config"));
     const cfg = preparePilot(join(directory(), "isolated task"), {
@@ -536,7 +605,10 @@ describe("task run preparation", () => {
     const path = join(cfg.root, "pilot.json");
     writePrivateJson(path, { ...cfg, task: undefined });
     expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
-    writePrivateJson(path, { ...cfg, task: { ...cfg.task, baseCommit: "0".repeat(40) } });
+    writePrivateJson(path, {
+      ...cfg,
+      task: { ...cfg.task, baseCommit: "0".repeat(40) },
+    });
     expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
     writePrivateJson(path, cfg);
     const db = new Database(cfg.db);
@@ -550,9 +622,9 @@ describe("task run preparation", () => {
         cfg.agents[0]!.runtimeId,
         cfg.agents[1]!.runtimeId,
       );
-      db.query("UPDATE runtime_attempt SET access = 'write' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
-      expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
       db.query("UPDATE runtime_attempt SET access = 'read' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
+      expect(() => loadPilot(cfg.root)).toThrow(/does not match persisted state/);
+      db.query("UPDATE runtime_attempt SET access = 'write' WHERE id = ?").run(cfg.agents[1]!.runtimeId);
       expect(loadPilot(cfg.root)).toEqual(cfg);
     } finally {
       db.close();
@@ -615,7 +687,9 @@ describe("generated native configuration", () => {
       const hook = settings.hooks[event]![0]!.hooks[0]!;
       expect(hook.type).toBe("http");
       expect(hook.url).toBe(`http://127.0.0.1:${endpoint.port}/events`);
-      expect(hook.headers).toEqual({ Authorization: "Bearer $AGENT_BRIDGE_TOKEN" });
+      expect(hook.headers).toEqual({
+        Authorization: "Bearer $AGENT_BRIDGE_TOKEN",
+      });
       expect(hook.allowedEnvVars).toEqual(["AGENT_BRIDGE_TOKEN"]);
     }
     const mcp = readPrivateJson<{
@@ -649,7 +723,10 @@ describe("generated native configuration", () => {
       join(cfg.root, "claude.mcp.json"),
       join(cfg.repo, ".codex", "hooks.json"),
     ];
-    const before = paths.map((path) => ({ text: readFileSync(path, "utf8"), inode: statSync(path).ino }));
+    const before = paths.map((path) => ({
+      text: readFileSync(path, "utf8"),
+      inode: statSync(path).ino,
+    }));
     writeNativeConfig(cfg, endpoint);
     for (const [i, path] of paths.entries()) {
       expect(readFileSync(path, "utf8")).toBe(before[i]!.text);
