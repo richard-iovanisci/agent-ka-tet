@@ -72,7 +72,16 @@ the startup Astra/ultra/never/full-access configuration. Codex effort remains co
 Both agents remained unpaused after normal completion. Independent artifact validation in a new
 clone passed **9 tests, 0 failures, 13 assertions**; source/reviewer remained clean at base.
 Evidence: `.bridge/pilots/2026-09-08-pyolo-{native-evidence,artifact-check}.json`.
-P-REV and peer-turn draft preservation under bypass remain unexecuted.
+P-REV then passed on the same product code: run `32a38542fe44` reached **accepted v7**.
+Native tool results confirm all six transitions from v1 through v7. The first commit
+`fe752697b581edc55705f251e3cedfaf91e074cf` omitted the fallback as instructed; final commit
+`4b1787acec4d29ef45aad05c4f60cc56ef949fac` added it as a direct child. All five messages were
+read/ACKed and both Codex peer items matched their immutable envelopes. This proves the controlled
+revision workflow, not unaided defect discovery. Both runs' exported patches apply and exactly
+reproduce their accepted trees. Independent normal Bun runs passed **6 tests / 6 assertions** for
+the first commit and **9 tests / 11 assertions** for the final commit; five separate probes confirmed
+the actual fallback correction. Evidence: `.bridge/pilots/2026-09-08-prev-{native-evidence,artifact-check,export-check}.json`.
+Peer-turn draft preservation under bypass and the failure matrix remain unexecuted.
 
 ## Limits and next steps
 
@@ -85,7 +94,7 @@ P-REV and peer-turn draft preservation under bypass remain unexecuted.
   These telemetry features remain unimplemented. Research found documented Claude
   status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
   Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
-- Next: the first live revision loop before N2 telemetry/UI; other launch profiles remain unqualified.
+- Next: N2 telemetry/UI; other launch profiles remain unqualified.
   General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
 
 Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).

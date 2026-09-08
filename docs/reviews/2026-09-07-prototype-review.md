@@ -249,7 +249,10 @@ and whitespace checks passed. Later on September 8, P-YOLO passed on `282517b`: 
 three read/ACKed messages, exact Codex peer envelope and native hook settings evidence. Independent
 artifact tests passed 9/9. The operator stayed in the console; normal completion left both agents
 unpaused. [PROGRESS.md](../../PROGRESS.md#n1a-implementation) records scope and evidence.
-P-REV and the bypass draft/failure matrix remain unexecuted; unavailable observations stay explicit.
+P-REV subsequently passed on the same product code: all six task transitions through accepted v7,
+five read/ACKed messages, and two sequential commits correcting the deliberately seeded fallback
+gap. Both accepted exports reproduce their Git trees. The bypass draft/failure matrix remains
+unexecuted; unavailable observations stay explicit. N2 is next.
 
 ## Prompt for Claude
 
@@ -261,7 +264,7 @@ review and C1-C6 are settled.
 
 Focus on the two required fixes, optional-settings failure versus thread identity,
 retention of the existing binding response, bounded reviewer checks, and the
-documentation corrections. Report concrete blockers or accept for P-YOLO, then P-REV.
+documentation corrections and recorded P-YOLO/P-REV evidence. Report concrete blockers before N2.
 Source/offline passes do not qualify native settings retention or a live revision loop.
 
 Keep the implementation worktree read-only. Do not launch, drive, stop or send to

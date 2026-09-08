@@ -180,7 +180,7 @@ resume after detach or recovery. Closing the console leaves native sessions runn
 Both lanes accepted the [round-2 reconciliation](docs/reviews/2026-09-07-prototype-review.md#reconciliation-with-claude-round-2).
 N1a implements the operator-authorized bypass default and launch controls. P-YOLO passed for
 Fable 5.1/high and Astra/ultra with bypass; see `PROGRESS.md` for evidence and observation limits.
-The live revision pilot remains unexecuted; N2–N4 follow that gate.
+The controlled revision pilot also passed, opening N2. Failure qualification remains in N3.
 
 | Step | Deliverable | Acceptance gate |
 |---|---|---|
