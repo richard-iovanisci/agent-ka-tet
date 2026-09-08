@@ -64,7 +64,15 @@ status and a clean-at-base reviewer check are implemented on `codex/n1a-launch-p
 The September 8 review fixes add Claude xhigh/Codex max, Vertex thinking validation, exact-session
 Codex model observations, tolerant optional settings parsing, existing binding-response retention,
 and bounded artifact/reviewer Git commands. They preserve thread identity and no-replay behavior.
-No authenticated N1a run has launched; P-YOLO and then P-REV are next.
+P-YOLO passed on September 8 using `282517b`: run `06db59ce23a4` reached **accepted v4**,
+artifact `20db315a8cd837ad84efb98662a1ad20e851aee4`. Exactly three messages were read/ACKed;
+the Codex peer item matched its stored envelope, with no approval requests recorded. Claude hooks
+reported high effort/bypass and resolved Fable 5.1; Codex peer hooks reported Astra, matching
+the startup Astra/ultra/never/full-access configuration. Codex effort remains configured-only.
+Both agents remained unpaused after normal completion. Independent artifact validation in a new
+clone passed **9 tests, 0 failures, 13 assertions**; source/reviewer remained clean at base.
+Evidence: `.bridge/pilots/2026-09-08-pyolo-{native-evidence,artifact-check}.json`.
+P-REV and peer-turn draft preservation under bypass remain unexecuted.
 
 ## Limits and next steps
 
@@ -77,7 +85,7 @@ No authenticated N1a run has launched; P-YOLO and then P-REV are next.
   These telemetry features remain unimplemented. Research found documented Claude
   status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
   Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
-- Next: qualify N1a settings, then the first live revision loop before N2 telemetry/UI.
+- Next: the first live revision loop before N2 telemetry/UI; other launch profiles remain unqualified.
   General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
 
 Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).

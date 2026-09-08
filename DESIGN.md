@@ -178,8 +178,9 @@ resume after detach or recovery. Closing the console leaves native sessions runn
 ## Next phase: operator controls
 
 Both lanes accepted the [round-2 reconciliation](docs/reviews/2026-09-07-prototype-review.md#reconciliation-with-claude-round-2).
-N1a implements the operator-authorized bypass default and launch controls. Its native settings-retention
-and revision pilots remain unexecuted; N2–N4 follow those gates.
+N1a implements the operator-authorized bypass default and launch controls. P-YOLO passed for
+Fable 5.1/high and Astra/ultra with bypass; see `PROGRESS.md` for evidence and observation limits.
+The live revision pilot remains unexecuted; N2–N4 follow that gate.
 
 | Step | Deliverable | Acceptance gate |
 |---|---|---|

@@ -7,7 +7,8 @@ A terminal console tracks the task and peer messages; Enter opens either session
 Your source checkout stays unchanged. A task finishes when Codex accepts Claude's exact commit.
 Configurable fleets, Windows, and Linux/WSL2 follow the validated pair.
 New runs default to permission bypass/YOLO with configurable model and effort.
-These controls await live qualification; quota/context visibility follows.
+Fable 5.1/high and Astra/ultra passed a live bypass task cycle. Other launch profiles,
+the revision loop, and quota/context visibility remain next.
 
 ## Start a task
 

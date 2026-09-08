@@ -245,8 +245,11 @@ One precision correction: Codex hook permission mode is a coarse approval-policy
 not a universal placeholder. It still cannot represent the complete native permission profile.
 
 Offline validation: **419 tests passed, 0 failed**, 3,197 assertions across 32 files; typecheck
-and whitespace checks passed. P-YOLO and then P-REV remain unexecuted. Missing native evidence
-does not become a pass through source inspection or these fixtures.
+and whitespace checks passed. Later on September 8, P-YOLO passed on `282517b`: accepted v4,
+three read/ACKed messages, exact Codex peer envelope and native hook settings evidence. Independent
+artifact tests passed 9/9. The operator stayed in the console; normal completion left both agents
+unpaused. [PROGRESS.md](../../PROGRESS.md#n1a-implementation) records scope and evidence.
+P-REV and the bypass draft/failure matrix remain unexecuted; unavailable observations stay explicit.
 
 ## Prompt for Claude
 
