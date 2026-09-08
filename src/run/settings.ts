@@ -1,6 +1,6 @@
 export interface ClaudeLaunchSettings {
   model: string;
-  effort: "inherit" | "low" | "medium" | "high" | "max";
+  effort: "inherit" | "low" | "medium" | "high" | "xhigh" | "max";
   thinking: "inherit" | "on" | "off";
   permissionMode: "bypassPermissions" | "default" | "acceptEdits" | "plan";
   accountRef?: string;
@@ -8,7 +8,7 @@ export interface ClaudeLaunchSettings {
 
 export interface CodexLaunchSettings {
   model: string;
-  effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra";
+  effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   approvalPolicy: "never" | "on-request" | "untrusted";
   sandbox: "danger-full-access" | "read-only" | "workspace-write";
   accountRef?: string;
@@ -72,7 +72,7 @@ export function resolveLaunchSettings(value: unknown = { version: 1 }): RunLaunc
       model: model(claude.model ?? "inherit", true),
       effort: selection(
         claude.effort ?? "high",
-        ["inherit", "low", "medium", "high", "max"],
+        ["inherit", "low", "medium", "high", "xhigh", "max"],
         "Claude effort",
       ),
       thinking: selection(claude.thinking ?? "inherit", ["inherit", "on", "off"], "Claude thinking"),
@@ -87,7 +87,7 @@ export function resolveLaunchSettings(value: unknown = { version: 1 }): RunLaunc
       model: model(codex.model ?? "gpt-6-astra", false),
       effort: selection(
         codex.effort ?? "ultra",
-        ["none", "minimal", "low", "medium", "high", "xhigh", "ultra"],
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
         "Codex effort",
       ),
       approvalPolicy: selection(
@@ -107,7 +107,7 @@ export function resolveLaunchSettings(value: unknown = { version: 1 }): RunLaunc
     result.claude.thinking === "off" &&
     (result.claude.model === "inherit" ||
       /^fable(?:\[1m\])?$/i.test(result.claude.model) ||
-      /(?:^|[-_/])fable[-_.]?5(?:[-_.]1)?(?=$|[-_](?:20\d{6}|latest)(?:$|[-_:])|\[)/i.test(
+      /(?:^|[-_/])fable[-_.]?5(?:[-_.]1)?(?=$|@|[-_](?:20\d{6}|latest)(?:$|[-_:])|\[)/i.test(
         result.claude.model,
       ))
   )

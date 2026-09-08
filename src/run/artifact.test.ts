@@ -295,6 +295,36 @@ describe("task artifacts", () => {
 });
 
 describe("task reviewer checkout", () => {
+  test("rejects a timed-out Git probe without changing the reviewer checkout", async () => {
+    const cfg = fixture();
+    const bin = join(cfg.root, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "git"), "#!/bin/sh\nexec /bin/sleep 7\n", { mode: 0o700 });
+    const script = `
+      import { validateReviewer } from ${JSON.stringify(import.meta.dir + "/artifact.ts")};
+      const cfg = JSON.parse(process.env.REVIEW_FIXTURE);
+      try { validateReviewer(cfg, cfg.agents[1].runtimeId); process.exitCode = 1; }
+      catch (error) { console.log(error.message); }
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], {
+      env: { ...process.env, PATH: bin, REVIEW_FIXTURE: JSON.stringify(cfg) },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 8_000,
+      killSignal: "SIGKILL",
+    });
+    const [code, output, error] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(code).toBe(0);
+    expect(error).toBe("");
+    expect(output).toContain("Git validation or export timed out");
+    expect(git(cfg.agents[1]!.workspace, "rev-parse", "HEAD")).toBe(cfg.task!.baseCommit);
+    expect(git(cfg.agents[1]!.workspace, "status", "--porcelain")).toBe("");
+  }, 10_000);
+
   test("accepts the assigned reviewer clean at base while the implementer advances", () => {
     const cfg = fixture();
     implement(cfg);

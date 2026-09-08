@@ -55,6 +55,16 @@ export interface CodexThreadSettings {
   sandbox?: CodexSandboxPolicy;
 }
 
+export interface CodexSettingsSnapshot {
+  settings: CodexThreadSettings | null;
+  settingsError?: string;
+}
+
+export interface CodexThreadBinding extends CodexSettingsSnapshot {
+  requestId: string;
+  threadId: string;
+}
+
 export interface CodexNotification {
   method: string;
   params?: unknown;
@@ -164,6 +174,14 @@ function nativeSettings(result: unknown): CodexThreadSettings {
   return settings;
 }
 
+function settingsSnapshot(result: unknown): CodexSettingsSnapshot {
+  try {
+    return { settings: nativeSettings(result) };
+  } catch {
+    return { settings: null, settingsError: "Native thread settings could not be parsed" };
+  }
+}
+
 interface PendingRequest {
   method: string;
   timer: ReturnType<typeof setTimeout>;
@@ -254,12 +272,11 @@ export class CodexClient {
     };
   }
 
-  async startThread(options: CodexThreadOptions): Promise<{
-    requestId: string;
-    threadId: string;
-    thread: Record<string, unknown> & { id: string };
-    settings: CodexThreadSettings;
-  }> {
+  async startThread(options: CodexThreadOptions): Promise<
+    CodexThreadBinding & {
+      thread: Record<string, unknown> & { id: string };
+    }
+  > {
     if (this.boundThread || this.binding || this.threadStarted)
       throw new Error("This Codex client already started or bound a thread");
     if (!isAbsolute(options.cwd)) throw new Error("Thread cwd must be absolute");
@@ -289,12 +306,13 @@ export class CodexClient {
     const requestId = randomUUID();
     this.threadStarted = true;
     const result = await this.request("thread/start", params, requestId);
+    let thread: Record<string, unknown> & { id: string };
     try {
-      const thread = nativeThread(result);
-      return { requestId, threadId: thread.id, thread, settings: nativeSettings(result) };
-    } catch (error) {
+      thread = nativeThread(result);
+    } catch {
       throw new CodexRequestError(requestId, "thread/start", "protocol", result);
     }
+    return { requestId, threadId: thread.id, thread, ...settingsSnapshot(result) };
   }
 
   async setThreadName(threadId: string, name: string): Promise<void> {
@@ -310,7 +328,7 @@ export class CodexClient {
     }
   }
 
-  async bindThread(threadId: string): Promise<void> {
+  async bindThread(threadId: string): Promise<CodexThreadBinding | void> {
     uuid(threadId);
     if (this.boundThread === threadId) return;
     if (this.boundThread || this.binding)
@@ -331,6 +349,7 @@ export class CodexClient {
         throw new CodexRequestError(requestId, "thread/resume", "protocol", result);
       }
       this.boundThread = threadId;
+      return { requestId, threadId, ...settingsSnapshot(result) };
     } finally {
       this.binding = false;
       this.bindingThread = undefined;

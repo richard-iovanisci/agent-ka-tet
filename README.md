@@ -27,9 +27,10 @@ Tracked `.codex/hooks.json` files currently need configuration reconciliation an
 
 Omit `--config` to use defaults: inherited Claude model/high effort, Codex Astra/ultra, bypass both.
 The JSON supports native model aliases/IDs, effort, permission controls, and an optional non-secret
-`accountRef` label. Claude thinking can inherit, enable, or disable where supported; enabling sets
-a visible 31,999-token budget for budget-based models. `run status` separates requested, configured
-and observed settings; missing native evidence stays pending. Existing version-1 runs keep their policy.
+`accountRef` label. Claude thinking can inherit, enable, or disable where supported. Enabling requests
+a fixed 31,999-token budget; adaptive models ignore that number. `run status` separates requested,
+configured and observed settings; missing or unparsed evidence stays explicit. Existing version-1
+runs keep their policy.
 
 ```sh
 bun bin/bridge run console /path/to/run
@@ -48,6 +49,7 @@ To detach, press Control+B, release both keys, then press lowercase d.
 Review native trust and tool prompts before pressing r for each agent, then s.
 Entering a session pauses its Bridge delivery until you resume it. Unsent drafts stay in the
 native composer. Both new runtimes can write; the reviewer is instructed to preserve its checkout.
+Bypass runs share your OS identity and can access each other's run files and credentials.
 A dirty reviewer checkout or HEAD away from the base blocks either review decision.
 Any permission requests from an explicit override or native policy are handled in that session.
 The nine Bridge tools are pre-approved within the run; peer messages cannot grant permissions.

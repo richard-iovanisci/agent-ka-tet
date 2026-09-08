@@ -216,20 +216,53 @@ decisions without writing a task transition or notification. This is a current-s
 sandbox. Do not treat an arbitrary `workspace-write` operation as guaranteed to request approval;
 P-APPR must select a command that the configured native policy actually prompts for.
 
+## N1a review follow-up — September 8
+
+Claude accepted N1a for P-YOLO after two fixes. Its verbatim feedback is preserved at
+`.bridge/reviews/2026-09-07-n1a-feedback.md`. The follow-up on `codex/n1a-launch-policy`, compared
+with `444e2da`, addresses both required changes and the merge recommendations. No live session
+was touched. [Draft PR #3](https://github.com/richard-iovanisci/agent-ka-tet/pull/3) remains stacked on #2.
+
+| Finding | Resolution |
+|---|---|
+| Effort choices | Add Claude xhigh and Codex max. Persistent is deferred: it enables additional native instructions and no model advertises it at the pin. Native model support still applies. |
+| Codex observations | Read model from exact-session native hooks. This reports native turn configuration, not backend-served model proof. Keep observed effort and permission unset. |
+| Optional settings | Bind a valid thread UUID even if settings parsing fails; show a fixed `unparsed` status. Preserve malformed-identity ambiguity and never retry creation. |
+| Binding response | Retain settings from the existing `thread/resume` binding response, without adding an RPC. Sparse metadata preserves the timestamped creation snapshot; explicit parse failure stays visible. |
+| Reviewer Git | Bound each artifact/reviewer Git command to five seconds. Failed validation precedes task/notice mutation. |
+| Vertex thinking | Reject thinking-off for documented Fable 5/5.1 Vertex IDs; do not guess future-model constraints. |
+| Documentation | Correct stdout redirection, fixed-budget semantics and historical whitespace-check attribution. Document same-user credential access under bypass. |
+
+Sources rechecked **2026-09-08**: Claude [model/effort configuration](https://code.claude.com/docs/en/model-config.md),
+[thinking environment](https://code.claude.com/docs/en/env-vars.md), and
+[Vertex IDs](https://code.claude.com/docs/en/google-vertex-ai.md); Codex
+[effort enum](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/protocol/src/openai_models.rs#L47-L78),
+[advertised models](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/models-manager/models.json),
+[persistent instructions](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/context/world_state/persistent_mode.rs#L57),
+[hook model source](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/hook_runtime.rs#L151-L157), and
+[permission mapping](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/hook_runtime.rs#L1003-L1010).
+One precision correction: Codex hook permission mode is a coarse approval-policy mapping,
+not a universal placeholder. It still cannot represent the complete native permission profile.
+
+Offline validation: **419 tests passed, 0 failed**, 3,197 assertions across 32 files; typecheck
+and whitespace checks passed. P-YOLO and then P-REV remain unexecuted. Missing native evidence
+does not become a pass through source inspection or these fixtures.
+
 ## Prompt for Claude
 
 ```text
 Review N1a in the sibling agent-ka-tet-n1a worktree on codex/n1a-launch-policy.
-Read AGENTS.md, DESIGN.md's launch configuration, PROGRESS.md's N1a status, then
-compare the implementation against f5afddd. C1-C6 are agreed; review new code only.
+Read this packet's September 8 follow-up, DESIGN.md's launch configuration and
+PROGRESS.md's checks. Compare the follow-up against 444e2da; the original N1a
+review and C1-C6 are settled.
 
-Focus on configuration freezing and v1 compatibility; host/thread/argv/environment
-consistency; requested/configured/observed attribution; reviewer rejection without
-state mutation; and the next P-YOLO/P-REV gate. Report concrete blockers or accept.
+Focus on the two required fixes, optional-settings failure versus thread identity,
+retention of the existing binding response, bounded reviewer checks, and the
+documentation corrections. Report concrete blockers or accept for P-YOLO, then P-REV.
 Source/offline passes do not qualify native settings retention or a live revision loop.
 
 Keep the implementation worktree read-only. Do not launch, drive, stop or send to
 any authenticated session. Use only GPT-6 Astra with ultra reasoning if delegating;
 otherwise review directly. Write feedback in your own worktree's ignored
-.bridge/reviews/2026-09-07-n1a-feedback.md and return its exact path.
+.bridge/reviews/2026-09-08-n1a-followup-feedback.md and return its exact path.
 ```

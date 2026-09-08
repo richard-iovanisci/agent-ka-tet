@@ -188,6 +188,7 @@ describe("Codex native peer client", () => {
           config: { model_reasoning_effort: "ultra" },
         });
         expect(started.settings).toEqual("reasoningEffort" in supplied ? { reasoningEffort: null } : {});
+        expect(started.settingsError).toBeUndefined();
         client.close();
       } finally {
         await host.close();
@@ -246,12 +247,13 @@ describe("Codex native peer client", () => {
     }
   });
 
-  test("rejects malformed supplied settings as uncertain without retrying thread creation", async () => {
+  test("preserves successful thread creation and binding when optional settings cannot be parsed", async () => {
     for (const supplied of [
       { model: null },
       { modelProvider: [] },
       { reasoningEffort: 1 },
       { approvalPolicy: "Never" },
+      { approvalPolicy: "future-policy-with-private-detail" },
       { approvalPolicy: { granular: { sandbox_approval: true } } },
       { sandbox: "danger-full-access" },
       { sandbox: null },
@@ -286,14 +288,119 @@ describe("Codex native peer client", () => {
       });
       try {
         const client = await host.connect();
+        const started = await client.startThread({ cwd: "/tmp/pilot-work" });
+        expect(started).toEqual({
+          requestId: host.messages.at(-1)!.id!,
+          threadId: THREAD,
+          thread: { id: THREAD },
+          settings: null,
+          settingsError: "Native thread settings could not be parsed",
+        });
+        await expect(client.startThread({ cwd: "/tmp/pilot-work" })).rejects.toThrow(/already started/);
+        expect(host.messages.filter((message) => message.method === "thread/start")).toHaveLength(1);
+        expect(host.messages.some((message) => message.method === "turn/start")).toBe(false);
+        await client.bindThread(started.threadId);
+        await client.sendPeer({
+          messageId: "metadata-peer",
+          envelope: "peer context",
+          requestId: "metadata-rpc",
+        });
+        expect(host.messages.at(-1)).toEqual({
+          id: "metadata-rpc",
+          method: "turn/start",
+          params: {
+            threadId: THREAD,
+            input: [],
+            toolOutput: { name: "bridge_receive_message", namespace: "agent_bridge", output: "peer context" },
+          },
+        });
+        client.close();
+      } finally {
+        await host.close();
+      }
+    }
+  });
+
+  test("keeps missing or malformed thread identities uncertain despite valid optional settings", async () => {
+    for (const thread of [undefined, null, {}, { id: null }, { id: 7 }, { id: "not-a-uuid" }]) {
+      const host = await fixture((message, peer) => {
+        if (message.method !== "thread/start") return;
+        peer.send(JSON.stringify({ id: message.id, result: { thread, model: "gpt-6-astra" } }));
+        return true;
+      });
+      try {
+        const client = await host.connect();
         await expect(client.startThread({ cwd: "/tmp/pilot-work" })).rejects.toMatchObject({
           method: "thread/start",
           reason: "protocol",
           outcome: "uncertain",
         });
         await expect(client.startThread({ cwd: "/tmp/pilot-work" })).rejects.toThrow(/already started/);
-        expect(host.messages.filter((message) => message.method === "thread/start")).toHaveLength(1);
-        expect(host.messages.some((message) => message.method === "turn/start")).toBe(false);
+        await expect(client.sendPeer({ messageId: "unbound", envelope: "inert" })).rejects.toThrow(
+          /bound native thread/,
+        );
+        expect(host.messages.map((message) => message.method)).toEqual([
+          "initialize",
+          "initialized",
+          "thread/start",
+        ]);
+        client.close();
+      } finally {
+        await host.close();
+      }
+    }
+  });
+
+  test("returns settings only from the actual exact-thread bind response without another RPC", async () => {
+    const reported = {
+      model: "native-selected-model",
+      reasoningEffort: "high",
+      approvalPolicy: "never",
+      sandbox: { type: "dangerFullAccess" },
+    } as const;
+    for (const settings of [reported, {}, { reasoningEffort: null }, { sandbox: "private-invalid-value" }]) {
+      const host = await fixture((message, peer) => {
+        if (message.method !== "thread/resume") return;
+        peer.send(
+          JSON.stringify({
+            id: message.id,
+            result: {
+              thread: { id: THREAD, unknownPrivateField: "omit thread metadata" },
+              ...settings,
+              unknownPrivateField: "omit metadata",
+            },
+          }),
+        );
+        return true;
+      });
+      try {
+        const client = await host.connect();
+        const binding = await client.bindThread(THREAD);
+        const request = host.messages.at(-1)!;
+        expect(request).toEqual({
+          id: expect.any(String),
+          method: "thread/resume",
+          params: { threadId: THREAD, excludeTurns: true },
+        });
+        expect(binding).toEqual({
+          requestId: request.id!,
+          threadId: THREAD,
+          ...(typeof settings.sandbox === "string"
+            ? { settings: null, settingsError: "Native thread settings could not be parsed" }
+            : { settings }),
+        });
+        expect(await client.bindThread(THREAD)).toBeUndefined();
+        expect(host.messages.map((message) => message.method)).toEqual([
+          "initialize",
+          "initialized",
+          "thread/resume",
+        ]);
+        await client.sendPeer({ messageId: "bound", envelope: "inert" });
+        expect(host.messages.at(-1)?.params).toEqual({
+          threadId: THREAD,
+          input: [],
+          toolOutput: { name: "bridge_receive_message", namespace: "agent_bridge", output: "inert" },
+        });
         client.close();
       } finally {
         await host.close();
@@ -628,23 +735,28 @@ describe("Codex native peer client", () => {
     }
   });
 
-  test("fails binding when the server returns another native thread", async () => {
-    const host = await fixture((message, peer) => {
-      if (message.method !== "thread/resume") return;
-      peer.send(JSON.stringify({ id: message.id, result: { thread: { id: OTHER } } }));
-      return true;
-    });
-    try {
-      const client = await host.connect();
-      await expect(client.bindThread(THREAD)).rejects.toMatchObject({
-        reason: "protocol",
-        outcome: "uncertain",
+  test.each([undefined, null, {}, { id: OTHER }, { id: "not-a-uuid" }, { id: 7 }])(
+    "fails binding for a missing, malformed, or different native identity: %j",
+    async (thread) => {
+      const host = await fixture((message, peer) => {
+        if (message.method !== "thread/resume") return;
+        peer.send(JSON.stringify({ id: message.id, result: { thread, sandbox: "also malformed" } }));
+        return true;
       });
-      await expect(client.sendPeer({ messageId: "a", envelope: "a" })).rejects.toThrow(/bound/);
-    } finally {
-      await host.close();
-    }
-  });
+      try {
+        const client = await host.connect();
+        await expect(client.bindThread(THREAD)).rejects.toMatchObject({
+          reason: "protocol",
+          outcome: "uncertain",
+        });
+        await expect(client.sendPeer({ messageId: "a", envelope: "a" })).rejects.toThrow(/bound/);
+        expect(host.messages.filter((message) => message.method === "thread/resume")).toHaveLength(1);
+        expect(host.messages.some((message) => message.method === "turn/start")).toBe(false);
+      } finally {
+        await host.close();
+      }
+    },
+  );
 
   test("retains correlated raw native errors without parsing retry permission", async () => {
     const rawError = {

@@ -30,8 +30,11 @@ function git(cwd: string, args: string[]): Buffer {
       },
       stdout: "pipe",
       stderr: "pipe",
+      timeout: 5_000,
+      killSignal: "SIGKILL",
     },
   );
+  if (result.exitedDueToTimeout) throw new Error("artifact Git validation or export timed out");
   if (result.exitCode !== 0) throw new Error("artifact Git validation or export failed");
   return result.stdout;
 }

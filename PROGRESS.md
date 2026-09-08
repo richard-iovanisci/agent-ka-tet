@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-09-07. **The macOS 1+1 prototype passed the operator's implement/review/accept
+Updated: 2026-09-08. **The macOS 1+1 prototype passed the operator's implement/review/accept
 cycle, final acknowledgment, and exported-patch validation.**
 
 ## Working
@@ -61,7 +61,9 @@ Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
 Design reconciliation is complete. New task runs snapshot per-agent launch settings and default to
 bypass/YOLO. Host/thread settings, Claude argv/environment, version-1 compatibility, native settings
 status and a clean-at-base reviewer check are implemented on `codex/n1a-launch-policy`.
-Offline checks passed: **405 tests, 0 failures**, 3,051 assertions across 32 files; typecheck passed.
+The September 8 review fixes add Claude xhigh/Codex max, Vertex thinking validation, exact-session
+Codex model observations, tolerant optional settings parsing, existing binding-response retention,
+and bounded artifact/reviewer Git commands. They preserve thread identity and no-replay behavior.
 No authenticated N1a run has launched; P-YOLO and then P-REV are next.
 
 ## Limits and next steps
@@ -83,8 +85,13 @@ Phase evidence, capability sources and Claude review prompt: [review packet](doc
 
 ## Checks
 
-N1a final `scripts/check.sh`: **405 passed, 0 failed**, 3,051 assertions across 32 files (44.97 s);
-typecheck and whitespace checks passed. The first run hit an existing tmux shell-fixture timeout.
+September 8 review fixes: `scripts/check.sh` passed **419 tests, 0 failures**, 3,197 assertions
+across 32 files (55.55 s), typecheck and whitespace checks. The script now checks both staged and
+unstaged whitespace and records that result. Evidence: `.bridge/reviews/2026-09-08-n1a-review-check.log`.
+
+September 7 N1a `scripts/check.sh`: **405 passed, 0 failed**, 3,051 assertions across 32 files (44.97 s);
+typecheck passed. A separate `git diff --check` passed; it was not part of that saved script log.
+The first run hit an existing tmux shell-fixture timeout.
 The fixture now disables user shell startup files while preserving real tmux/bracketed-paste checks.
 Evidence: `.bridge/reviews/2026-09-07-n1a-final-check.log`.
 
@@ -92,7 +99,7 @@ Pause-notice clarification: **15 console tests passed**, 208 assertions; typeche
 
 Full suite for `b18ad69`, before the pause-notice wording change: `scripts/check.sh` reported
 **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
-typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
+typecheck passed, with whitespace checked separately. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
 Directory split: **13 native/coordination/pilot/run files, 180 tests**; **16 shared/earlier files,
 187 tests**, including shared modules changed during the rework. This is not a new-versus-old test count.

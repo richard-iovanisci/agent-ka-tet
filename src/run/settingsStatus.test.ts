@@ -31,12 +31,14 @@ function fixture(version: 1 | 2 = 2) {
     store.expectSession(agent.runtimeId, sessionId);
     return store.bindRuntime(agent.runtimeId, sessionId);
   };
-  const hook = (name: string, data: Record<string, unknown> = {}, source = "native-hook") => {
-    const body = { session_id: claude.sessionId, hook_event_name: name, ...data };
-    return store.appendObservation(claude.runtimeId, {
+  const hook = (name: string, data: Record<string, unknown> = {}, source = "native-hook", agent = claude) => {
+    const runtime = store.runtime(agent.runtimeId);
+    const sessionId = runtime.sessionId ?? runtime.expectedSessionId!;
+    const body = { session_id: sessionId, hook_event_name: name, ...data };
+    return store.appendObservation(agent.runtimeId, {
       source,
       name,
-      sessionId: claude.sessionId!,
+      sessionId,
       data: source === "native-hook-pending" ? { body, wrapper: { pid: 123, born: "fixture" } } : body,
     });
   };
@@ -263,6 +265,157 @@ describe("runtime settings status", () => {
       },
     });
     expect(runtimeSettings(f.cfg, runtime).configured.values).toEqual({});
+  });
+
+  test("Codex observes the latest supported hook model while omitting coarse permissions and unreported effort", () => {
+    const f = fixture();
+    const runtime = f.bind(f.codex);
+    for (const [name, model] of [
+      ["SessionStart", "startup-model"],
+      ["PostToolUse", "tool-model"],
+      ["Stop", "stop-model"],
+    ]) {
+      const event = f.hook(
+        name!,
+        {
+          model,
+          permission_mode: "default",
+          effort: { level: "ultra" },
+          token: "fixture-secret-do-not-expose",
+        },
+        "native-hook",
+        f.codex,
+      );
+      const status = runtimeSettings(f.cfg, runtime);
+      expect(status.observed).toEqual({
+        model: { value: model!, source: `native-hook:${name}`, recordedAt: event.createdAt },
+        effort: null,
+        permissionMode: null,
+        thinking: null,
+      });
+      expect(JSON.stringify(status)).not.toContain("fixture-secret-do-not-expose");
+      expect(status.configured).toEqual({ source: "pending", recordedAt: null, values: null });
+    }
+    expect(f.store.runtime(runtime.id)).toEqual(runtime);
+  });
+
+  test("Codex model projection requires exact root-session hook provenance and ignores malformed later models", () => {
+    const f = fixture();
+    const runtime = f.bind(f.codex);
+    const event = f.hook("PostToolUse", { model: "exact-native-model" }, "native-hook", f.codex);
+    for (const data of [
+      { session_id: randomUUID() },
+      { agent_id: "subagent" },
+      { agent_type: "nested" },
+      { parent_thread_id: "parent" },
+      { hook_event_name: "SessionEnd" },
+      { model: null },
+      { model: "" },
+    ])
+      f.hook("Stop", { model: "invalid-newer-model", ...data }, "native-hook", f.codex);
+    for (const name of ["Notification", "SessionEnd", "UnknownHook"])
+      f.hook(name, { model: "unsupported-model" }, "native-hook", f.codex);
+    for (const source of ["pane-capture", "codex-app-server", "native-hook-pending"])
+      f.hook("SessionStart", { model: "untrusted-model", source: "startup" }, source, f.codex);
+    f.hook("SessionStart", { model: "other-runtime-model" });
+    const db = new Database(f.cfg.db);
+    try {
+      const insert = db.query("INSERT INTO runtime_observation (runtime_id,value) VALUES (?,?)");
+      for (const extra of [{ runtimeId: randomUUID() }, { sessionId: randomUUID() }]) {
+        insert.run(
+          runtime.id,
+          JSON.stringify({
+            runtimeId: runtime.id,
+            sessionId: runtime.sessionId,
+            source: "native-hook",
+            name: "Stop",
+            createdAt: 9000,
+            data: { session_id: runtime.sessionId, model: "mismatched-envelope-model" },
+            ...extra,
+          }),
+        );
+      }
+    } finally {
+      db.close();
+    }
+    expect(runtimeSettings(f.cfg, runtime).observed).toEqual({
+      model: { value: "exact-native-model", source: "native-hook:PostToolUse", recordedAt: event.createdAt },
+      effort: null,
+      permissionMode: null,
+      thinking: null,
+    });
+    for (const wrong of [
+      { sessionId: randomUUID() },
+      { expectedSessionId: randomUUID() },
+      { sessionId: null },
+    ])
+      expect(runtimeSettings(f.cfg, { ...runtime, ...wrong }).observed.model).toBeNull();
+  });
+
+  test("informative resume settings supersede startup while sparse samples preserve it and parse errors stay explicit", () => {
+    const f = fixture();
+    const runtime = f.bind(f.codex);
+    const started = {
+      runtimeId: runtime.id,
+      threadId: runtime.sessionId,
+      state: "accepted",
+      configuredAt: 1000,
+      settings: { model: "startup-model", reasoningEffort: "ultra", approvalPolicy: "never" },
+    };
+    const resumed = {
+      runtimeId: runtime.id,
+      threadId: runtime.sessionId,
+      source: "codex-thread/resume",
+      configuredAt: 2000,
+      requestId: "existing-bind-response",
+      settings: { model: "resumed-model" },
+    };
+    const startPath = agentFile(f.cfg.root, f.codex.id, "thread-intent");
+    const resumePath = agentFile(f.cfg.root, f.codex.id, "thread-settings");
+    writePrivateJson(startPath, started);
+    for (const extra of [
+      { settings: {} },
+      { settings: { unknown: "not-informative" } },
+      { runtimeId: randomUUID() },
+      { threadId: randomUUID() },
+      { source: "untrusted" },
+      { configuredAt: undefined },
+    ]) {
+      writePrivateJson(resumePath, { ...resumed, ...extra });
+      expect(runtimeSettings(f.cfg, runtime).configured).toEqual({
+        source: "codex-thread/start",
+        recordedAt: 1000,
+        values: started.settings,
+      });
+    }
+    writePrivateJson(resumePath, resumed);
+    const configured = {
+      source: "codex-thread/resume",
+      recordedAt: 2000,
+      values: { model: "resumed-model" },
+    };
+    expect(runtimeSettings(f.cfg, runtime).configured).toEqual(configured);
+    expect(runtimeSettings(f.cfg, runtime).configured).toEqual(configured);
+    writePrivateJson(resumePath, { ...resumed, settings: null, settingsError: "fixture-secret-raw-error" });
+    expect(runtimeSettings(f.cfg, runtime).configured).toEqual({
+      source: "codex-thread/resume",
+      recordedAt: 2000,
+      values: null,
+      status: "unparsed",
+      error: "Native thread settings could not be parsed",
+    });
+    writePrivateJson(resumePath, { ...resumed, settings: {} });
+    writePrivateJson(startPath, { ...started, settings: null, settingsError: "fixture-secret-raw-error" });
+    const status = runtimeSettings(f.cfg, runtime);
+    expect(status.configured).toEqual({
+      source: "codex-thread/start",
+      recordedAt: 1000,
+      values: null,
+      status: "unparsed",
+      error: "Native thread settings could not be parsed",
+    });
+    expect(JSON.stringify(status)).not.toContain("fixture-secret-raw-error");
+    expect(f.store.runtime(runtime.id)).toEqual(runtime);
   });
 
   test("foreign, malformed and non-private launch records remain pending", () => {

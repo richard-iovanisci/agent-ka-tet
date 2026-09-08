@@ -128,7 +128,10 @@ reply chains enforce the same message and hop limits. Submission verifies a clea
 HEAD descended from the recorded base. The reviewer inspects that exact commit, not its own base checkout.
 
 Bridge enforces ownership among its assignments. Filesystem access follows native policy; bypass
-does not restrict writes to the assigned checkout. Record those launch settings. Credential revocation ends Bridge access, not the native
+does not restrict access to the assigned checkout. Both agents run as the same OS user and can read
+private run configuration and each other's credentials. Scoped credentials and reviewer checks
+coordinate cooperating agents; they do not isolate a hostile agent. Record those launch settings.
+Credential revocation ends Bridge access, not the native
 process. Expired ownership means unknown ownership. Reassignment requires verified exit of the old
 runtime or explicit operator reconciliation; revocation and logical rebinding do not free a checkout.
 
@@ -190,7 +193,7 @@ and revision pilots remain unexecuted; N2–N4 follow those gates.
 
 Persist a versioned run specification containing each agent's ID, kind, role, model, effort,
 thinking setting where supported, permission profile, workspace and non-secret account reference.
-Use `run defaults` to write one human-editable JSON file and `run prepare --config` to snapshot it.
+`run defaults` prints JSON; redirect it to a file, edit it, then snapshot it with `run prepare --config`.
 New task state is version 2; its launch-settings format is version 1. Generated private state is separate.
 Resolve selections before creating native sessions; a private policy digest rejects later edits.
 Changing launch settings requires a new run. Unsupported or policy-blocked selections surface
@@ -201,26 +204,37 @@ Claude receives explicit model/effort/bypass controls. `--model` outranks `ANTHR
 `CLAUDE_CODE_EFFORT_LEVEL` outranks `--effort`. Normalize controls covered by explicit settings,
 preserve deliberate inheritance and unrelated provider/auth/network configuration, and test settings
 reinjection. Record ignored variable names and disposition, never raw inherited values. Allow native model aliases or explicit IDs; `inherit` preserves Claude's native model selection.
-Default Claude effort is high and Codex is Astra/ultra. Reject known incompatible thinking settings (Fable 5/5.1
-cannot disable thinking). Explicit thinking-on uses a visible Bridge budget of 31,999 tokens
-for budget-based models; adaptive models may ignore it. Inherit adds no thinking controls.
+Default Claude effort is high and Codex is Astra/ultra. Claude accepts low/medium/high/xhigh/max or
+inherit; Codex accepts none/minimal/low/medium/high/xhigh/max/ultra, subject to native model support.
+Codex persistent mode remains outside this launch profile. Reject known incompatible thinking
+settings, including thinking-off for Fable 5/5.1 and their Vertex IDs. Explicit thinking-on requests
+a Bridge fixed budget of 31,999 tokens. Claude caps fixed budgets against output limits and ignores
+the numeric budget under adaptive reasoning; this is neither a native default nor observed use.
+Inherit adds no thinking controls.
 Unsupported capabilities remain unverified rather than guessed.
 
 Codex host configuration uses `approval_policy="never"` and `sandbox_mode="danger-full-access"`;
 thread creation sends `approvalPolicy:"never"`, `sandbox:"danger-full-access"`. The response uses
 camelCase fields and `sandbox:{type:"dangerFullAccess"}`. Preserve that configured response in the
-client API and run record. Attached-TUI flags are insufficient for an already subscribed thread.
+client API and run record, including the response from the existing binding operation. Missing or
+unparsed optional settings do not invalidate a certain thread UUID: bind it, show the metadata gap,
+and retain the explicit readiness gate. Identity failures remain ambiguous and are never replayed.
+Attached-TUI flags are insufficient for an already subscribed thread.
 Peer delivery never changes these settings; metadata readers never resume a thread merely to inspect it.
 
 Claude effort starts as configured until a supported hook or status-line sample reports it. Optional
 SessionStart model data and later hook permission/effort data supplement the launch record; N1a
-does not require the N2 collector. Native substitutions must remain visible, not normalized into agreement.
+does not require the N2 collector. Exact-session Codex hooks report the native turn's configured
+model, not proof of the model served by the backend. Codex hook permission mode is too coarse to
+represent its policy, and effort remains unobserved. Native substitutions stay visible.
 
 Separate reviewer role from effective filesystem capability. With bypass enabled, both agents
 must be treated as potential writers even when the reviewer is instructed not to edit. Preserve
-separate checkouts, Bridge assignment exclusion, scoped credentials and run/message limits.
+separate checkouts, Bridge assignment exclusion, scoped credentials and run/message limits, within
+the same-user limitation above.
 Before a review transition, verify the assigned reviewer checkout is clean and its HEAD equals
-the recorded base; reject without a task/notice write on failure. This checks current Git state,
+the recorded base; reject without a task/notice write on failure. Each artifact/reviewer Git command
+has a five-second timeout. This checks current Git state,
 not filesystem immutability. Describe the review-only instruction without claiming sandbox enforcement.
 
 N1a changes `pilot/config.ts`, `pilot/process.ts`, `native/codex.ts`, `pilot/server.ts` and the

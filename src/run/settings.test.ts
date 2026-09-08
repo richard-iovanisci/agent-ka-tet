@@ -43,6 +43,25 @@ describe("run launch settings", () => {
     expect(() => validateLaunchSettings({ version: 1, claude: {}, codex: {} })).toThrow(/complete/);
   });
 
+  test("preserves Claude xhigh and Codex max through persisted settings validation", () => {
+    for (const model of ["claude-fable-5", "claude-fable-5-1"]) {
+      const settings = resolveLaunchSettings({
+        version: 1,
+        claude: { model, effort: "xhigh" },
+        codex: { model: "gpt-6-astra", effort: "max" },
+      });
+      expect(settings.claude.effort).toBe("xhigh");
+      expect(settings.codex.effort).toBe("max");
+      expect(() => validateLaunchSettings(JSON.parse(JSON.stringify(settings)))).not.toThrow();
+    }
+  });
+
+  test("keeps Codex persistent mode outside the supported launch controls", () => {
+    expect(() => resolveLaunchSettings({ version: 1, codex: { effort: "persistent" } })).toThrow(
+      /unsupported Codex effort/,
+    );
+  });
+
   test("rejects unsupported controls before preparing native state", () => {
     for (const input of [
       { version: 2 },
@@ -69,6 +88,11 @@ describe("run launch settings", () => {
       "claude-fable-5-20260901",
       "claude-fable-5-1",
       "claude-fable-5.1",
+      "claude-fable-5@20260901",
+      "claude-fable-5-1@20260901",
+      "claude-fable-5.1@20260901",
+      "publishers/anthropic/models/claude-fable-5-1@20260901",
+      "us.anthropic.claude-fable-5-1-20260901-v1:0",
     ])
       expect(() =>
         resolveLaunchSettings({
@@ -76,15 +100,17 @@ describe("run launch settings", () => {
           claude: { model, thinking: "off" },
         }),
       ).toThrow(/cannot disable thinking/);
-    expect(
-      resolveLaunchSettings({
-        version: 1,
-        claude: { model: "claude-fable-4", thinking: "off" },
-      }).claude.thinking,
-    ).toBe("off");
-    expect(
-      resolveLaunchSettings({ version: 1, claude: { model: "claude-fable-5-2", thinking: "off" } }).claude
-        .thinking,
-    ).toBe("off");
+    for (const model of [
+      "claude-fable-4",
+      "claude-fable-5-2",
+      "claude-fable-5.2",
+      "claude-fable-5-2@20260901",
+      "claude-fable-5.2@20260901",
+      "publishers/anthropic/models/claude-fable-5-2@20260901",
+      "claude-fable-5-10",
+    ])
+      expect(resolveLaunchSettings({ version: 1, claude: { model, thinking: "off" } }).claude.thinking).toBe(
+        "off",
+      );
   });
 });

@@ -413,6 +413,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
               threadId,
               requestId: started.requestId,
               settings: started.settings,
+              ...(started.settingsError ? { settingsError: started.settingsError } : {}),
               configuredAt: now(),
             });
           } catch (error) {
@@ -442,7 +443,18 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
       observeCodex(client, runtime);
       if (cfg.codexHistoryMode === "legacy")
         await client.setThreadName(runtime.sessionId!, `${cfg.tmuxSession}-codex`);
-      await client.bindThread(runtime.sessionId!);
+      const binding = await client.bindThread(runtime.sessionId!);
+      if (binding) {
+        if (binding.threadId !== runtime.sessionId) throw new Error("native settings thread mismatch");
+        writePrivateJson(agentFile(cfg.root, codexAgent.id, "thread-settings"), {
+          runtimeId: runtime.id,
+          threadId: binding.threadId,
+          source: "codex-thread/resume",
+          configuredAt: now(),
+          settings: binding.settings,
+          ...(binding.settingsError ? { settingsError: binding.settingsError } : {}),
+        });
+      }
       if (closed) throw new Error("coordinator is stopping");
       if (!hostAlive()) throw new Error("Codex host ownership changed during binding");
       writePrivateJson(agentFile(cfg.root, codexAgent.id, "thread"), {

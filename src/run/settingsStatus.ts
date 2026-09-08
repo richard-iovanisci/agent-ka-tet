@@ -19,6 +19,8 @@ export interface RuntimeSettings {
     recordedAt: number | null;
     values: Record<string, unknown> | null;
     environment?: EnvironmentDisposition[];
+    status?: "unparsed";
+    error?: "Native thread settings could not be parsed";
   };
   observed: Record<"model" | "effort" | "permissionMode" | "thinking", SettingsSample | null>;
 }
@@ -112,7 +114,7 @@ function environment(value: unknown): EnvironmentDisposition[] | undefined {
   );
 }
 
-const HOOKS = [
+const CLAUDE_HOOKS = [
   "SessionStart",
   "UserPromptSubmit",
   "PreToolUse",
@@ -126,7 +128,19 @@ const HOOKS = [
   "Notification",
 ];
 
-function observedClaude(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSettings["observed"] {
+const CODEX_MODEL_HOOKS = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PostToolUse",
+  "PermissionRequest",
+  "Stop",
+  "Interrupt",
+  "PreCompact",
+  "PostCompact",
+];
+
+function observedHooks(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSettings["observed"] {
   const observed: RuntimeSettings["observed"] = {
     model: null,
     effort: null,
@@ -134,6 +148,10 @@ function observedClaude(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSetti
     thinking: null,
   };
   if (!runtime.sessionId || runtime.sessionId !== runtime.expectedSessionId) return observed;
+  const claude = runtime.kind === "claude";
+  const hooks = claude ? CLAUDE_HOOKS : CODEX_MODEL_HOOKS;
+  const modelHooks = claude ? ["SessionStart"] : CODEX_MODEL_HOOKS;
+  const fields = claude ? (["model", "effort", "permissionMode"] as const) : (["model"] as const);
   let db: Database | undefined;
   try {
     const stat = lstatSync(cfg.db);
@@ -163,20 +181,20 @@ function observedClaude(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSetti
           CASE
             WHEN json_extract(event, '$.source') = 'native-hook' AND json_type(event, '$.data') = 'object'
               THEN json_extract(event, '$.data')
-            WHEN json_extract(event, '$.source') = 'native-hook-pending'
+            WHEN ${claude ? 1 : 0} AND json_extract(event, '$.source') = 'native-hook-pending'
               AND json_extract(event, '$.name') = 'SessionStart' AND json_type(event, '$.data.body') = 'object'
               THEN json_extract(event, '$.data.body')
             ELSE '{}' END AS body
         FROM events WHERE json_extract(event, '$.runtimeId') = ? AND json_extract(event, '$.sessionId') = ?
       )
       SELECT source, name, recordedAt,
-        CASE WHEN name = 'SessionStart' AND json_type(body, '$.model') = 'text'
+        CASE WHEN name IN (${modelHooks.map((hook) => `'${hook}'`).join(",")}) AND json_type(body, '$.model') = 'text'
           THEN substr(json_extract(body, '$.model'), 1, 257) END AS model,
-        CASE WHEN name IN ('PreToolUse', 'PostToolUse', 'Stop') AND json_type(body, '$.effort.level') = 'text'
+        CASE WHEN ${claude ? 1 : 0} AND name IN ('PreToolUse', 'PostToolUse', 'Stop') AND json_type(body, '$.effort.level') = 'text'
           THEN substr(json_extract(body, '$.effort.level'), 1, 257) END AS effort,
-        CASE WHEN json_type(body, '$.permission_mode') = 'text'
+        CASE WHEN ${claude ? 1 : 0} AND json_type(body, '$.permission_mode') = 'text'
           THEN substr(json_extract(body, '$.permission_mode'), 1, 257) END AS permissionMode
-      FROM hooks WHERE name IN (${HOOKS.map((hook) => `'${hook}'`).join(",")})
+      FROM hooks WHERE name IN (${hooks.map((hook) => `'${hook}'`).join(",")})
         AND json_extract(body, '$.session_id') = ?
         AND (source != 'native-hook-pending' OR json_extract(body, '$.source') = 'startup')
         AND (json_extract(body, '$.hook_event_name') IS NULL OR json_extract(body, '$.hook_event_name') = name)
@@ -193,7 +211,7 @@ function observedClaude(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSetti
       .iterate(runtime.id, runtime.id, runtime.sessionId, runtime.sessionId);
     for (const row of rows) {
       if (!timestamp(row.recordedAt)) continue;
-      for (const field of ["model", "effort", "permissionMode"] as const) {
+      for (const field of fields) {
         if (!observed[field] && text(row[field]))
           observed[field] = {
             value: row[field],
@@ -201,13 +219,44 @@ function observedClaude(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSetti
             recordedAt: row.recordedAt,
           };
       }
-      if (observed.model && observed.effort && observed.permissionMode) break;
+      if (fields.every((field) => observed[field])) break;
     }
   } catch {
   } finally {
     db?.close();
   }
   return observed;
+}
+
+function configuredCodex(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSettings["configured"] | null {
+  if (!runtime.sessionId || runtime.sessionId !== runtime.expectedSessionId) return null;
+  for (const [file, source] of [
+    ["thread-settings", "codex-thread/resume"],
+    ["thread-intent", "codex-thread/start"],
+  ] as const) {
+    const snapshot = record(agentFile(cfg.root, runtime.agentId, file));
+    if (
+      !snapshot ||
+      snapshot.runtimeId !== runtime.id ||
+      snapshot.threadId !== runtime.sessionId ||
+      !timestamp(snapshot.configuredAt) ||
+      (source === "codex-thread/start" ? snapshot.state !== "accepted" : snapshot.source !== source)
+    )
+      continue;
+    if (snapshot.settings === null && typeof snapshot.settingsError === "string" && snapshot.settingsError) {
+      return {
+        source,
+        recordedAt: snapshot.configuredAt,
+        values: null,
+        status: "unparsed",
+        error: "Native thread settings could not be parsed",
+      };
+    }
+    const values = configuredValues(snapshot.settings, "codex");
+    if (values && (source === "codex-thread/start" || Object.keys(values).length > 0))
+      return { source, recordedAt: snapshot.configuredAt, values };
+  }
+  return null;
 }
 
 export function runtimeSettings(cfg: PilotConfig, runtime: RuntimeAttempt): RuntimeSettings {
@@ -245,26 +294,14 @@ export function runtimeSettings(cfg: PilotConfig, runtime: RuntimeAttempt): Runt
           ...(dispositions === undefined ? {} : { environment: dispositions }),
         };
     }
-    status.observed = observedClaude(cfg, runtime);
   } else {
-    const intent = record(agentFile(cfg.root, agent.id, "thread-intent"));
-    if (
-      intent?.state === "accepted" &&
-      intent.runtimeId === runtime.id &&
-      runtime.sessionId &&
-      runtime.sessionId === runtime.expectedSessionId &&
-      intent.threadId === runtime.sessionId &&
-      timestamp(intent.configuredAt)
-    ) {
-      const values = configuredValues(intent.settings, "codex");
-      if (values)
-        status.configured = {
-          source: "codex-thread/start",
-          recordedAt: intent.configuredAt,
-          values,
-          ...(dispositions === undefined ? {} : { environment: dispositions }),
-        };
-    }
+    const configured = configuredCodex(cfg, runtime);
+    if (configured)
+      status.configured = {
+        ...configured,
+        ...(dispositions === undefined ? {} : { environment: dispositions }),
+      };
   }
+  status.observed = observedHooks(cfg, runtime);
   return status;
 }

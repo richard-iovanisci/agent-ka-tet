@@ -7,6 +7,7 @@ import type { MessageRecord, Run, RuntimeAttempt, RuntimeObservation } from "../
 import {
   CodexRequestError,
   type CodexClient,
+  type CodexThreadSettings,
   type CodexNotification,
   type CodexResponse,
   type CodexServerRequest,
@@ -19,12 +20,14 @@ class FakeCodex {
   threadId = randomUUID();
   starts = 0;
   threadOptions: Parameters<CodexClient["startThread"]>[0][] = [];
-  settings = {
+  settings: CodexThreadSettings | null = {
     model: "native-model",
     reasoningEffort: "high",
     approvalPolicy: "never" as const,
     sandbox: { type: "dangerFullAccess" as const },
   };
+  settingsError: string | undefined;
+  bindingSettings: Awaited<ReturnType<CodexClient["bindThread"]>> = undefined;
   bound: string[] = [];
   peers: Parameters<CodexClient["sendPeer"]>[0][] = [];
   operators: Parameters<CodexClient["startOperatorTurn"]>[0][] = [];
@@ -46,10 +49,12 @@ class FakeCodex {
       threadId: this.threadId,
       thread: { id: this.threadId },
       settings: this.settings,
+      ...(this.settingsError ? { settingsError: this.settingsError } : {}),
     };
   }
   async bindThread(id: string) {
     this.bound.push(id);
+    return this.bindingSettings;
   }
   async setThreadName() {
     if (this.nameError) throw this.nameError;
@@ -533,27 +538,46 @@ describe("native pilot coordinator", () => {
     expect((await f.status()).agents.find((a) => a.agentId === "codex")!.sessionId).toBeNull();
   });
 
-  test("retains a returned thread identity when native settings metadata is malformed without binding or retrying", async () => {
+  test("binds a certain thread with unparsed settings and recovers without another start", async () => {
     const f = fixture({}, true);
-    f.native.startError = new CodexRequestError("metadata-request", "thread/start", "protocol", {
-      thread: { id: f.native.threadId },
-      model: 42,
-      token: "unrelated-native-secret",
-    });
-    expect((await f.request("/operator/connect", {})).status).toBe(400);
+    f.native.settings = null;
+    f.native.settingsError = "Native thread settings could not be parsed";
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
     const intent = readPrivateJson<Record<string, unknown>>(agentFile(f.cfg.root, "codex", "thread-intent"));
     expect(intent).toMatchObject({
-      state: "ambiguous",
-      returnedThreadId: f.native.threadId,
-      reason: "protocol",
+      state: "accepted",
+      threadId: f.native.threadId,
+      settings: null,
+      settingsError: f.native.settingsError,
     });
-    expect(JSON.stringify(intent)).not.toContain("unrelated-native-secret");
-    expect((await f.status()).agents.find((a) => a.kind === "codex")!.sessionId).toBeNull();
+    const status = (await f.status()).agents.find((a) => a.kind === "codex")!;
+    expect(status.sessionId).toBe(f.native.threadId);
+    expect(status.settings.configured).toMatchObject({ status: "unparsed", values: null });
+    expect(status.ready).toBe(false);
     await f.restart();
-    f.native.startError = null;
-    expect((await f.request("/operator/connect", {})).status).toBe(400);
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
     expect(f.native.starts).toBe(1);
-    expect(f.native.bound).toHaveLength(0);
+    expect(f.native.bound).toEqual([f.native.threadId, f.native.threadId]);
+  });
+
+  test("records settings from the existing bind response without adding native calls", async () => {
+    const f = fixture({}, true);
+    f.native.bindingSettings = {
+      requestId: "resume-settings",
+      threadId: f.native.threadId,
+      settings: { model: "retained-model", reasoningEffort: "max" },
+    };
+    await f.bind();
+    expect((await f.status()).agents.find((a) => a.kind === "codex")!.settings.configured).toMatchObject({
+      source: "codex-thread/resume",
+      values: { model: "retained-model", reasoningEffort: "max" },
+    });
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toHaveLength(1);
+    await f.restart();
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toHaveLength(2);
   });
 
   test("retains native binding errors without losing the accepted thread identity", async () => {
