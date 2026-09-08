@@ -7,6 +7,7 @@ import type { MessageRecord, Run, RuntimeAttempt, RuntimeObservation } from "../
 import {
   CodexRequestError,
   type CodexClient,
+  type CodexThreadSettings,
   type CodexNotification,
   type CodexResponse,
   type CodexServerRequest,
@@ -18,6 +19,15 @@ import { openCoordinationStore } from "../coordination/store.ts";
 class FakeCodex {
   threadId = randomUUID();
   starts = 0;
+  threadOptions: Parameters<CodexClient["startThread"]>[0][] = [];
+  settings: CodexThreadSettings | null = {
+    model: "native-model",
+    reasoningEffort: "high",
+    approvalPolicy: "never" as const,
+    sandbox: { type: "dangerFullAccess" as const },
+  };
+  settingsError: string | undefined;
+  bindingSettings: Awaited<ReturnType<CodexClient["bindThread"]>> = undefined;
   bound: string[] = [];
   peers: Parameters<CodexClient["sendPeer"]>[0][] = [];
   operators: Parameters<CodexClient["startOperatorTurn"]>[0][] = [];
@@ -30,13 +40,21 @@ class FakeCodex {
   responses = new Set<(event: CodexResponse) => void>();
   requests = new Set<(event: CodexServerRequest) => void>();
   disconnects = new Set<(error: Error) => void>();
-  async startThread() {
+  async startThread(options: Parameters<CodexClient["startThread"]>[0]) {
+    this.threadOptions.push(options);
     this.starts++;
     if (this.startError) throw this.startError;
-    return { requestId: randomUUID(), threadId: this.threadId, thread: { id: this.threadId } };
+    return {
+      requestId: randomUUID(),
+      threadId: this.threadId,
+      thread: { id: this.threadId },
+      settings: this.settings,
+      ...(this.settingsError ? { settingsError: this.settingsError } : {}),
+    };
   }
   async bindThread(id: string) {
     this.bound.push(id);
+    return this.bindingSettings;
   }
   async setThreadName() {
     if (this.nameError) throw this.nameError;
@@ -87,7 +105,10 @@ class FakeCodex {
 interface Status {
   serverNow: number;
   run: Run;
-  agents: RuntimeAttempt[];
+  agents: (RuntimeAttempt & {
+    attention?: string;
+    settings: ReturnType<typeof import("../run/settingsStatus.ts").runtimeSettings>;
+  })[];
   messages: MessageRecord[];
   observations: RuntimeObservation[];
 }
@@ -100,7 +121,10 @@ afterEach(async () => {
 function fixture(options: Omit<PilotServerOptions, "connect"> = {}, task = false) {
   const source = task ? preparePilot() : null;
   const cfg = task
-    ? preparePilot(undefined, { project: source!.repo, brief: "Add a checked artifact." })
+    ? preparePilot(undefined, {
+        project: source!.repo,
+        brief: "Add a checked artifact.",
+      })
     : preparePilot();
   const native = new FakeCodex();
   let server = startPilotServer(cfg, {
@@ -122,7 +146,10 @@ function fixture(options: Omit<PilotServerOptions, "connect"> = {}, task = false
   async function request(path: string, body?: unknown, credential = cfg.operatorToken) {
     const response = await fetch(`http://127.0.0.1:${server.endpoint.port}${path}`, {
       method: body === undefined ? "GET" : "POST",
-      headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${credential}`,
+        "content-type": "application/json",
+      },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();
@@ -193,16 +220,26 @@ describe("native pilot coordinator", () => {
     const f = fixture({}, true);
     await f.ready();
     expect((await f.request("/operator/start", {})).status).toBe(200);
-    expect(f.native.operators[0]!.text).toContain("read-only worktree");
+    expect(f.native.operators[0]!.text).not.toContain("read-only worktree");
     expect(f.native.operators[0]!.text).not.toContain("PING");
     const initial = (await f.tool("claude", "bridge_task_read")).data;
     expect(initial.role).toBe("implementer");
     expect(initial.baseCommit).toBe(f.cfg.task!.baseCommit);
     expect(
-      (await f.tool("codex", "bridge_task_claim", { taskId: initial.id, expectedVersion: 1 })).status,
+      (
+        await f.tool("codex", "bridge_task_claim", {
+          taskId: initial.id,
+          expectedVersion: 1,
+        })
+      ).status,
     ).toBe(400);
     expect(
-      (await f.tool("claude", "bridge_task_claim", { taskId: initial.id, expectedVersion: 1 })).status,
+      (
+        await f.tool("claude", "bridge_task_claim", {
+          taskId: initial.id,
+          expectedVersion: 1,
+        })
+      ).status,
     ).toBe(200);
     const workspace = f.agent("claude").workspace;
     writeFileSync(join(workspace, "artifact.txt"), "checked result\n");
@@ -254,6 +291,22 @@ describe("native pilot coordinator", () => {
         })
       ).status,
     ).toBe(400);
+    const beforeReview = (await f.status()).messages.length;
+    const reviewerFile = join(f.agent("codex").workspace, "untracked-review.txt");
+    writeFileSync(reviewerFile, "reviewer edits must block either decision");
+    for (const decision of ["accept", "changes_requested"]) {
+      const refused = await f.tool("codex", "bridge_task_review", {
+        taskId: initial.id,
+        expectedVersion: 3,
+        decision,
+        summary: "must not persist",
+      });
+      expect(refused.status).toBe(400);
+      expect(refused.data.error).toContain("uncommitted changes");
+      expect((await f.tool("codex", "bridge_task_read")).data.version).toBe(3);
+      expect((await f.status()).messages).toHaveLength(beforeReview);
+    }
+    rmSync(reviewerFile);
     const reviewed = await f.tool("codex", "bridge_task_review", {
       taskId: initial.id,
       expectedVersion: 3,
@@ -316,7 +369,10 @@ describe("native pilot coordinator", () => {
     });
     expect(sent.status).toBe(200);
     expect((await f.channel("next")).data).toBeNull();
-    await f.request("/operator/ready", { agentId: "claude", confirmNative: true });
+    await f.request("/operator/ready", {
+      agentId: "claude",
+      confirmNative: true,
+    });
     const delivery = (await f.channel("next")).data;
     expect(delivery.messageId).toBe(sent.data.message.id);
     expect((await f.channel("next")).data).toBeNull();
@@ -329,15 +385,30 @@ describe("native pilot coordinator", () => {
         )
       ).status,
     ).toBe(400);
-    expect((await f.channel("receipt", { deliveryId: delivery.deliveryId, outcome: "written" })).status).toBe(
-      200,
-    );
+    expect(
+      (
+        await f.channel("receipt", {
+          deliveryId: delivery.deliveryId,
+          outcome: "written",
+        })
+      ).status,
+    ).toBe(200);
     let receipt = (await f.status()).messages[0]!.receipt;
     expect(receipt.state).toBe("written");
     expect(receipt.application).toBe("unread");
-    expect((await f.tool("codex", "bridge_ack_message", { messageId: delivery.messageId })).status).toBe(400);
-    await f.tool("claude", "bridge_read_message", { messageId: delivery.messageId });
-    await f.tool("claude", "bridge_ack_message", { messageId: delivery.messageId });
+    expect(
+      (
+        await f.tool("codex", "bridge_ack_message", {
+          messageId: delivery.messageId,
+        })
+      ).status,
+    ).toBe(400);
+    await f.tool("claude", "bridge_read_message", {
+      messageId: delivery.messageId,
+    });
+    await f.tool("claude", "bridge_ack_message", {
+      messageId: delivery.messageId,
+    });
     receipt = (await f.status()).messages[0]!.receipt;
     expect(receipt.application).toBe("acknowledged");
     expect(receipt.state).toBe("written");
@@ -365,7 +436,11 @@ describe("native pilot coordinator", () => {
       }
     };
     const sent = (
-      await f.tool("claude", "bridge_send_message", { to: "codex", body: "PONG", idempotencyKey: "pong" })
+      await f.tool("claude", "bridge_send_message", {
+        to: "codex",
+        body: "PONG",
+        idempotencyKey: "pong",
+      })
     ).data as MessageRecord;
     await until(async () => (await f.status()).messages[0]!.receipt.state === "accepted");
     expect(seenState).toBe("sending");
@@ -381,7 +456,11 @@ describe("native pilot coordinator", () => {
     const f = fixture();
     await f.ready();
     f.native.peerError = new CodexRequestError("request", "turn/start", "disconnect");
-    await f.tool("claude", "bridge_send_message", { to: "codex", body: "PONG", idempotencyKey: "pong" });
+    await f.tool("claude", "bridge_send_message", {
+      to: "codex",
+      body: "PONG",
+      idempotencyKey: "pong",
+    });
     await until(async () => (await f.status()).messages[0]!.receipt.state === "ambiguous");
     await f.restart();
     expect((await f.status()).agents.every((a) => !a.ready)).toBe(true);
@@ -414,7 +493,11 @@ describe("native pilot coordinator", () => {
         },
       });
     const sent = (
-      await f.tool("claude", "bridge_send_message", { to: "codex", body: "PONG", idempotencyKey: "pong" })
+      await f.tool("claude", "bridge_send_message", {
+        to: "codex",
+        body: "PONG",
+        idempotencyKey: "pong",
+      })
     ).data as MessageRecord;
     await until(async () => (await f.status()).messages[0]!.receipt.state === "ambiguous");
     const receipt = (await f.status()).messages[0]!.receipt;
@@ -422,14 +505,21 @@ describe("native pilot coordinator", () => {
     expect(receipt.itemId).toBe("observed-item");
     expect(receipt.application).toBe("unread");
     for (const listener of f.native.responses)
-      listener({ requestId: sent.receipt.requestId, result: { turn: { id: "observed-turn" } } });
+      listener({
+        requestId: sent.receipt.requestId,
+        result: { turn: { id: "observed-turn" } },
+      });
     expect((await f.status()).messages[0]!.receipt.state).toBe("ambiguous");
   });
 
   test("holds a Channel notification whose write receipt was lost", async () => {
     const f = fixture();
     await f.ready();
-    await f.tool("codex", "bridge_send_message", { to: "claude", body: "PING", idempotencyKey: "ping" });
+    await f.tool("codex", "bridge_send_message", {
+      to: "claude",
+      body: "PING",
+      idempotencyKey: "ping",
+    });
     expect((await f.channel("next")).data.messageId).toBeTruthy();
     await f.restart();
     await f.ready();
@@ -446,6 +536,48 @@ describe("native pilot coordinator", () => {
     expect((await f.request("/operator/connect", {})).status).toBe(400);
     expect(f.native.starts).toBe(1);
     expect((await f.status()).agents.find((a) => a.agentId === "codex")!.sessionId).toBeNull();
+  });
+
+  test("binds a certain thread with unparsed settings and recovers without another start", async () => {
+    const f = fixture({}, true);
+    f.native.settings = null;
+    f.native.settingsError = "Native thread settings could not be parsed";
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    const intent = readPrivateJson<Record<string, unknown>>(agentFile(f.cfg.root, "codex", "thread-intent"));
+    expect(intent).toMatchObject({
+      state: "accepted",
+      threadId: f.native.threadId,
+      settings: null,
+      settingsError: f.native.settingsError,
+    });
+    const status = (await f.status()).agents.find((a) => a.kind === "codex")!;
+    expect(status.sessionId).toBe(f.native.threadId);
+    expect(status.settings.configured).toMatchObject({ status: "unparsed", values: null });
+    expect(status.ready).toBe(false);
+    await f.restart();
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toEqual([f.native.threadId, f.native.threadId]);
+  });
+
+  test("records settings from the existing bind response without adding native calls", async () => {
+    const f = fixture({}, true);
+    f.native.bindingSettings = {
+      requestId: "resume-settings",
+      threadId: f.native.threadId,
+      settings: { model: "retained-model", reasoningEffort: "max" },
+    };
+    await f.bind();
+    expect((await f.status()).agents.find((a) => a.kind === "codex")!.settings.configured).toMatchObject({
+      source: "codex-thread/resume",
+      values: { model: "retained-model", reasoningEffort: "max" },
+    });
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toHaveLength(1);
+    await f.restart();
+    expect((await f.request("/operator/connect", {})).status).toBe(200);
+    expect(f.native.starts).toBe(1);
+    expect(f.native.bound).toHaveLength(2);
   });
 
   test("retains native binding errors without losing the accepted thread identity", async () => {
@@ -517,10 +649,16 @@ describe("native pilot coordinator", () => {
       const paused = await f.request("/operator/pause", { agentId });
       expect(paused.status).toBe(200);
       expect(paused.data.paused).toBe(true);
-      const resumed = await f.request("/operator/ready", { agentId, confirmNative: true });
+      const resumed = await f.request("/operator/ready", {
+        agentId,
+        confirmNative: true,
+      });
       expect(resumed).toEqual({ status: 400, data: expected });
     }
-    expect(await f.request("/operator/start", {})).toEqual({ status: 400, data: expected });
+    expect(await f.request("/operator/start", {})).toEqual({
+      status: 400,
+      data: expected,
+    });
     expect((await f.status()).agents.every((agent) => agent.paused && !agent.ready)).toBe(true);
     expect(f.native.operators).toHaveLength(0);
     expect(existsSync(pilotFile(f.cfg.root, "start.json"))).toBe(false);
@@ -535,8 +673,16 @@ describe("native pilot coordinator", () => {
     } finally {
       store.close();
     }
-    const expected = { status: 400, data: { error: "run is paused; peer delivery is held" } };
-    expect(await f.request("/operator/ready", { agentId: "claude", confirmNative: true })).toEqual(expected);
+    const expected = {
+      status: 400,
+      data: { error: "run is paused; peer delivery is held" },
+    };
+    expect(
+      await f.request("/operator/ready", {
+        agentId: "claude",
+        confirmNative: true,
+      }),
+    ).toEqual(expected);
     expect(await f.request("/operator/start", {})).toEqual(expected);
     expect(f.native.operators).toHaveLength(0);
   });
@@ -572,6 +718,99 @@ describe("native pilot coordinator", () => {
     expect(claude.sessionId).toBe(f.agent("claude").sessionId!);
   });
 
+  test("uses the run policy for thread creation and retains native substitutions across recovery", async () => {
+    const f = fixture({}, true);
+    await f.bind();
+    expect(f.native.threadOptions).toEqual([
+      {
+        cwd: f.agent("codex").workspace,
+        model: "gpt-6-astra",
+        sandbox: "danger-full-access",
+        approvalPolicy: "never",
+        config: { model_reasoning_effort: "ultra" },
+        historyMode: "legacy",
+      },
+    ]);
+    const settings = (await f.status()).agents.find((a) => a.kind === "codex")!.settings;
+    expect(settings.requested).toMatchObject({
+      model: "gpt-6-astra",
+      effort: "ultra",
+    });
+    expect(settings.configured.values).toMatchObject({
+      model: "native-model",
+      reasoningEffort: "high",
+    });
+    expect(settings.observed.effort).toBeNull();
+    await f.restart();
+    expect((await f.status()).agents.find((a) => a.kind === "codex")!.settings).toEqual(settings);
+    expect(f.native.starts).toBe(1);
+  });
+
+  test("keeps legacy thread creation at its original policy", async () => {
+    const f = fixture();
+    await f.bind();
+    expect(f.native.threadOptions[0]).toMatchObject({
+      sandbox: "read-only",
+      approvalPolicy: "on-request",
+    });
+    expect((await f.status()).agents[0]!.settings.requested).toBeNull();
+  });
+
+  test("clears approval attention only for matching native thread and request IDs", async () => {
+    const f = fixture();
+    await f.ready();
+    const attention = async () => (await f.status()).agents.find((a) => a.kind === "codex")!.attention;
+    for (const requestId of [0, 1]) {
+      for (const listener of f.native.requests)
+        listener({
+          requestId,
+          method: "item/commandExecution/requestApproval",
+          params: {
+            threadId: f.native.threadId,
+            turnId: "peer-turn",
+            itemId: `item-${requestId}`,
+          },
+        });
+    }
+    expect(await attention()).toBe("Native approval pending");
+    f.native.notify({
+      method: "serverRequest/resolved",
+      params: { threadId: randomUUID(), requestId: 0 },
+    });
+    f.native.notify({
+      method: "serverRequest/resolved",
+      params: { threadId: f.native.threadId, requestId: 99 },
+    });
+    f.native.notify({
+      method: "turn/completed",
+      params: {
+        threadId: f.native.threadId,
+        turn: { id: "peer-turn", status: "completed" },
+      },
+    });
+    expect(await attention()).toBe("Native approval pending");
+    f.native.notify({
+      method: "serverRequest/resolved",
+      params: { threadId: f.native.threadId, requestId: 0 },
+    });
+    expect(await attention()).toBe("Native approval pending");
+    f.native.notify({
+      method: "serverRequest/resolved",
+      params: { threadId: f.native.threadId, requestId: 1 },
+    });
+    expect(await attention()).toBeUndefined();
+    for (const listener of f.native.requests)
+      listener({
+        requestId: 2,
+        method: "item/commandExecution/requestApproval",
+        params: { threadId: f.native.threadId },
+      });
+    f.native.close();
+    expect(await attention()).toBe("Native approval pending");
+    await f.restart();
+    expect(await attention()).toBe("Native approval pending");
+  });
+
   test("records native approval requests without answering or exposing credentials", async () => {
     const f = fixture();
     await f.ready();
@@ -579,7 +818,11 @@ describe("native pilot coordinator", () => {
       listener({
         requestId: 1,
         method: "item/commandExecution/requestApproval",
-        params: { threadId: f.native.threadId, turnId: "turn-1", itemId: "item-1" },
+        params: {
+          threadId: f.native.threadId,
+          turnId: "turn-1",
+          itemId: "item-1",
+        },
       });
     const status = await f.status();
     expect(status.observations.some((o) => o.name === "item/commandExecution/requestApproval")).toBe(true);

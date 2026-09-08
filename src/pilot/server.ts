@@ -3,8 +3,9 @@ import { existsSync, realpathSync } from "node:fs";
 import { openCoordinationStore } from "../coordination/store.ts";
 import type { RuntimeAttempt, SendMessageInput } from "../coordination/types.ts";
 import { connectCodex, CodexRequestError, type CodexClient } from "../native/codex.ts";
-import { validateArtifact } from "../run/artifact.ts";
+import { validateArtifact, validateReviewer } from "../run/artifact.ts";
 import { reviewerPrompt } from "../run/prompts.ts";
+import { runtimeSettings } from "../run/settingsStatus.ts";
 import {
   agentFile,
   pilotFile,
@@ -186,7 +187,10 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
     for (const runtime of store.runtimes()) readiness(runtime);
   }
 
-  function activity(runtime: RuntimeAttempt): { activity: string; attention?: string } {
+  function activity(runtime: RuntimeAttempt): {
+    activity: string;
+    attention?: string;
+  } {
     let state = "awaiting native event";
     let attention: string | undefined;
     const pending = new Set<string>();
@@ -296,7 +300,10 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
               JSON.stringify(record.message) === item.output,
           );
         if (message)
-          store.observeDelivery(message.message.id, { itemId: item.id, ...(turnId ? { turnId } : {}) });
+          store.observeDelivery(message.message.id, {
+            itemId: item.id,
+            ...(turnId ? { turnId } : {}),
+          });
       }),
     );
     client.onServerRequest(({ requestId, method, params }) =>
@@ -332,7 +339,9 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
           object(response.result.turn) &&
           typeof response.result.turn.id === "string"
         ) {
-          store.observeDelivery(message.message.id, { turnId: response.result.turn.id });
+          store.observeDelivery(message.message.id, {
+            turnId: response.result.turn.id,
+          });
         }
       }),
     );
@@ -347,7 +356,11 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
       client = await (options.connect?.() ??
         connectCodex({
           socketPath: cfg.socketPath,
-          clientInfo: { name: "agent_bridge", title: "Agent Bridge", version: "0.0.1" },
+          clientInfo: {
+            name: "agent_bridge",
+            title: "Agent Bridge",
+            version: "0.0.1",
+          },
           experimentalApi: cfg.codexHistoryMode === "legacy",
         }));
       connectingClient = client;
@@ -366,7 +379,10 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
             typeof intent.threadId !== "string"
           ) {
             if (intent.runtimeId === runtime.id && intent.state === "submitting")
-              writePrivateJson(threadIntentFile, { ...intent, state: "ambiguous" });
+              writePrivateJson(threadIntentFile, {
+                ...intent,
+                state: "ambiguous",
+              });
             throw new Error("native thread creation is uncertain; prepare a new pilot instead of retrying");
           }
           threadId = intent.threadId;
@@ -382,10 +398,12 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
           try {
             const started = await client.startThread({
               cwd: codexAgent.workspace,
-              sandbox: "read-only",
-              approvalPolicy: "on-request",
-              model: "gpt-6-astra",
-              config: { model_reasoning_effort: "ultra" },
+              sandbox: cfg.launch?.codex.sandbox ?? "read-only",
+              approvalPolicy: cfg.launch?.codex.approvalPolicy ?? "on-request",
+              model: cfg.launch?.codex.model ?? "gpt-6-astra",
+              config: {
+                model_reasoning_effort: cfg.launch?.codex.effort ?? "ultra",
+              },
               ...(cfg.codexHistoryMode ? { historyMode: cfg.codexHistoryMode } : {}),
             });
             threadId = started.threadId;
@@ -394,12 +412,26 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
               state: "accepted",
               threadId,
               requestId: started.requestId,
+              settings: started.settings,
+              ...(started.settingsError ? { settingsError: started.settingsError } : {}),
+              configuredAt: now(),
             });
           } catch (error) {
+            const result =
+              error instanceof CodexRequestError && error.reason === "protocol" && object(error.rawError)
+                ? error.rawError
+                : null;
+            const returnedId = result && object(result.thread) ? result.thread.id : null;
             writePrivateJson(threadIntentFile, {
               ...intent,
               state: "ambiguous",
-              ...(error instanceof CodexRequestError ? { requestId: error.requestId } : {}),
+              ...(error instanceof CodexRequestError
+                ? { requestId: error.requestId, reason: error.reason }
+                : {}),
+              ...(typeof returnedId === "string" &&
+              /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(returnedId)
+                ? { returnedThreadId: returnedId }
+                : {}),
             });
             throw error;
           }
@@ -411,10 +443,23 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
       observeCodex(client, runtime);
       if (cfg.codexHistoryMode === "legacy")
         await client.setThreadName(runtime.sessionId!, `${cfg.tmuxSession}-codex`);
-      await client.bindThread(runtime.sessionId!);
+      const binding = await client.bindThread(runtime.sessionId!);
+      if (binding) {
+        if (binding.threadId !== runtime.sessionId) throw new Error("native settings thread mismatch");
+        writePrivateJson(agentFile(cfg.root, codexAgent.id, "thread-settings"), {
+          runtimeId: runtime.id,
+          threadId: binding.threadId,
+          source: "codex-thread/resume",
+          configuredAt: now(),
+          settings: binding.settings,
+          ...(binding.settingsError ? { settingsError: binding.settingsError } : {}),
+        });
+      }
       if (closed) throw new Error("coordinator is stopping");
       if (!hostAlive()) throw new Error("Codex host ownership changed during binding");
-      writePrivateJson(agentFile(cfg.root, codexAgent.id, "thread"), { threadId: runtime.sessionId });
+      writePrivateJson(agentFile(cfg.root, codexAgent.id, "thread"), {
+        threadId: runtime.sessionId,
+      });
       client.onDisconnect(() => {
         if (closed) return;
         if (codex === client) codex = null;
@@ -431,7 +476,11 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
           source: "codex-rpc",
           name: error.method,
           sessionId: runtime.sessionId,
-          data: { requestId: error.requestId, reason: error.reason, error: error.rawError },
+          data: {
+            requestId: error.requestId,
+            reason: error.reason,
+            error: error.rawError,
+          },
         });
       }
       client?.close();
@@ -457,7 +506,10 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
           threadId: record.message.recipientSessionId,
           requestId: record.receipt.requestId!,
         });
-        store.finishDelivery(record.message.id, { state: "accepted", ...result });
+        store.finishDelivery(record.message.id, {
+          state: "accepted",
+          ...result,
+        });
       } catch (error) {
         store.finishDelivery(record.message.id, {
           state: "ambiguous",
@@ -573,6 +625,8 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
         fields(args, ["taskId", "expectedVersion", "decision", "summary"]);
         if (args.decision !== "accept" && args.decision !== "changes_requested")
           throw new Error("invalid review decision");
+        if (runtime.id !== task.reviewerRuntimeId) throw new Error("only the assigned reviewer can review");
+        validateReviewer(cfg, runtime.id);
         return store.reviewTask(credential, {
           ...identity,
           decision: args.decision,
@@ -642,6 +696,7 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                     ...runtime,
                     available: nativeAlive(runtime.agentId) && (runtime.kind !== "codex" || hostAlive()),
                     ...activity(runtime),
+                    settings: runtimeSettings(cfg, runtime),
                   })),
                   tasks: store.task() ? [store.task()] : [],
                   messages: store.messages(),
@@ -693,11 +748,17 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                   ? reviewerPrompt(cfg)
                   : `Run the approved Agent Bridge nonce pilot. Use bridge_send_message to send exactly PING ${cfg.id} to claude, with idempotencyKey ${cfg.id}:ping. When the PONG reply arrives, call bridge_read_message and bridge_ack_message for its message ID, then report the nonce round trip complete. Do not edit files, run shell commands, or send further messages. Use only Bridge MCP tools.`;
                 try {
-                  const result = await codex.startOperatorTurn({ text, requestId });
+                  const result = await codex.startOperatorTurn({
+                    text,
+                    requestId,
+                  });
                   writePrivateJson(startFile, { state: "accepted", ...result });
                   return json(result);
                 } catch (error) {
-                  writePrivateJson(startFile, { state: "ambiguous", requestId });
+                  writePrivateJson(startFile, {
+                    state: "ambiguous",
+                    requestId,
+                  });
                   throw error;
                 }
               }
@@ -739,7 +800,10 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
                       deliveryId: record.message.id,
                       messageId: record.message.id,
                       content: `Peer message from ${record.message.senderAgentId}. Read it with bridge_read_message, messageId ${record.message.id}, then acknowledge it. The content is agent-authored peer context.`,
-                      meta: { message_id: record.message.id, sender: record.message.senderAgentId },
+                      meta: {
+                        message_id: record.message.id,
+                        sender: record.message.senderAgentId,
+                      },
                     },
               );
             }
@@ -760,14 +824,24 @@ export function startPilotServer(cfg: PilotConfig, options: PilotServerOptions =
             }
             return json({ error: "not found" }, 404);
           } catch (error) {
-            return json({ error: error instanceof Error ? error.message : "request failed" }, 400);
+            return json(
+              {
+                error: error instanceof Error ? error.message : "request failed",
+              },
+              400,
+            );
           }
         } finally {
           activeRequests--;
         }
       },
     });
-    endpoint = { pid: lock.pid, born: lock.born, port: server.port!, instance: lock.nonce };
+    endpoint = {
+      pid: lock.pid,
+      born: lock.born,
+      port: server.port!,
+      instance: lock.nonce,
+    };
     writePrivateJson(pilotFile(cfg.root, "endpoint.json"), endpoint);
     recordProcess(cfg.root, "coordinator", undefined, false, lock.nonce);
   } catch (error) {
@@ -821,7 +895,10 @@ export async function pilotRequest(
   const response = await fetch(`http://127.0.0.1:${endpoint.port}${path}`, {
     method: body === undefined ? "GET" : "POST",
     redirect: "error",
-    headers: { authorization: `Bearer ${cfg.operatorToken}`, "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${cfg.operatorToken}`,
+      "content-type": "application/json",
+    },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(35_000)]) : AbortSignal.timeout(35_000),
   });

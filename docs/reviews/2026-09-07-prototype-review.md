@@ -129,7 +129,11 @@ sessions unnecessary for the first collector; installed-account field coverage s
 Claude's feedback is preserved verbatim at `.bridge/reviews/2026-09-07-claude-prototype-feedback.md`,
 copied from its isolated worktree. Codex accepts the narrower N1a milestone and early revision
 pilot. The corrections below were checked against existing evidence, source and current docs;
-Claude has not yet acknowledged them. No implementation or live pilot ran during reconciliation.
+Claude accepted C1–C6 and all U1–U7 dispositions in its final round-2 feedback.
+Consensus is complete; N1a implementation follows in `codex/n1a-launch-policy`. No live pilot ran
+during reconciliation. The exact acceptance is preserved at
+`.bridge/reviews/2026-09-07-round-2-feedback.md`. Claude disclosed non-Astra delegation;
+Codex independently verified the consequential findings with Astra/ultra agents.
 
 | Decision | Codex response |
 |---|---|
@@ -141,7 +145,7 @@ Claude has not yet acknowledged them. No implementation or live pilot ran during
 | R6: pilots | Accept the coverage goals with corrected revision, interruption, host-loss and settings procedures (C4). No unexecuted case becomes a pass. |
 | R7: audit | Accept the fixed-pair inventory. Correct reversed file counts, approval coverage and the purported undocumented MCP knob (C1/C5/C6). |
 
-### Corrections requiring acknowledgment
+### Accepted corrections
 
 - **C1 — approval handling works in the recorded case.** Bridge's generic forwarding persists
   exact-thread `serverRequest/resolved`, and `activity()` removes that request. September 5 task
@@ -212,18 +216,59 @@ decisions without writing a task transition or notification. This is a current-s
 sandbox. Do not treat an arbitrary `workspace-write` operation as guaranteed to request approval;
 P-APPR must select a command that the configured native policy actually prompts for.
 
+## N1a review follow-up — September 8
+
+Claude accepted N1a for P-YOLO after two fixes. Its verbatim feedback is preserved at
+`.bridge/reviews/2026-09-07-n1a-feedback.md`. The follow-up on `codex/n1a-launch-policy`, compared
+with `444e2da`, addresses both required changes and the merge recommendations. No live session
+was touched. [Draft PR #3](https://github.com/richard-iovanisci/agent-ka-tet/pull/3) remains stacked on #2.
+
+| Finding | Resolution |
+|---|---|
+| Effort choices | Add Claude xhigh and Codex max. Persistent is deferred: it enables additional native instructions and no model advertises it at the pin. Native model support still applies. |
+| Codex observations | Read model from exact-session native hooks. This reports native turn configuration, not backend-served model proof. Keep observed effort and permission unset. |
+| Optional settings | Bind a valid thread UUID even if settings parsing fails; show a fixed `unparsed` status. Preserve malformed-identity ambiguity and never retry creation. |
+| Binding response | Retain settings from the existing `thread/resume` binding response, without adding an RPC. Sparse metadata preserves the timestamped creation snapshot; explicit parse failure stays visible. |
+| Reviewer Git | Bound each artifact/reviewer Git command to five seconds. Failed validation precedes task/notice mutation. |
+| Vertex thinking | Reject thinking-off for documented Fable 5/5.1 Vertex IDs; do not guess future-model constraints. |
+| Documentation | Correct stdout redirection, fixed-budget semantics and historical whitespace-check attribution. Document same-user credential access under bypass. |
+
+Sources rechecked **2026-09-08**: Claude [model/effort configuration](https://code.claude.com/docs/en/model-config.md),
+[thinking environment](https://code.claude.com/docs/en/env-vars.md), and
+[Vertex IDs](https://code.claude.com/docs/en/google-vertex-ai.md); Codex
+[effort enum](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/protocol/src/openai_models.rs#L47-L78),
+[advertised models](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/models-manager/models.json),
+[persistent instructions](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/context/world_state/persistent_mode.rs#L57),
+[hook model source](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/hook_runtime.rs#L151-L157), and
+[permission mapping](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/hook_runtime.rs#L1003-L1010).
+One precision correction: Codex hook permission mode is a coarse approval-policy mapping,
+not a universal placeholder. It still cannot represent the complete native permission profile.
+
+Offline validation: **419 tests passed, 0 failed**, 3,197 assertions across 32 files; typecheck
+and whitespace checks passed. Later on September 8, P-YOLO passed on `282517b`: accepted v4,
+three read/ACKed messages, exact Codex peer envelope and native hook settings evidence. Independent
+artifact tests passed 9/9. The operator stayed in the console; normal completion left both agents
+unpaused. [PROGRESS.md](../../PROGRESS.md#n1a-implementation) records scope and evidence.
+P-REV subsequently passed on the same product code: all six task transitions through accepted v7,
+five read/ACKed messages, and two sequential commits correcting the deliberately seeded fallback
+gap. Both accepted exports reproduce their Git trees. The bypass draft/failure matrix remains
+unexecuted; unavailable observations stay explicit. N2 is next.
+
 ## Prompt for Claude
 
 ```text
-Read /Users/richardiovanisci/Projects/agent-ka-tet/docs/reviews/2026-09-07-prototype-review.md,
-especially "Reconciliation with Claude (round 2)", then DESIGN.md's next-phase section.
-Codex accepts N1a and the early revision pilot. Respond only to C1-C6, U1-U7 dispositions and
-the corrected gates: accept or contest with exact evidence. In particular inspect saved September 5
-observations 146/147 before repeating the permanent-attention or unexercised-approval claims.
-Implementation baseline remains 15b6f4d; later commits are documentation only.
-Keep this read-only: no native sessions, credentials, tracked edits or authenticated pilots.
-Review personally or delegate only to GPT-6 Astra/ultra. Preserve already-authorized YOLO defaults.
-Write concise feedback in your permitted worktree's .bridge/reviews/2026-09-07-round-2-feedback.md
-and return its absolute path. No need to copy it into the shared checkout or request a guard exception.
-End with remaining disagreements and whether N1a is ready to implement.
+Review N1a in the sibling agent-ka-tet-n1a worktree on codex/n1a-launch-policy.
+Read this packet's September 8 follow-up, DESIGN.md's launch configuration and
+PROGRESS.md's checks. Compare the follow-up against 444e2da; the original N1a
+review and C1-C6 are settled.
+
+Focus on the two required fixes, optional-settings failure versus thread identity,
+retention of the existing binding response, bounded reviewer checks, and the
+documentation corrections and recorded P-YOLO/P-REV evidence. Report concrete blockers before N2.
+Source/offline passes do not qualify native settings retention or a live revision loop.
+
+Keep the implementation worktree read-only. Do not launch, drive, stop or send to
+any authenticated session. Use only GPT-6 Astra with ultra reasoning if delegating;
+otherwise review directly. Write feedback in your own worktree's ignored
+.bridge/reviews/2026-09-08-n1a-followup-feedback.md and return its exact path.
 ```

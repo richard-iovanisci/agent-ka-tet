@@ -1,11 +1,11 @@
 # Status
 
-Updated: 2026-09-07. **The macOS 1+1 prototype passed the operator's implement/review/accept
+Updated: 2026-09-08. **The macOS 1+1 prototype passed the operator's implement/review/accept
 cycle, final acknowledgment, and exported-patch validation.**
 
 ## Working
 
-- Claude implements; read-only Codex reviews the exact committed artifact in a separate worktree.
+- Claude implements; Codex reviews the exact committed artifact in a separate worktree.
 - Versioned task claim, submit, and review operations persist with their peer notifications.
 - Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
 - The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
@@ -56,6 +56,33 @@ Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-
 The operator closed this round. Both agents' Bridge delivery is paused, with native sessions retained.
 Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
 
+## N1a implementation
+
+Design reconciliation is complete. New task runs snapshot per-agent launch settings and default to
+bypass/YOLO. Host/thread settings, Claude argv/environment, version-1 compatibility, native settings
+status and a clean-at-base reviewer check are implemented on `codex/n1a-launch-policy`.
+The September 8 review fixes add Claude xhigh/Codex max, Vertex thinking validation, exact-session
+Codex model observations, tolerant optional settings parsing, existing binding-response retention,
+and bounded artifact/reviewer Git commands. They preserve thread identity and no-replay behavior.
+P-YOLO passed on September 8 using `282517b`: run `06db59ce23a4` reached **accepted v4**,
+artifact `20db315a8cd837ad84efb98662a1ad20e851aee4`. Exactly three messages were read/ACKed;
+the Codex peer item matched its stored envelope, with no approval requests recorded. Claude hooks
+reported high effort/bypass and resolved Fable 5.1; Codex peer hooks reported Astra, matching
+the startup Astra/ultra/never/full-access configuration. Codex effort remains configured-only.
+Both agents remained unpaused after normal completion. Independent artifact validation in a new
+clone passed **9 tests, 0 failures, 13 assertions**; source/reviewer remained clean at base.
+Evidence: `.bridge/pilots/2026-09-08-pyolo-{native-evidence,artifact-check}.json`.
+P-REV then passed on the same product code: run `32a38542fe44` reached **accepted v7**.
+Native tool results confirm all six transitions from v1 through v7. The first commit
+`fe752697b581edc55705f251e3cedfaf91e074cf` omitted the fallback as instructed; final commit
+`4b1787acec4d29ef45aad05c4f60cc56ef949fac` added it as a direct child. All five messages were
+read/ACKed and both Codex peer items matched their immutable envelopes. This proves the controlled
+revision workflow, not unaided defect discovery. Both runs' exported patches apply and exactly
+reproduce their accepted trees. Independent normal Bun runs passed **6 tests / 6 assertions** for
+the first commit and **9 tests / 11 assertions** for the final commit; five separate probes confirmed
+the actual fallback correction. Evidence: `.bridge/pilots/2026-09-08-prev-{native-evidence,artifact-check,export-check}.json`.
+Peer-turn draft preservation under bypass and the failure matrix remain unexecuted.
+
 ## Limits and next steps
 
 - Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
@@ -63,12 +90,11 @@ Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
   refused before preparation; automatic configuration merging remains open.
 - The run has 32 messages, an eight-hop limit, and four hours. It supports one task and a fixed pair.
 - Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
-- Improve the console and add launch-time model/reasoning controls,
-  default permission bypass/YOLO, shared provider/account quota visibility, and per-session context.
-  These are operator requirements, not implemented features. Research found documented Claude
+- Improve the console, shared provider/account quota visibility, and per-session context.
+  These telemetry features remain unimplemented. Research found documented Claude
   status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
   Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
-- Next: N1a launch-policy plumbing, then the first live revision loop before N2 telemetry/UI.
+- Next: N2 telemetry/UI; other launch profiles remain unqualified.
   General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
 
 Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).
@@ -76,11 +102,21 @@ Phase evidence, capability sources and Claude review prompt: [review packet](doc
 
 ## Checks
 
+September 8 review fixes: `scripts/check.sh` passed **419 tests, 0 failures**, 3,197 assertions
+across 32 files (55.55 s), typecheck and whitespace checks. The script now checks both staged and
+unstaged whitespace and records that result. Evidence: `.bridge/reviews/2026-09-08-n1a-review-check.log`.
+
+September 7 N1a `scripts/check.sh`: **405 passed, 0 failed**, 3,051 assertions across 32 files (44.97 s);
+typecheck passed. A separate `git diff --check` passed; it was not part of that saved script log.
+The first run hit an existing tmux shell-fixture timeout.
+The fixture now disables user shell startup files while preserving real tmux/bracketed-paste checks.
+Evidence: `.bridge/reviews/2026-09-07-n1a-final-check.log`.
+
 Pause-notice clarification: **15 console tests passed**, 208 assertions; typecheck passed.
 
 Full suite for `b18ad69`, before the pause-notice wording change: `scripts/check.sh` reported
 **367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
-typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
+typecheck passed, with whitespace checked separately. Tests cover task roles, version conflicts, atomic notifications,
 Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
 Directory split: **13 native/coordination/pilot/run files, 180 tests**; **16 shared/earlier files,
 187 tests**, including shared modules changed during the rework. This is not a new-versus-old test count.

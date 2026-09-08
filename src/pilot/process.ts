@@ -7,11 +7,13 @@ import {
   pilotFile,
   readPrivateJson,
   sourceFile,
+  writePrivateJson,
   type PilotEndpoint,
 } from "./config.ts";
 import { recordProcess } from "./processState.ts";
 import { startPilotServer } from "./server.ts";
 import { implementerPrompt } from "../run/prompts.ts";
+import { claudeLaunchControls, codexHostLaunchControls, type NativeLaunchRecord } from "../run/launch.ts";
 
 export async function runProcess(
   role: string,
@@ -47,15 +49,28 @@ export async function runProcess(
   const agent = cfg.agents.find((a) => a.id === (role === "codex-host" ? "codex" : agentId));
   if (!agent || !["codex-host", "agent"].includes(role)) throw new Error("invalid pilot process role");
   const processRole = role === "agent" ? agent.id : role;
-  const env: NodeJS.ProcessEnv = {
+  let env: NodeJS.ProcessEnv = {
     ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_"))),
     AGENT_BRIDGE_URL: `http://127.0.0.1:${endpoint.port}`,
     AGENT_BRIDGE_TOKEN: agent.token,
   };
+  const launch = cfg.version === 2 ? cfg.launch : undefined;
+  if (cfg.version === 2 && !launch) throw new Error("missing native launch settings");
+  let launchRecord: Omit<NativeLaunchRecord, "recordedAt"> | undefined;
   let command: string, args: string[];
   if (role === "codex-host") {
+    const controls = launch ? codexHostLaunchControls(launch.codex) : undefined;
+    if (controls)
+      launchRecord = {
+        version: 1,
+        runtimeId: agent.runtimeId,
+        role: "codex-host",
+        configured: controls.configured,
+        environment: controls.environment,
+      };
     command = "codex";
     args = [
+      ...(controls?.args ?? []),
       "-c",
       `mcp_servers.agent_bridge.command=${JSON.stringify(process.execPath)}`,
       "-c",
@@ -81,6 +96,17 @@ export async function runProcess(
     command = "codex";
     args = ["resume", threadId, "--remote", `unix://${cfg.socketPath}`, "--cd", agent.workspace];
   } else {
+    const controls = launch ? claudeLaunchControls(launch.claude, env) : undefined;
+    if (controls) {
+      env = controls.env;
+      launchRecord = {
+        version: 1,
+        runtimeId: agent.runtimeId,
+        role: "claude",
+        configured: controls.configured,
+        environment: controls.environment,
+      };
+    }
     command = "claude";
     env.MCP_PROTOCOL_NEGOTIATION = "legacy";
     args = [
@@ -93,7 +119,7 @@ export async function runProcess(
       "--mcp-config",
       pilotFile(root, "claude.mcp.json"),
       "--strict-mcp-config",
-      ...(cfg.task ? ["--permission-mode", "default"] : []),
+      ...(controls?.args ?? (cfg.task ? ["--permission-mode", "default"] : [])),
       "--dangerously-load-development-channels",
       "server:agent-bridge",
       "--append-system-prompt",
@@ -114,8 +140,17 @@ export async function runProcess(
     if (!/^%\d+$/.test(pane.paneId) || pane.wrapperPid !== process.pid)
       throw new Error("pane ownership does not match this wrapper; native process not started");
   }
+  if (launchRecord)
+    writePrivateJson(agentFile(root, agent.id, "launch"), {
+      ...launchRecord,
+      recordedAt: Date.now(),
+    });
   recordProcess(root, processRole);
-  const child = spawn(command, args, { cwd: agent.workspace, env, stdio: "inherit" });
+  const child = spawn(command, args, {
+    cwd: agent.workspace,
+    env,
+    stdio: "inherit",
+  });
   if (child.pid !== undefined) recordProcess(root, processRole, child.pid);
   const forward = (signal: NodeJS.Signals) => {
     if (child.exitCode === null && child.signalCode === null) child.kill(signal);

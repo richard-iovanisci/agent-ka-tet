@@ -27,6 +27,19 @@ import {
 const SOCKET = `bridge-test-${process.pid}`;
 const SESSION = "mux-adapter-test";
 const CWD = process.cwd();
+const SHELL_COMMAND = [
+  "/usr/bin/env",
+  "-u",
+  "ENV",
+  "-u",
+  "BASH_ENV",
+  "ZDOTDIR=/dev/null",
+  "PS1=bridge-test$ ",
+  "/bin/zsh",
+  "-d",
+  "-f",
+  "-i",
+] as const;
 const COLLAPSED_RECEIVER = fileURLToPath(
   new URL("./fixtures/collapsedPasteReceiver.ts", import.meta.url),
 );
@@ -130,6 +143,7 @@ async function startCollapsedReceiver(
     cwd: CWD,
     width: 180,
     height: 40,
+    command: SHELL_COMMAND,
   });
   expect(await receiverMux.waitForShellReady(pane)).toBe(true);
   const command = [
@@ -244,6 +258,7 @@ describe("TmuxAdapter", () => {
       cwd: CWD,
       width: 200,
       height: 50,
+      command: SHELL_COMMAND,
     });
     expect(firstPane).toMatch(/^%\d+$/);
     expect(await tmux.hasSession(SESSION)).toBe(true);
@@ -259,7 +274,7 @@ describe("TmuxAdapter", () => {
 
   test("three splits + tiled layout => four sane panes", async () => {
     for (let i = 0; i < 3; i++) {
-      splitPanes.push(await tmux.splitPane(SESSION, { cwd: CWD }));
+      splitPanes.push(await tmux.splitPane(SESSION, { cwd: CWD, command: SHELL_COMMAND }));
     }
     await tmux.selectLayout(SESSION, "tiled");
 
@@ -280,7 +295,7 @@ describe("TmuxAdapter", () => {
       expect(p.agentId).toBeNull();
       expect(p.managedProcess).toBeNull();
       expect(typeof p.title).toBe("string");
-      expect(p.command.length).toBeGreaterThan(0); // the user's shell
+      expect(p.command.length).toBeGreaterThan(0);
     }
     expect(panes.filter((p) => p.active).length).toBe(1);
   });
@@ -298,6 +313,7 @@ describe("TmuxAdapter", () => {
         "-P",
         "-F",
         "#{window_id}",
+        ...SHELL_COMMAND,
       ])
     ).trim();
     expect(scratchWindow).toMatch(/^@\d+$/);
@@ -314,7 +330,7 @@ describe("TmuxAdapter", () => {
     expect((await tmux.listPanes(SESSION)).map((pane) => pane.id)).toEqual(
       managedIds,
     );
-    const added = await tmux.splitPane(SESSION, { cwd: CWD });
+    const added = await tmux.splitPane(SESSION, { cwd: CWD, command: SHELL_COMMAND });
     await tmux.selectLayout(SESSION, "tiled");
     const after = await tmux.listPanes(SESSION);
     expect(after.map((pane) => pane.id)).toEqual([...managedIds, added]);
