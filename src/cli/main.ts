@@ -6,10 +6,12 @@ import { attach } from "./attach.ts";
 import { runInit } from "./init.ts";
 import { top } from "./top.ts";
 import { handoff, type HandoffArgs } from "./handoff.ts";
+import { pilotMain } from "../pilot/cli.ts";
+import { runMain } from "../run/cli.ts";
 
 const COMMAND_FLAGS = {
   up: new Set(["--existing-session-only"]),
-  down: new Set(["--legacy"]),
+  down: new Set<string>(),
   attach: new Set<string>(),
   init: new Set(["--dry-run"]),
   top: new Set(["--once"]),
@@ -49,6 +51,9 @@ export function parseHandoffArgs(args: string[]): HandoffArgs {
 export async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
 
+  if (cmd === "pilot") return pilotMain(argv.slice(1));
+  if (cmd === "run") return runMain(argv.slice(1));
+
   if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") {
     printHelp();
     return 0;
@@ -79,7 +84,7 @@ export async function main(argv: string[]): Promise<number> {
       return 2;
     }
     try {
-      const cfg = loadConfigWithMigrationNotice();
+      const cfg = loadConfig();
       return await handoff(cfg, handoffArgs, { mux: new TmuxAdapter() });
     } catch (error) {
       console.error(
@@ -100,29 +105,28 @@ export async function main(argv: string[]): Promise<number> {
   try {
     switch (cmd) {
       case "up": {
-        const cfg = loadConfigWithMigrationNotice();
+        const cfg = loadConfig();
         return await up(cfg, {
           mux: new TmuxAdapter(),
           existingSessionOnly: flags.has("--existing-session-only"),
         });
       }
       case "down": {
-        const cfg = loadConfigWithMigrationNotice();
+        const cfg = loadConfig();
         return await down(cfg, {
           mux: new TmuxAdapter(),
-          allowLegacy: flags.has("--legacy"),
         });
       }
       case "attach": {
-        const cfg = loadConfigWithMigrationNotice();
+        const cfg = loadConfig();
         return await attach(cfg, { mux: new TmuxAdapter() });
       }
       case "init": {
-        const cfg = loadConfigWithMigrationNotice();
+        const cfg = loadConfig();
         return runInit(cfg, { dryRun: flags.has("--dry-run") });
       }
       case "top": {
-        const cfg = loadConfigWithMigrationNotice();
+        const cfg = loadConfig();
         return await top(cfg, { once: flags.has("--once") });
       }
     }
@@ -132,25 +136,17 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
-function loadConfigWithMigrationNotice() {
-  const cfg = loadConfig();
-  if (cfg.legacyAgentsConfig) {
-    console.error(
-      "bridge: legacy object-shaped agents config detected; using only claude/codex — migrate to the ordered array shown in bridge.config.example.jsonc",
-    );
-  }
-  return cfg;
-}
-
 function printHelp(): void {
   console.log(`agent-bridge — supervisor for native coding-agent TUIs
 
 usage: bridge <command>
 
 commands:
+  run              native Claude implementer + Codex reviewer; see run --help
+  pilot            prepare, inspect, and run a named native-messaging pilot; see pilot --help
   up [--existing-session-only]
                    launch the session + daemon; recovery flag refuses to create panes
-  down [--legacy]  kill this repo's tmux session and daemon; --legacy retires a verified four-agent baseline
+  down             kill this repo's tmux session and daemon
   attach           attach to the tmux session
   init [--dry-run] wire agent hook/event surfaces to the daemon (diff + backup first)
   top [--once]     live per-agent state board (events only, no scraping)

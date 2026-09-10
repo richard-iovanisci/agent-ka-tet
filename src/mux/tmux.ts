@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import { BRIDGE_MANAGED_PROCESS_OPTION } from "../attribution.ts";
 import type {
   MuxAdapter,
-  ListPanesOptions,
   PaneInfo,
   PasteObservable,
   PasteVerification,
@@ -10,19 +9,6 @@ import type {
   SendResult,
   SendTextOptions,
 } from "./adapter.ts";
-
-/**
- * tmux backend for MuxAdapter. Every invocation is an argv array through
- * Bun.spawn — never a shell string — so session names, titles, and injected
- * text can't be re-interpreted by a shell.
- *
- * Injection etiquette (DESIGN.md §4, load-bearing): text goes in as ONE
- * bracketed paste via a uniquely named tmux buffer (load-buffer from stdin +
- * paste-buffer -d -p -r), then exactly one expected receipt observable is
- * verified via capture-pane. A miss retries observation, never the paste, and
- * one trailing Enter is sent only after verification — never per-line
- * send-keys, which is the naive path that intermittently loses keystrokes.
- */
 
 export interface TmuxAdapterOptions {
   /** tmux -L socket name (tests use a throwaway socket per run). */
@@ -70,6 +56,15 @@ const MANAGED_WINDOW_MARKER_OPTION = "@agent-bridge-managed-window";
 const PANE_AGENT_ID_OPTION = "@agent-bridge-agent-id";
 
 let bufferSeq = 0;
+
+function paneCommand(command: readonly string[] | undefined): string[] {
+  if (command === undefined) return [];
+  if (command.length === 0 || command[0] === "" || command.some((arg) => arg.includes("\0"))) {
+    throw new Error("tmux command requires a nonempty executable and NUL-free arguments");
+  }
+  // One tmux argument invokes a shell; nice with zero adjustment execs directly.
+  return ["--", ...(command.length === 1 ? ["/usr/bin/nice", "-n", "0", "--", ...command] : command)];
+}
 
 interface ObservableCounts {
   literal: number;
@@ -275,7 +270,8 @@ export class TmuxAdapter implements MuxAdapter {
   /** Run tmux, never throwing on a non-zero exit. */
   private async run(args: string[], stdin?: string): Promise<RunResult> {
     const proc = Bun.spawn({
-      cmd: [...this.baseArgv, ...args],
+      // tmux consumes one escape before a trailing literal semicolon.
+      cmd: [...this.baseArgv, ...args.map((arg) => arg.replace(/;$/u, "\\;"))],
       env: this.environment,
       stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
       stdout: "pipe",
@@ -338,15 +334,8 @@ export class TmuxAdapter implements MuxAdapter {
     ).trim();
   }
 
-  /**
-   * Resolve the bridge-owned window without consulting tmux's mutable current
-   * window. Missing or inconsistent reciprocal markers fail closed. The sole
-   * legacy fallback is explicit and used only for verified baseline teardown.
-   */
-  private async managedWindowTarget(
-    session: string,
-    opts: ListPanesOptions = {},
-  ): Promise<string> {
+  /** Resolve the pinned window; never infer ownership from the current window. */
+  private async managedWindowTarget(session: string): Promise<string> {
     const sessionId = await this.sessionId(session);
     const stored = await this.run([
       "show-options",
@@ -356,7 +345,6 @@ export class TmuxAdapter implements MuxAdapter {
       MANAGED_WINDOW_OPTION,
     ]);
     if (stored.exitCode !== 0 || stored.stdout.trim().length === 0) {
-      if (opts.legacyCurrentWindow === true) return exactWindow(session);
       throw new Error(
         `tmux session ${JSON.stringify(session)} has no managed window identity`,
       );
@@ -400,7 +388,7 @@ export class TmuxAdapter implements MuxAdapter {
 
   async createSession(
     session: string,
-    opts: { cwd: string; width?: number; height?: number },
+    opts: { cwd: string; width?: number; height?: number; command?: readonly string[] },
   ): Promise<string> {
     // tmux silently rewrites '.' and ':' in session names; accepting that
     // would create a session that exact-match targets can never address.
@@ -409,14 +397,15 @@ export class TmuxAdapter implements MuxAdapter {
         `tmux session names must not contain '.', ':' or whitespace: ${JSON.stringify(session)}`,
       );
     }
-    // No command argument: the pane runs the user's default shell, so it
-    // outlives whatever agent is later launched by typing into it.
     const args = ["new-session", "-d", "-s", session, "-c", opts.cwd];
     if (opts.width !== undefined) args.push("-x", String(opts.width));
     if (opts.height !== undefined) args.push("-y", String(opts.height));
-    args.push("-P", "-F", "#{pane_id}");
+    args.push("-P", "-F", "#{pane_id}", ...paneCommand(opts.command));
     const paneId = (await this.exec(args)).trim();
     try {
+      if (opts.command !== undefined) {
+        await this.exec(["set-option", "-p", "-t", paneId, "remain-on-exit", "on"]);
+      }
       const windowId = (
         await this.exec([
           "display-message",
@@ -455,7 +444,8 @@ export class TmuxAdapter implements MuxAdapter {
     }
   }
 
-  async splitPane(session: string, opts: { cwd: string }): Promise<string> {
+  async splitPane(session: string, opts: { cwd: string; command?: readonly string[] }): Promise<string> {
+    const command = paneCommand(opts.command);
     const window = await this.managedWindowTarget(session);
     const out = await this.exec([
       "split-window",
@@ -466,8 +456,13 @@ export class TmuxAdapter implements MuxAdapter {
       "-P",
       "-F",
       "#{pane_id}",
+      ...command,
     ]);
-    return out.trim();
+    const paneId = out.trim();
+    if (opts.command !== undefined) {
+      await this.exec(["set-option", "-p", "-t", paneId, "remain-on-exit", "on"]);
+    }
+    return paneId;
   }
 
   async selectLayout(
@@ -478,9 +473,9 @@ export class TmuxAdapter implements MuxAdapter {
     await this.exec(["select-layout", "-t", window, layout]);
   }
 
-  async listPanes(session: string, opts: ListPanesOptions = {}): Promise<PaneInfo[]> {
+  async listPanes(session: string): Promise<PaneInfo[]> {
     const separator = paneSeparator();
-    const window = await this.managedWindowTarget(session, opts);
+    const window = await this.managedWindowTarget(session);
     const out = await this.exec([
       "list-panes",
       "-t",

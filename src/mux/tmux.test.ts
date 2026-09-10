@@ -1,9 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -222,6 +225,16 @@ describe("TmuxAdapter", () => {
     for (const bad of ["a.b", "a:b", "a b", ""]) {
       await expect(tmux.createSession(bad, { cwd: CWD })).rejects.toThrow(/must not contain|names/);
     }
+  });
+
+  test("empty or invalid commands fail before creating a session or splitting", async () => {
+    for (const command of [[], [""], ["/bin/echo", "bad\0argument"]]) {
+      await expect(tmux.createSession("invalid-command", { cwd: CWD, command }))
+        .rejects.toThrow(/nonempty executable|NUL-free/);
+      await expect(tmux.splitPane("missing-session", { cwd: CWD, command }))
+        .rejects.toThrow(/nonempty executable|NUL-free/);
+    }
+    expect(await tmux.hasSession("invalid-command")).toBe(false);
   });
 
   test("hasSession is false before create, true after", async () => {
@@ -669,4 +682,89 @@ describe("TmuxAdapter", () => {
     await tmux.killSession(SESSION);
     expect(await tmux.hasSession(SESSION)).toBe(false);
   });
+});
+
+describe("TmuxAdapter direct commands", () => {
+  test("executes literal argv and cwd without shell init, retaining only direct panes on exit", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "bridge-direct-command-"));
+    const socket = `bridge-direct-${process.pid}`;
+    const env = { ...process.env, SHELL: "/bin/zsh", ZDOTDIR: directory };
+    const mux = new TmuxAdapter({ socketName: socket, configFile: "/dev/null", environment: env });
+    const raw = async (args: string[]) => {
+      const process = Bun.spawn({ cmd: ["tmux", "-L", socket, "-f", "/dev/null", ...args], env, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited,
+      ]);
+      if (code !== 0) throw new Error(stderr);
+      return stdout.trim();
+    };
+    const shellMarker = join(directory, "shell-started");
+    writeFileSync(join(directory, ".zshenv"), 'print -r -- "hostile shell init" > "$ZDOTDIR/shell-started"\nexit 73\n');
+    const probe = Bun.spawn({ cmd: ["/bin/zsh", "-c", "exit 0"], env, stdout: "ignore", stderr: "ignore" });
+    expect(await probe.exited).toBe(73);
+    expect(existsSync(shellMarker)).toBe(true);
+    rmSync(shellMarker);
+    const script = join(directory, "record argv.ts");
+    writeFileSync(script, `import { existsSync, writeFileSync, writeSync } from "node:fs";
+const [output, ...argv] = process.argv.slice(2);
+writeSync(1, "DIRECT_OUTPUT_RETAINED\\n");
+writeFileSync(output, JSON.stringify({ argv, cwd: process.cwd(), pid: process.pid }));
+setInterval(() => { if (existsSync(output + ".exit")) process.exit(23); }, 25);
+`);
+    const values = ["two words", "\"quoted\" 'value'", "$(touch SHOULD_NOT_EXIST)", "`touch ALSO_NOT_CREATED`", "a;b", ";", "tail;", "backslash\\;", "double\\\\;", "line\nbreak", "--flag", "", "# literal", "a=b"];
+    try {
+      const outputs: string[] = [];
+      const panes: string[] = [];
+      for (const [index, cwdName] of ["create cwd ;", "split cwd $() ;"].entries()) {
+        const cwd = join(directory, cwdName);
+        mkdirSync(cwd);
+        const output = join(directory, `argv-${index}.json`);
+        const command = Object.freeze([process.execPath, script, output, ...values]);
+        const pane = index === 0
+          ? await mux.createSession("direct-command", { cwd, width: 160, height: 48, command })
+          : await mux.splitPane("direct-command", { cwd, command });
+        expect(await pollFor(async () => existsSync(output))).toBe(true);
+        const record = JSON.parse(readFileSync(output, "utf8"));
+        expect(record).toEqual({ argv: values, cwd: realpathSync(cwd), pid: expect.any(Number) });
+        expect(await raw(["display-message", "-p", "-t", pane, "#{pane_pid}"])).toBe(String(record.pid));
+        expect(await raw(["show-options", "-p", "-v", "-t", pane, "remain-on-exit"])).toBe("on");
+        expect(existsSync(join(cwd, "SHOULD_NOT_EXIST"))).toBe(false);
+        expect(existsSync(join(cwd, "ALSO_NOT_CREATED"))).toBe(false);
+        await mux.setPaneAgentId(pane, `direct-${index}`);
+        outputs.push(output);
+        panes.push(pane);
+      }
+      expect((await mux.listPanes("direct-command")).map((pane) => [pane.id, pane.agentId]))
+        .toEqual(panes.map((pane, index) => [pane, `direct-${index}`]));
+      expect(existsSync(shellMarker)).toBe(false);
+      expect(await raw(["show-options", "-g", "-w", "-v", "remain-on-exit"])).toBe("off");
+
+      const singleOutput = join(directory, "single.json");
+      const executable = join(directory, "single program = $(literal) ;");
+      writeFileSync(executable, `#!${process.execPath}\n${readFileSync(script, "utf8").replace('process.argv.slice(2)', JSON.stringify([singleOutput]))}`, { mode: 0o700 });
+      const singlePane = await mux.createSession("single-command", { cwd: directory, command: [executable] });
+      expect(await pollFor(async () => existsSync(singleOutput))).toBe(true);
+      expect(JSON.parse(readFileSync(singleOutput, "utf8"))).toMatchObject({ argv: [], cwd: realpathSync(directory) });
+      expect(existsSync(shellMarker)).toBe(false);
+      outputs.push(singleOutput);
+      panes.push(singlePane);
+
+      for (const [index, output] of outputs.entries()) {
+        writeFileSync(`${output}.exit`, "exit");
+        const pane = panes[index]!;
+        expect(await pollFor(async () => (await raw(["display-message", "-p", "-t", pane, "#{pane_dead}:#{pane_dead_status}"])) === "1:23")).toBe(true);
+        expect(await mux.capturePane(pane, { lines: 100 })).toContain("DIRECT_OUTPUT_RETAINED");
+      }
+      expect(await mux.hasSession("direct-command")).toBe(true);
+      expect(await mux.hasSession("single-command")).toBe(true);
+
+      rmSync(join(directory, ".zshenv"));
+      const legacyPane = await mux.splitPane("direct-command", { cwd: directory });
+      expect(await mux.waitForShellReady(legacyPane)).toBe(true);
+      expect(await raw(["show-options", "-p", "-A", "-v", "-t", legacyPane, "remain-on-exit"])).toBe("off");
+    } finally {
+      await raw(["kill-server"]).catch(() => {});
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

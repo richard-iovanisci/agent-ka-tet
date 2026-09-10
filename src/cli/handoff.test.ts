@@ -28,6 +28,10 @@ import { parseManagedProcessMarker } from "../attribution.ts";
 import { tryAcquireDeliveryReservation } from "../handoffs/reservation.ts";
 
 const SOCKET = `bridge-handoff-test-${process.pid}`;
+const SHELL_ROOT = mkdtempSync(join(tmpdir(), "bridge-handoff-shell-"));
+const SHELL_ENV = { SHELL: "/bin/zsh", ZDOTDIR: SHELL_ROOT };
+writeFileSync(join(SHELL_ROOT, ".zshenv"), "unsetopt GLOBAL_RCS\n");
+writeFileSync(join(SHELL_ROOT, ".zshrc"), "PROMPT='bridge-fixture> '\nRPROMPT=''\n");
 const RECEIVER = fileURLToPath(
   new URL("../mux/fixtures/collapsedPasteReceiver.ts", import.meta.url),
 );
@@ -48,6 +52,7 @@ afterEach(async () => {
 
 afterAll(() => {
   Bun.spawnSync(["tmux", "-L", SOCKET, "kill-server"]);
+  rmSync(SHELL_ROOT, { recursive: true, force: true });
 });
 
 async function pollFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 5000) {
@@ -133,7 +138,7 @@ async function fixture(
   cfg.daemonPort = reservePort();
   const daemon = startDaemon(cfg, { dbPath: ":memory:" });
   daemons.push(daemon);
-  const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+  const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
 
   const firstPane = await mux.createSession(cfg.session, {
     cwd: cfg.agents.find((agent) => agent.id === "claude")?.cwd ?? repo,

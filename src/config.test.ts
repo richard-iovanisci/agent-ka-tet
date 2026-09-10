@@ -47,16 +47,11 @@ describe("loadConfig", () => {
     ]);
   });
 
-  test("legacy object roster is normalized to Claude + Codex for migration", () => {
-    const dir = tempRepo('{"agents": {"claude": {}}}');
-    const cfg = loadConfig(dir);
-    expect(cfg.legacyAgentsConfig).toBe(true);
-    expect(cfg.agents.map((agent) => agent.kind)).toEqual(["claude", "codex"]);
-  });
-
-  test("agents must be an ordered array or legacy object", () => {
-    const dir = tempRepo('{"agents": "claude"}');
-    expect(() => loadConfig(dir)).toThrow(/must be an ordered array/);
+  test("agents must be an ordered array", () => {
+    for (const agents of ["claude", null, { claude: {} }]) {
+      const dir = tempRepo(JSON.stringify({ agents }));
+      expect(() => loadConfig(dir)).toThrow(/must be an ordered array/);
+    }
   });
 
   test("unsupported adapter kind is rejected", () => {
@@ -74,7 +69,7 @@ describe("loadConfig", () => {
     expect(() => loadConfig(dir)).toThrow(/duplicate agent id "pair"/);
   });
 
-  test("duplicate adapter kinds are rejected in Phase 0", () => {
+  test("the current launcher rejects duplicate adapter kinds", () => {
     const dir = tempRepo(`{
       "agents": [
         { "id": "claude-a", "kind": "claude" },
@@ -84,7 +79,7 @@ describe("loadConfig", () => {
     expect(() => loadConfig(dir)).toThrow(/multiple "claude" instances are not supported/);
   });
 
-  test("current Phase 0 roster requires both adapter kinds", () => {
+  test("the current launcher requires both adapter kinds", () => {
     const dir = tempRepo('{"agents": [{"id": "claude", "kind": "claude"}]}');
     expect(() => loadConfig(dir)).toThrow(/requires one configured "codex"/);
   });

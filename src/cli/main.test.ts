@@ -90,9 +90,20 @@ describe("bridge argument validation", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("usage: bridge <command>");
+    expect(result.stdout).toContain("pilot");
+    expect(result.stdout).not.toContain("--legacy");
     expect(result.stdout).not.toContain("not running");
     expect(result.stdout).not.toContain("nothing to stop");
     expect(result.stderr).toBe("");
+  });
+
+  test("removed migration flag fails before teardown", () => {
+    const { repo, home } = fixture();
+    const result = runBridge(repo, home, ["down", "--legacy"]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain('unknown option or argument "--legacy"');
+    expect(result.stdout).not.toContain("not running");
+    expect(result.stdout).not.toContain("nothing to stop");
   });
 
   test("a typoed init flag fails before writing any hook config", () => {

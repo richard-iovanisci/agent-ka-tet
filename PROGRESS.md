@@ -1,31 +1,89 @@
-# Implementation status
+# Status
 
-Updated: 2026-09-05. Active platform: **macOS only**.
+Updated: 2026-09-07. **The macOS 1+1 prototype passed the operator's implement/review/accept
+cycle, final acknowledgment, and exported-patch validation.**
 
-## Current baseline
+## Working
 
-The reconciled baseline is `eb8f515`: native Claude/Codex tmux launch, hook-derived state,
-exact-session operator-approved handoffs, packet/receipt persistence, and diff-backed config updates.
-The previous documentation recorded macOS manual-handoff acceptance; those historical checks
-do not validate the new native routes or task plane.
+- Claude implements; read-only Codex reviews the exact committed artifact in a separate worktree.
+- Versioned task claim, submit, and review operations persist with their peer notifications.
+- Native Claude Channel and Codex tool output carry messages with separate delivery/read/ACK receipts.
+- The console shows tasks and receipts, opens either native TUI, and supports pause/resume.
+- Run expiry is shown separately from agent pause; expired runs retain native entry and inspection.
+- Native startup uses direct tmux argv with a pane ownership barrier, avoiding interactive shell prompts.
+- Live recovery preserves native sessions and prepared messages; fixtures verify uncertain sends stay held.
+- Accepted linear commits export as a patch. The source checkout stays unchanged.
 
-The architecture has been rewritten around [DESIGN.md](DESIGN.md). Old designs and checkout
-snapshots are preserved outside the active source tree; they are not implementation authority.
+## Live validation
 
-## Work remaining
+Claude Code **2.1.261**, Codex **0.153.4**, Bun **1.3.14**, macOS.
 
-1. Build the small authenticated, durable pilot harness and protocol fixtures.
-2. Run named macOS pilots for private Codex hosting/binding, attached-TUI tool output,
-   Claude Channels, peer-triggered hooks, application ACK, and uncertain delivery outcomes.
-3. Complete versioned tasks/review, writer exclusion, pause/resume and limits; connect proven
-   routes to the API and console. Complete a native 1+1 implement/review loop
-   without manual relay, then prove 2+2 with separate worktrees and repeated-kind addressing.
+Run `d215cc7c163f` completed **implement → review → accept** with exactly three acknowledged
+messages and no manual relay. Codex's idle review turn received one correlated tool-output item;
+its transcript retained exactly one operator user message. Claude read and acknowledged the final
+acceptance. Both native composers retained distinct unsent drafts, absent from submitted records.
 
-**No new native-route pilot or pair/fleet gate has passed.** Windows and Linux, including WSL2,
-remain deferred until the working macOS prototype.
+The coordinator was stopped with the review notice prepared and held. Recovery preserved both
+TUI processes, the private host, exact session identities, and the pending notice. Reconfirmation
+released it once. Console attach/detach and quit preserved the native sessions.
 
-## Validation
+Claude's eight tests passed. Codex independently ran the eight committed test callbacks in memory;
+its normal runner attempt failed without diagnostics. Exported patch validation then ran the normal
+Bun runner in a separate checkout: **8 passed, 0 failed**. The source remained clean at its original commit.
 
-Documentation rewrite: CLI and hook installation source inspected; no authenticated runtime
-exercised. `bun run typecheck` passed during reconciliation; the full test suite has not been rerun.
-`scripts/check.sh` runs both standard checks. Record native pilot versions and evidence here.
+Native shell/file approvals were answered in the TUIs. The nine Bridge tools required no per-call
+approval. This proves automatic peer delivery, not operation without native permission prompts.
+Codex's peer-triggered review also exercised command approval: saved request 146 and resolution 147
+correlate to the review turn. This is one live approval case, not coverage of every request class.
+The earlier nonce pilot also passed active-turn Codex delivery and owned shutdown.
+
+Private evidence: `.bridge/pilots/2026-09-05-task-native-evidence.json`, draft captures, recovery
+snapshots, and `2026-09-05-task-export-verification.json`. The completed pair is paused for inspection.
+
+The September 7 refresh exposed an Oh My Zsh startup prompt intercepting the launcher paste.
+That attempt was stopped without an agent or task start. Direct startup then launched Claude **2.1.263**
+and Codex **0.153.4**, with both native routes confirmed ready before returning them to paused state.
+The operator confirmed pause/resume, correct native focus, and unsent draft preservation across
+detach for both agents. Run `32fe38630f90` then reached **accepted v4**, artifact
+`32f8c1c76381a305880c0fbbaf67a5b271a0f94e`. Claude reported eight passing tests; Codex reported
+eight committed test callbacks plus four additional assertions passing in memory. Operator resume
+released the final acceptance once; all three messages were read and acknowledged. The exported
+patch applied cleanly in a separate clone, exactly reproduced the accepted Git tree, and passed
+the normal Bun runner: **8 passed, 0 failed**. Source and reviewer remained clean at the recorded base.
+Draft preservation during peer-triggered turns is not yet manually checked in this run.
+Evidence: `.bridge/pilots/2026-09-07-operator-checks.json` and `2026-09-07-task-export-verification.json`.
+
+The operator closed this round. Both agents' Bridge delivery is paused, with native sessions retained.
+Evidence: `.bridge/pilots/2026-09-07-round-closed.json`.
+
+## Limits and next steps
+
+- Claude uses a development Channel; this Codex build needs experimental legacy history at startup.
+- Native project/hook trust must precede the private Codex host. Tracked Codex hook conflicts are
+  refused before preparation; automatic configuration merging remains open.
+- The run has 32 messages, an eight-hop limit, and four hours. It supports one task and a fixed pair.
+- Forced interruption, provider disconnect, and uncertain native outcome matrices remain open.
+- Improve the console and add launch-time model/reasoning controls,
+  default permission bypass/YOLO, shared provider/account quota visibility, and per-session context.
+  These are operator requirements, not implemented features. Research found documented Claude
+  status-line fields and Codex app-server APIs/events; installed-session collection is still untested.
+  Native collection comes first; scraping and hidden admin sessions are deferred fallbacks.
+- Next: N1a launch-policy plumbing, then the first live revision loop before N2 telemetry/UI.
+  General failure qualification and configurable 2+2 follow. Windows and Linux/WSL2 remain later work.
+
+Next sequence and gates: [DESIGN.md](DESIGN.md#next-phase-operator-controls).
+Phase evidence, capability sources and Claude review prompt: [review packet](docs/reviews/2026-09-07-prototype-review.md).
+
+## Checks
+
+Pause-notice clarification: **15 console tests passed**, 208 assertions; typecheck passed.
+
+Full suite for `b18ad69`, before the pause-notice wording change: `scripts/check.sh` reported
+**367 passed, 0 failed**, 2,768 assertions across 29 files (56.81 s);
+typecheck and whitespace checks passed. Tests cover task roles, version conflicts, atomic notifications,
+Git isolation/export, protocol/recovery, and real tmux/PTY console behavior.
+Directory split: **13 native/coordination/pilot/run files, 180 tests**; **16 shared/earlier files,
+187 tests**, including shared modules changed during the rework. This is not a new-versus-old test count.
+
+Repository history is retained at `archive/pre-native-rework-2026-09-05`; obsolete proposals and
+inactive worktrees are archived outside the source tree. [DESIGN.md](DESIGN.md) is the contract.

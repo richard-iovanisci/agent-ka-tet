@@ -2,7 +2,6 @@ import type { BridgeConfig } from "../config.ts";
 import type { InitOptions } from "../adapters/initCommon.ts";
 import { initClaude, removeClaudeHooks } from "../adapters/claude/init.ts";
 import { initCodex, removeCodexHooks } from "../adapters/codex/init.ts";
-import { retireLegacyIntegrations } from "../adapters/retireLegacy.ts";
 import type { AgentKind } from "../types.ts";
 
 /**
@@ -20,7 +19,7 @@ export function runInit(cfg: BridgeConfig, opts: InitOptions = {}): number {
       void (enabled ? initCodex(cfg, opts) : removeCodexHooks(cfg, opts)),
   };
 
-  let failures = retireLegacyIntegrations(opts);
+  let failures = 0;
   for (const agent of cfg.agents) {
     const label = agent.id === agent.kind ? agent.id : `${agent.id} (${agent.kind})`;
     print("");

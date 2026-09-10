@@ -22,15 +22,7 @@ import {
   type InitOptions,
 } from "../initCommon.ts";
 
-/**
- * Wire Claude Code to the daemon via native `http` hook handlers plus the
- * command-only SessionStart surface in repo-local .claude/settings.json.
- * Schema verified against code.claude.com/docs/en/hooks July 2026.
- *
- * Events: HANDOFF.md's five plus UserPromptSubmit/PostToolUse (DECISIONS.md
- * 2026-07-07 — without them `working` is unobservable).
- */
-
+// SessionStart is command-only; the remaining lifecycle hooks use HTTP.
 const HOOK_EVENTS: Array<{ event: string; matcher?: string }> = [
   { event: "SessionEnd" },
   { event: "UserPromptSubmit" },

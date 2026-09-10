@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,23 +18,21 @@ import {
 } from "../attribution.ts";
 import type { AgentStatus, StatusResponse } from "../types.ts";
 import { TmuxAdapter } from "../mux/tmux.ts";
-import { daemonPidFile } from "../paths.ts";
 import { up, launchCommand, daemonHealthy } from "./up.ts";
 import { down } from "./down.ts";
+import { fetchDaemonStatus } from "./daemonClient.ts";
 import { attach } from "./attach.ts";
 import { formatAge, renderBoard, top } from "./top.ts";
 
 const SOCKET = `bridge-test-cli-${process.pid}`;
 const SESSION = `bridge-cli-${process.pid}`;
-const PORT = 4800 + (process.pid % 150);
-const LEGACY_ACCEPT_PORT = 5100 + (process.pid % 100);
-const LEGACY_PREFIX_PORT = 5300 + (process.pid % 100);
-const LEGACY_DAEMON_FIXTURE = fileURLToPath(
-  new URL("./fixtures/legacy/daemon/index.ts", import.meta.url),
-);
-
+const SHELL_ROOT = mkdtempSync(join(tmpdir(), "bridge-cli-shell-"));
+const SHELL_ENV = { SHELL: "/bin/zsh", ZDOTDIR: SHELL_ROOT };
+writeFileSync(join(SHELL_ROOT, ".zshenv"), "unsetopt GLOBAL_RCS\n");
+writeFileSync(join(SHELL_ROOT, ".zshrc"), "PROMPT='bridge-fixture> '\nRPROMPT=''\n");
 afterAll(() => {
   Bun.spawnSync(["tmux", "-L", SOCKET, "kill-server"]);
+  rmSync(SHELL_ROOT, { recursive: true, force: true });
 });
 
 /** Poll an async predicate every 50ms until true or timeout. */
@@ -45,66 +43,6 @@ async function pollFor(predicate: () => Promise<boolean>, timeoutMs = 5000): Pro
     if (Date.now() >= deadline) return false;
     await Bun.sleep(50);
   }
-}
-
-async function createLegacySession(
-  mux: TmuxAdapter,
-  session: string,
-  cwd: string,
-): Promise<void> {
-  const panes = [await mux.createSession(session, { cwd })];
-  for (let i = 1; i < 4; i++) panes.push(await mux.splitPane(session, { cwd }));
-  for (const [index, title] of ["claude", "codex", "agy", "opencode"].entries()) {
-    await mux.setPaneTitle(panes[index]!, title);
-  }
-}
-
-async function startLegacyDaemon(
-  port: number,
-  pidFile: string,
-  configDirArg: string,
-) {
-  const child = Bun.spawn([
-    "bun",
-    LEGACY_DAEMON_FIXTURE,
-    "--port",
-    String(port),
-    "--pid-file",
-    pidFile,
-    "--dir",
-    configDirArg,
-  ], {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  const ready = await pollFor(async () => {
-    try {
-      return (await fetch(`http://127.0.0.1:${port}/status`, {
-        signal: AbortSignal.timeout(200),
-      })).ok;
-    } catch {
-      return false;
-    }
-  });
-  if (!ready) {
-    try {
-      process.kill(child.pid, "SIGTERM");
-    } catch {
-      // already gone
-    }
-    throw new Error(`legacy daemon fixture failed to bind port ${port}`);
-  }
-  return child;
-}
-
-async function stopFixture(child: Awaited<ReturnType<typeof startLegacyDaemon>>): Promise<void> {
-  try {
-    process.kill(child.pid, "SIGTERM");
-  } catch {
-    // already stopped by bridge down
-  }
-  await Promise.race([child.exited, Bun.sleep(3000)]);
 }
 
 function agentStatus(partial: Partial<AgentStatus> & Pick<AgentStatus, "agent">): AgentStatus {
@@ -265,7 +203,7 @@ describe("bridge ownership guards", () => {
   test("existing-session-only recovery never creates a missing session", async () => {
     const cfg = defaultConfig(mkdtempSync(join(tmpdir(), "bridge-recovery-only-")));
     cfg.session = `bridge-recovery-only-${process.pid}`;
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
     const lines: string[] = [];
     expect(
       await up(cfg, {
@@ -283,72 +221,30 @@ describe("bridge ownership guards", () => {
     const cfg = defaultConfig(mkdtempSync(join(tmpdir(), "bridge-disabled-")));
     cfg.session = `bridge-disabled-${process.pid}`;
     for (const agent of cfg.agents) agent.enabled = false;
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
     const lines: string[] = [];
     expect(await up(cfg, { mux, print: (line) => lines.push(line) })).toBe(1);
     expect(await mux.hasSession(cfg.session)).toBe(false);
     expect(lines.join("\n")).toContain("no agents enabled");
   });
 
-  test("legacy down requires opt-in, then accepts an exactly identified baseline", async () => {
-    const repo = mkdtempSync(join(tmpdir(), "bridge-legacy-accept-"));
-    const cfg = defaultConfig(repo);
-    cfg.session = `bridge-legacy-accept-${process.pid}`;
-    cfg.daemonPort = LEGACY_ACCEPT_PORT;
-    const pidFile = daemonPidFile(cfg.daemonPort);
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
-    await createLegacySession(mux, cfg.session, repo);
-    const child = await startLegacyDaemon(cfg.daemonPort, pidFile, cfg.configDir);
-
-    try {
-      const refused: string[] = [];
-      expect(await down(cfg, { mux, print: (line) => refused.push(line) })).toBe(1);
-      expect(await mux.hasSession(cfg.session)).toBe(true);
-      expect(refused.join("\n")).toContain("rerun with `bridge down --legacy`");
-      expect(() => process.kill(child.pid, 0)).not.toThrow();
-
-      const accepted: string[] = [];
-      expect(await down(cfg, {
-        mux,
-        allowLegacy: true,
-        print: (line) => accepted.push(line),
-      })).toBe(0);
-      expect(await mux.hasSession(cfg.session)).toBe(false);
-      expect(accepted.join("\n")).toContain("verified legacy baseline");
-      expect(await Promise.race([child.exited, Bun.sleep(3000).then(() => -1)])).toBe(0);
-    } finally {
-      if (await mux.hasSession(cfg.session)) await mux.killSession(cfg.session);
-      await stopFixture(child);
-      rmSync(pidFile, { force: true });
-    }
-  });
-
-  test("legacy down refuses a daemon whose --dir only shares a path prefix", async () => {
-    const repo = mkdtempSync(join(tmpdir(), "bridge-legacy-prefix-"));
-    const otherRepo = `${repo}-other`;
-    mkdirSync(otherRepo);
-    const cfg = defaultConfig(repo);
-    cfg.session = `bridge-legacy-prefix-${process.pid}`;
-    cfg.daemonPort = LEGACY_PREFIX_PORT;
-    const pidFile = daemonPidFile(cfg.daemonPort);
-    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
-    await createLegacySession(mux, cfg.session, repo);
-    const child = await startLegacyDaemon(cfg.daemonPort, pidFile, otherRepo);
-
+  test("down refuses a session and daemon without current ownership evidence", async () => {
+    const cfg = defaultConfig(mkdtempSync(join(tmpdir(), "bridge-unowned-")));
+    cfg.session = `bridge-unowned-${process.pid}`;
+    const fixture = Bun.serve({ hostname: "127.0.0.1", port: 0,
+      fetch: () => Response.json({ daemon: { pid: process.pid }, agents: [] }),
+    });
+    cfg.daemonPort = fixture.port!;
+    const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
+    await mux.createSession(cfg.session, { cwd: cfg.repo });
     try {
       const lines: string[] = [];
-      expect(await down(cfg, {
-        mux,
-        allowLegacy: true,
-        print: (line) => lines.push(line),
-      })).toBe(1);
+      expect(await down(cfg, { mux, print: line => lines.push(line) })).toBe(1);
       expect(await mux.hasSession(cfg.session)).toBe(true);
-      expect(() => process.kill(child.pid, 0)).not.toThrow();
-      expect(lines.join("\n")).toContain("REFUSING");
+      expect(lines.filter(line => line.includes("REFUSING"))).toHaveLength(2);
     } finally {
-      if (await mux.hasSession(cfg.session)) await mux.killSession(cfg.session);
-      await stopFixture(child);
-      rmSync(pidFile, { force: true });
+      await mux.killSession(cfg.session);
+      fixture.stop(true);
     }
   });
 });
@@ -358,11 +254,15 @@ describe("bridge up/down against real tmux + real daemon", () => {
     "up creates two horizontal panes, spawns the daemon; down tears both down",
     async () => {
       const repo = mkdtempSync(join(tmpdir(), "bridge-cli-"));
+      const roots = [repo];
+      const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+      const port = reservation.port!;
+      await reservation.stop(true);
       writeFileSync(
         join(repo, CONFIG_FILENAME),
         JSON.stringify({
           session: SESSION,
-          daemonPort: PORT,
+          daemonPort: port,
           db: join(repo, "events.sqlite"),
           agents: [
             // Output markers prove both that the launch command executed and
@@ -383,108 +283,128 @@ describe("bridge up/down against real tmux + real daemon", () => {
         }),
       );
       const cfg = loadConfig(repo);
-      const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null" });
+      const mux = new TmuxAdapter({ socketName: SOCKET, configFile: "/dev/null", environment: SHELL_ENV });
       const lines: string[] = [];
       const daemonScript = fileURLToPath(new URL("../daemon/index.ts", import.meta.url));
 
-      const code = await up(cfg, { mux, print: (l) => lines.push(l), daemonScript });
-      expect(code).toBe(0);
-      expect(await mux.hasSession(SESSION)).toBe(true);
-      const panes = await mux.listPanes(SESSION);
-      expect(panes).toHaveLength(2);
-      expect(
-        panes.slice().sort((a, b) => a.index - b.index).map((pane) => pane.agentId),
-      ).toEqual(["claude", "codex"]);
-      expect(await mux.getSessionMarker(SESSION)).toBe(bridgeSessionMarker(cfg));
-      expect(panes[0]?.height).toBe(panes[1]?.height);
-      expect(panes.every((pane) => pane.width < 220 && pane.height >= 50)).toBe(true);
-      expect(await daemonHealthy(PORT)).toBe(true);
+      try {
+        const code = await up(cfg, { mux, print: (l) => lines.push(l), daemonScript });
+        let startupDetail = lines.join("\n");
+        if (code !== 0) {
+          const reported = await fetchDaemonStatus(port);
+          startupDetail += "\n" + JSON.stringify({
+            expectedSource: cfg.sourceFingerprint,
+            reportedSource: reported?.daemon.sourceFingerprint,
+            expectedConfig: configFingerprint(cfg),
+            reportedConfig: reported?.daemon.configFingerprint,
+            reportedConfigDir: reported?.daemon.configDir,
+          });
+        }
+        expect(code, startupDetail).toBe(0);
+        expect(await mux.hasSession(SESSION)).toBe(true);
+        const panes = await mux.listPanes(SESSION);
+        expect(panes).toHaveLength(2);
+        expect(
+          panes.slice().sort((a, b) => a.index - b.index).map((pane) => pane.agentId),
+        ).toEqual(["claude", "codex"]);
+        expect(await mux.getSessionMarker(SESSION)).toBe(bridgeSessionMarker(cfg));
+        expect(panes[0]?.height).toBe(panes[1]?.height);
+        expect(panes.every((pane) => pane.width < 220 && pane.height >= 50)).toBe(true);
+        expect(await daemonHealthy(port)).toBe(true);
 
-      // Launch commands must have EXECUTED (not just been pasted), with both
-      // managed-process markers available to their process trees.
-      for (const pane of panes) {
-        const executed = await pollFor(async () => {
-          const text = await mux.capturePane(pane.id);
-          const output = text.split("\n").map((line) => line.trim());
-          return (
-            output.includes(`bridge-launched-${pane.agentId}:${pane.agentId}`) &&
-            output.includes(`bridge-fingerprint:${configFingerprint(cfg)}`)
-          );
-        });
-        expect(executed).toBe(true);
+        // Launch commands must have EXECUTED (not just been pasted), with both
+        // managed-process markers available to their process trees.
+        for (const pane of panes) {
+          const executed = await pollFor(async () => {
+            const text = await mux.capturePane(pane.id);
+            const output = text.split("\n").map((line) => line.trim());
+            return (
+              output.includes(`bridge-launched-${pane.agentId}:${pane.agentId}`) &&
+              output.includes(`bridge-fingerprint:${configFingerprint(cfg)}`)
+            );
+          });
+          expect(executed).toBe(true);
+        }
+        expect(await pollFor(async () =>
+          (await mux.listPanes(SESSION)).every((pane) => pane.managedProcess === null)
+        )).toBe(true);
+
+        // status endpoint contains exactly the configured two-agent roster
+        const status = (await (await fetch(`http://127.0.0.1:${port}/status`)).json()) as StatusResponse;
+        expect(status.agents.map((agent) => agent.agent)).toEqual(["claude", "codex"]);
+        expect(status.daemon.configDir).toBe(cfg.configDir);
+        expect(status.daemon.sourceRoot).toBe(cfg.sourceRoot);
+        expect(status.daemon.sourceFingerprint).toBe(cfg.sourceFingerprint);
+        expect(status.daemon.configFingerprint).toBe(configFingerprint(cfg));
+
+        // re-running up leaves the panes alone, re-ensures the daemon, exits 0
+        expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(0);
+        expect(await mux.listPanes(SESSION)).toHaveLength(2);
+        expect(await daemonHealthy(port)).toBe(true);
+
+        // A changed config in the same directory cannot silently reuse stale panes.
+        const staleCfg = {
+          ...cfg,
+          agents: cfg.agents.map((agent) => ({ ...agent })),
+        };
+        staleCfg.agents[0]!.command = "echo changed-command";
+        expect(await up(staleCfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(1);
+        expect(await mux.listPanes(SESSION)).toHaveLength(2);
+        expect(await daemonHealthy(port)).toBe(true);
+
+        // The same default session/port from another target repo is never reused,
+        // attached, displayed, or torn down.
+        const foreignDir = mkdtempSync(join(tmpdir(), "bridge-foreign-"));
+        roots.push(foreignDir);
+        const foreignCfg = {
+          ...cfg,
+          repo: foreignDir,
+          configDir: foreignDir,
+          db: join(foreignDir, "events.sqlite"),
+          agents: cfg.agents.map((agent) => ({ ...agent })),
+        };
+        const foreignPortCfg = {
+          ...foreignCfg,
+          session: `bridge-foreign-${process.pid}`,
+        };
+        expect(await up(foreignPortCfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(1);
+        expect(await mux.hasSession(foreignPortCfg.session)).toBe(false);
+        expect(await attach(foreignCfg, { mux, print: (l) => lines.push(l) })).toBe(1);
+        const topFrames: string[] = [];
+        expect(await top(foreignCfg, { once: true, print: (frame) => topFrames.push(frame) })).toBe(1);
+        expect(topFrames.join("\n")).toContain("another or stale bridge configuration");
+        expect(await down(foreignCfg, { mux, print: (l) => lines.push(l) })).toBe(1);
+        expect(await mux.hasSession(SESSION)).toBe(true);
+        expect(await daemonHealthy(port)).toBe(true);
+
+        // Crash only the daemon, then prove `up` revives it without replacing panes.
+        const paneIdsBeforeRecovery = (await mux.listPanes(SESSION)).map((pane) => pane.id);
+        process.kill(status.daemon.pid, "SIGTERM");
+        expect(await pollFor(async () => !(await daemonHealthy(port)))).toBe(true);
+        expect(await mux.hasSession(SESSION)).toBe(true);
+        expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(0);
+        expect((await mux.listPanes(SESSION)).map((pane) => pane.id)).toEqual(
+          paneIdsBeforeRecovery,
+        );
+        expect(await daemonHealthy(port)).toBe(true);
+
+        const downCode = await down(cfg, { mux, print: (l) => lines.push(l) });
+        expect(downCode).toBe(0);
+        expect(await mux.hasSession(SESSION)).toBe(false);
+        // daemon exits after SIGTERM (poll up to 3s)
+        let healthy = true;
+        for (let i = 0; i < 30 && healthy; i++) {
+          healthy = await daemonHealthy(port);
+          if (healthy) await Bun.sleep(100);
+        }
+        expect(healthy).toBe(false);
+      } finally {
+        await down(cfg, { mux, print: () => {} });
+        const stopped = await pollFor(async () =>
+          (await fetchDaemonStatus(port))?.daemon.configDir !== cfg.configDir
+        );
+        if (stopped) for (const root of roots) rmSync(root, { recursive: true, force: true });
       }
-      expect(await pollFor(async () =>
-        (await mux.listPanes(SESSION)).every((pane) => pane.managedProcess === null)
-      )).toBe(true);
-
-      // status endpoint contains exactly the configured two-agent roster
-      const status = (await (await fetch(`http://127.0.0.1:${PORT}/status`)).json()) as StatusResponse;
-      expect(status.agents.map((agent) => agent.agent)).toEqual(["claude", "codex"]);
-      expect(status.daemon.configDir).toBe(cfg.configDir);
-      expect(status.daemon.sourceRoot).toBe(cfg.sourceRoot);
-      expect(status.daemon.sourceFingerprint).toBe(cfg.sourceFingerprint);
-      expect(status.daemon.configFingerprint).toBe(configFingerprint(cfg));
-
-      // re-running up leaves the panes alone, re-ensures the daemon, exits 0
-      expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(0);
-      expect(await mux.listPanes(SESSION)).toHaveLength(2);
-      expect(await daemonHealthy(PORT)).toBe(true);
-
-      // A changed config in the same directory cannot silently reuse stale panes.
-      const staleCfg = {
-        ...cfg,
-        agents: cfg.agents.map((agent) => ({ ...agent })),
-      };
-      staleCfg.agents[0]!.command = "echo changed-command";
-      expect(await up(staleCfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(1);
-      expect(await mux.listPanes(SESSION)).toHaveLength(2);
-      expect(await daemonHealthy(PORT)).toBe(true);
-
-      // The same default session/port from another target repo is never reused,
-      // attached, displayed, or torn down.
-      const foreignDir = mkdtempSync(join(tmpdir(), "bridge-foreign-"));
-      const foreignCfg = {
-        ...cfg,
-        repo: foreignDir,
-        configDir: foreignDir,
-        db: join(foreignDir, "events.sqlite"),
-        agents: cfg.agents.map((agent) => ({ ...agent })),
-      };
-      const foreignPortCfg = {
-        ...foreignCfg,
-        session: `bridge-foreign-${process.pid}`,
-      };
-      expect(await up(foreignPortCfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(1);
-      expect(await mux.hasSession(foreignPortCfg.session)).toBe(false);
-      expect(await attach(foreignCfg, { mux, print: (l) => lines.push(l) })).toBe(1);
-      const topFrames: string[] = [];
-      expect(await top(foreignCfg, { once: true, print: (frame) => topFrames.push(frame) })).toBe(1);
-      expect(topFrames.join("\n")).toContain("another or stale bridge configuration");
-      expect(await down(foreignCfg, { mux, print: (l) => lines.push(l) })).toBe(1);
-      expect(await mux.hasSession(SESSION)).toBe(true);
-      expect(await daemonHealthy(PORT)).toBe(true);
-
-      // Crash only the daemon, then prove `up` revives it without replacing panes.
-      const paneIdsBeforeRecovery = (await mux.listPanes(SESSION)).map((pane) => pane.id);
-      process.kill(status.daemon.pid, "SIGTERM");
-      expect(await pollFor(async () => !(await daemonHealthy(PORT)))).toBe(true);
-      expect(await mux.hasSession(SESSION)).toBe(true);
-      expect(await up(cfg, { mux, print: (l) => lines.push(l), daemonScript })).toBe(0);
-      expect((await mux.listPanes(SESSION)).map((pane) => pane.id)).toEqual(
-        paneIdsBeforeRecovery,
-      );
-      expect(await daemonHealthy(PORT)).toBe(true);
-
-      const downCode = await down(cfg, { mux, print: (l) => lines.push(l) });
-      expect(downCode).toBe(0);
-      expect(await mux.hasSession(SESSION)).toBe(false);
-      // daemon exits after SIGTERM (poll up to 3s)
-      let healthy = true;
-      for (let i = 0; i < 30 && healthy; i++) {
-        healthy = await daemonHealthy(PORT);
-        if (healthy) await Bun.sleep(100);
-      }
-      expect(healthy).toBe(false);
     },
     { timeout: 30_000 },
   );
